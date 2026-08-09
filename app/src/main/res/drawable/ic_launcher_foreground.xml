@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Teal water background -->
+    <path
+        android:fillColor="#0D7377"
+        android:pathData="M54,54m-54,0a54,54 0,1 1,108 0a54,54 0,1 1,-108 0"/>
+    
+    <!-- Water surface wave -->
+    <path
+        android:fillColor="#14A3A8"
+        android:fillAlpha="0.4"
+        android:pathData="M0,48 Q18,44 36,48 Q54,52 72,48 Q90,44 108,48 L108,108 L0,108 Z"/>
+    
+    <!-- Water droplet body -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.92"
+        android:pathData="M54,30 C40,42 34,50 34,60 C34,71 43,78 54,78 C65,78 74,71 74,60 C74,50 68,42 54,30 Z"/>
+    
+    <!-- Droplet highlight -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.3"
+        android:pathData="M46,36 A8,6 0,0 1,54 33 A6,6 0,0 0,48 38 Z"/>
+    
+    <!-- Carbon chain zigzag inside droplet -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#0D7377"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M44,58 L48,52 L52,58 L56,52 L60,58 L64,52"/>
+    
+    <!-- Carbon nodes -->
+    <path android:fillColor="#E8F6F3" android:pathData="M42,59 A3,3 0,1 1,42 53A3,3 0,1 1,42 59 Z"/>
+    <path android:fillColor="#E8F6F3" android:pathData="M46,53 A3,3 0,1 1,46 47A3,3 0,1 1,46 53 Z"/>
+    <path android:fillColor="#E8F6F3" android:pathData="M50,59 A3,3 0,1 1,50 53A3,3 0,1 1,50 59 Z"/>
+    <path android:fillColor="#E8F6F3" android:pathData="M54,53 A3,3 0,1 1,54 47A3,3 0,1 1,54 53 Z"/>
+    <path android:fillColor="#E8F6F3" android:pathData="M58,59 A3,3 0,1 1,58 53A3,3 0,1 1,58 59 Z"/>
+    <path android:fillColor="#E8F6F3" android:pathData="M62,53 A3,3 0,1 1,62 47A3,3 0,1 1,62 53 Z"/>
+    
+    <!-- Bottom ripple -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillAlpha="0.25"
+        android:pathData="M38,72 Q54,78 70,72 Q74,76 70,78 Q54,84 38,78 Q34,76 38,72 Z"/>
+</vector>

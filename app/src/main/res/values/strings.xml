@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">命苦打工人</string>
+    <string name="accessibility_service_desc">命苦打工人手机控制服务。用于 AI 助手读取屏幕内容和执行自动化操作。</string>
+</resources>

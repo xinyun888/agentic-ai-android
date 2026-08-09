@@ -1,0 +1,28 @@
+# Built output
+build/
+app/build/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Keystore
+*.keystore
+*.jks
+debug.keystore
