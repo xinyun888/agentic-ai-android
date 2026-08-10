@@ -92,17 +92,7 @@ class ActiveModeService : Service() {
         startForeground(1001, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · ${if (immersive) "沉浸" else "轻盈"}"))
 
         heartbeatJob = scope.launch {
-            // First heartbeat immediately
-            try {
-                val result = doHeartbeat(persona)
-                if (result.isNotBlank() && result.uppercase() != "PASS") {
-                    pushNotification(persona.name, result)
-                }
-                updateNotification("${fullName} 正在陪伴 · ${if (result.isBlank()) "本轮PASS" else "已推送: ${result.take(15)}…"}")
-            } catch (e: Exception) {
-                updateNotification("${fullName} 心跳异常 · ${e.message?.take(20) ?: "未知"}")
-            }
-            // Then loop with delay
+            updateNotification("${fullName} 正在陪伴 · ${intervalMin}分钟后首次心跳")
             while (isActive) {
                 delay(intervalMin * 60_000L)
                 if (!isInTimeRange()) continue
@@ -110,9 +100,11 @@ class ActiveModeService : Service() {
                     val result = doHeartbeat(persona)
                     if (result.isNotBlank() && result != "PASS") {
                         pushNotification(persona.name, result)
-                        updateNotification("${fullName} 正在陪伴 · 已推送: ${result.take(15)}…")
+                        // Also save to conversation so it appears in chat
+                        saveToConversation(persona, result)
+                        updateNotification("${fullName} 正在陪伴 · 已推送")
                     } else {
-                        updateNotification("${fullName} 正在陪伴 · ${if (result.isBlank()) "本轮PASS" else "本轮PASS"}")
+                        updateNotification("${fullName} 正在陪伴 · 本轮PASS")
                     }
                 } catch (e: Exception) {
                     updateNotification("${fullName} 心跳异常 · ${e.message?.take(20) ?: "未知"}")
@@ -229,6 +221,25 @@ class ActiveModeService : Service() {
             .build()
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify((System.currentTimeMillis() % 100000).toInt(), notif)
+    }
+
+    private fun saveToConversation(persona: Persona, content: String) {
+        try {
+            val storage = StorageManager(this)
+            val convs = storage.getConversations().toMutableList()
+            val idx = convs.indexOfFirst { it.profileId == personaId || it.profileId.isBlank() }
+            if (idx >= 0) {
+                val target = convs[idx]
+                convs[idx] = target.copy(
+                    messages = target.messages + ChatMessage(
+                        role = "assistant",
+                        content = content,
+                        timestamp = System.currentTimeMillis()
+                    )
+                )
+                storage.saveConversations(convs)
+            }
+        } catch (_: Exception) {}
     }
 
     private fun updateNotification(text: String) {
