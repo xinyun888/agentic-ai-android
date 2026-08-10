@@ -98,7 +98,10 @@ class ActiveModeService : Service() {
                 if (result.isNotBlank() && result.uppercase() != "PASS") {
                     pushNotification(persona.name, result)
                 }
-            } catch (_: Exception) {}
+                updateNotification("${fullName} 正在陪伴 · ${if (result.isBlank()) "本轮PASS" else "已推送: ${result.take(15)}…"}")
+            } catch (e: Exception) {
+                updateNotification("${fullName} 心跳异常 · ${e.message?.take(20) ?: "未知"}")
+            }
             // Then loop with delay
             while (isActive) {
                 delay(intervalMin * 60_000L)
@@ -107,8 +110,13 @@ class ActiveModeService : Service() {
                     val result = doHeartbeat(persona)
                     if (result.isNotBlank() && result != "PASS") {
                         pushNotification(persona.name, result)
+                        updateNotification("${fullName} 正在陪伴 · 已推送: ${result.take(15)}…")
+                    } else {
+                        updateNotification("${fullName} 正在陪伴 · ${if (result.isBlank()) "本轮PASS" else "本轮PASS"}")
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    updateNotification("${fullName} 心跳异常 · ${e.message?.take(20) ?: "未知"}")
+                }
             }
         }
     }
@@ -164,11 +172,12 @@ class ActiveModeService : Service() {
         val userPrompt = buildString {
             append(pasHint)
             append("现在是 $timeStr。$contextNote\n")
-            append("你有话想主动说吗？严格判断：\n")
-            append("- 如果现在是休息时段或屏幕关闭 → 必须回复 PASS\n")
-            append("- 如果有未完成的事想提醒 → 说一句话\n")
-            append("- 如果只是想闲聊 → 简短一句，不超过手机通知栏长度\n")
-            append("- 否则严格回复 PASS，不要输出任何其他内容")
+            if (shouldSkip) {
+                append("现在不是合适的聊天时间。你必须回复 PASS。")
+            } else {
+                append("随便说点什么吧，一句简短的话就够了。可以问候、吐槽、或者随便聊聊。")
+                append("不要回复 PASS，除非你真的完全不想说话。")
+            }
         }
 
         messages.add(ChatMessageDto(role = "user", content = userPrompt))
@@ -196,7 +205,10 @@ class ActiveModeService : Service() {
         val first = choices.firstOrNull() as? Map<*, *> ?: return ""
         val msg = first["message"] as? Map<*, *> ?: return ""
         val content = msg["content"]?.toString()?.trim() ?: return ""
-        return if (content.uppercase() == "PASS" || content.equals("PASS", ignoreCase = true)) "" else content
+        // Match "PASS" or "PASS（...）" etc
+        val isPass = content.uppercase().startsWith("PASS") || 
+                      content.equals("PASS", ignoreCase = true)
+        return if (isPass) "" else content
     }
 
     private fun pushNotification(title: String, content: String) {
@@ -217,6 +229,11 @@ class ActiveModeService : Service() {
             .build()
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify((System.currentTimeMillis() % 100000).toInt(), notif)
+    }
+
+    private fun updateNotification(text: String) {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(1001, buildNotification("", text))
     }
 
     private fun buildNotification(title: String, text: String): Notification {
