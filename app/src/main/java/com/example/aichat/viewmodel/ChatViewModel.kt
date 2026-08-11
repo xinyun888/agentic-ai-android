@@ -337,6 +337,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 ⑦ **长期记忆**：每次发现用户偏好、项目决策、重要上下文时，立即用 `memory_save` 记下来。下次对话开始时会自动加载你的记忆，这样你不会忘。
 ⑧ **对话隔离**：工作区和记忆都按对话隔离。write_file / build_html 保存文件时，写到 workspace/${if (myConvId.isBlank()) "" else sanitize(myConvId) + "/"} 目录下（你的专属目录）。默认只查看工作区中本对话的文件。如果用户主动要求查看其他对话或全局文件，可以用 read_file 读取完整路径。
 ⑨ **工具调用纪律**：需要计算、执行代码、搜索、读写文件时，直接发出工具调用（function calling），系统会自动执行并把结果返回给你。禁止把工具调用、代码、JSON 结构写进你的回答文本——回答里只放最终结论。禁止假装执行（如"我用Python算了一下结果是X"）——没调用工具就是没算。
+⑩ **约定识别**：当用户提到未来的约定或承诺（"一会儿""等下""晚上""明天""下周"+要做的事）时，立即用 memory_save 记录。key 格式"约定-xxx"，content 必须写明：约定内容 + 约定时间（参照"## 当前时间"推算）。这样即使过很久，你也能在约定的时间提起它。
 
 $workspaceFiles
 
@@ -347,6 +348,12 @@ ${PlanParser.planInstruction()}
 
                 // Collect dynamic system messages (inserted AFTER history for cache friendliness)
                 val dynamicSystemMsgs = mutableListOf<ChatMessageDto>()
+
+                // Real-time clock so the model always knows the current time
+                val now = java.time.LocalDateTime.now()
+                val nowStr = "${now.year}年${now.monthValue}月${now.dayOfMonth}日 ${now.hour}:${String.format("%02d", now.minute)}"
+                dynamicSystemMsgs.add(ChatMessageDto(role = "system",
+                    content = "## 当前时间\n\n现在是 $nowStr。判断约定/待办/时效性话题时以此为准。"))
 
                 // Add search/verify context (run on IO)
                 val effectiveSearch = searchEnabled || factCheckEnabled

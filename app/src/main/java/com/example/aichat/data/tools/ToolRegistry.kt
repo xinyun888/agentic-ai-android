@@ -558,6 +558,23 @@ class MemorySaveTool : Tool {
     override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
         val key = args["key"]?.trim() ?: return ToolResult("", false, "需要 key")
         val content = args["content"]?.trim() ?: return ToolResult("", false, "需要 content")
+        // Appointments (约定-xxx) are stored separately so heartbeat code can manage their lifecycle
+        if (key.startsWith("约定-")) {
+            val apptFile = java.io.File(memDirFor(convId, context), "appointments.md")
+            try {
+                val existing = if (apptFile.exists()) apptFile.readText() else ""
+                val pattern = Regex("## ${Regex.escape(key)}\n[^#]*").find(existing)
+                val body = if (pattern != null) {
+                    existing.replace(pattern.value, "## $key\n$content")
+                } else {
+                    "$existing\n## $key\n$content".trim()
+                }
+                apptFile.writeText(body.trim() + "\n")
+                return ToolResult("", true, "已记录约定: $key")
+            } catch (e: Exception) {
+                return ToolResult("", false, "约定保存失败: ${e.message}")
+            }
+        }
         val memDir = memDirFor(convId, context)
         val memFile = java.io.File(memDir, "memory.md")
         try {

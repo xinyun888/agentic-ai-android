@@ -1,6 +1,7 @@
 package com.example.aichat.service
 
 import android.app.Notification
+import android.app.AlarmManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -30,6 +31,7 @@ class ActiveModeService : Service() {
         const val CHANNEL_PUSH = "active_mode_push"
         const val ACTION_START = "com.example.aichat.ACTION_START_ACTIVE"
         const val ACTION_STOP = "com.example.aichat.ACTION_STOP_ACTIVE"
+        const val ACTION_HEARTBEAT = "com.example.aichat.ACTION_ACTIVE_HEARTBEAT"
         const val EXTRA_PERSONA_ID = "persona_id"
         const val EXTRA_CONV_ID = "conv_id"
         const val EXTRA_INTERVAL_MIN = "interval_min"
@@ -45,6 +47,11 @@ class ActiveModeService : Service() {
         fun isRunning(personaId: String): Boolean = personaId in runningPersonas
     }
 
+    private data class ActiveConfig(
+        val convId: String, val intervalMin: Int, val immersive: Boolean,
+        val showThinking: Boolean, val startHour: Int, val endHour: Int
+    )
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val client = OkHttpClient()
     private val gson = Gson()
@@ -53,6 +60,8 @@ class ActiveModeService : Service() {
     private val jobs = ConcurrentHashMap<String, Job>()
     /** personaId → convId mapping, for cleanup */
     private val personaConvs = ConcurrentHashMap<String, String>()
+    /** personaId → heartbeat config (for AlarmManager wakeups after process death) */
+    private val configs = ConcurrentHashMap<String, ActiveConfig>()
 
     override fun onCreate() {
         super.onCreate()
@@ -76,6 +85,10 @@ class ActiveModeService : Service() {
             action == ACTION_STOP -> {
                 stopHeartbeat(personaId)
             }
+            action == ACTION_HEARTBEAT -> {
+                // AlarmManager wakeup — run heartbeat even if app is backgrounded/killed
+                handleHeartbeat(personaId)
+            }
         }
         return START_STICKY
     }
@@ -85,10 +98,39 @@ class ActiveModeService : Service() {
     override fun onDestroy() {
         jobs.values.forEach { it.cancel() }
         jobs.clear()
+        runningPersonas.forEach { cancelAlarm(it) }
         runningPersonas.clear()
         runningConversations.clear()
+        configs.clear()
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun buildHeartbeatPI(personaId: String): PendingIntent {
+        val intent = Intent(this, ActiveModeService::class.java).apply {
+            action = ACTION_HEARTBEAT
+            putExtra(EXTRA_PERSONA_ID, personaId)
+        }
+        return PendingIntent.getService(this, 1000 + Math.floorMod(personaId.hashCode(), 1000),
+            intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
+    private fun scheduleAlarm(personaId: String) {
+        val cfg = configs[personaId] ?: return
+        val am = getSystemService(ALARM_SERVICE) as AlarmManager
+        val at = System.currentTimeMillis() + cfg.intervalMin * 60_000L
+        try {
+            // setExactAndAllowWhileIdle fires even in Doze (Android 12+ has per-app quota, fine at 5-60min)
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+        } catch (_: Exception) {
+            try { am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
+            catch (_: Exception) { am.set(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
+        }
+    }
+
+    private fun cancelAlarm(personaId: String) {
+        val am = getSystemService(ALARM_SERVICE) as AlarmManager
+        am.cancel(buildHeartbeatPI(personaId))
     }
 
     private fun startHeartbeat(
@@ -110,30 +152,55 @@ class ActiveModeService : Service() {
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
         startForeground(fgId, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · 每轮心跳写回对话", fgId))
 
+        // Save config so AlarmManager wakeups (even after process death) can resume
+        configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
+        // Schedule first heartbeat after intervalMin (not immediately)
+        updateNotification(fgId, fullName, "${intervalMin}分钟后首次心跳")
+        scheduleAlarm(personaId)
+    }
+
+    /** Executed on AlarmManager wakeup — works even when app is backgrounded/killed */
+    private fun handleHeartbeat(personaId: String) {
+        val cfg = configs[personaId] ?: return
+        if (personaId !in runningPersonas) return
+        val persona = Personas.getById(personaId)
+        val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
+        val fullName = "${persona.emoji} ${persona.name}"
+
+        // Ensure foreground while doing network work (in case service was restarted by alarm)
+        try {
+            startForeground(fgId, buildNotification(fullName + " 正在陪伴", "心跳中...", fgId))
+        } catch (_: Exception) {}
+
+        jobs[personaId]?.cancel()
         jobs[personaId] = scope.launch {
-            updateNotification(fgId, fullName, "${intervalMin}分钟后首次心跳")
-            while (isActive) {
-                delay(intervalMin * 60_000L)
-                if (!isInTimeRange(startHour, endHour)) continue
-                try {
-                    val result = doHeartbeat(persona, convId, immersive, showThinking)
-                    if (result.isNotBlank() && !result.uppercase().startsWith("PASS")) {
-                        pushNotification(persona, result)
-                        saveToConversation(convId, persona, result)
-                        updateNotification(fgId, fullName, "已推送")
-                    } else {
-                        updateNotification(fgId, fullName, "本轮PASS")
-                    }
-                } catch (e: Exception) {
-                    updateNotification(fgId, fullName, "心跳异常: ${e.message?.take(20) ?: "未知"}")
+            try {
+                if (!isInTimeRange(cfg.startHour, cfg.endHour)) {
+                    updateNotification(fgId, fullName, "休息时段跳过")
+                    return@launch
                 }
+                val result = doHeartbeat(persona, cfg.convId, cfg.immersive, cfg.showThinking)
+                if (result.isNotBlank() && !result.uppercase().startsWith("PASS")) {
+                    pushNotification(persona, result)
+                    saveToConversation(cfg.convId, persona, result)
+                    updateNotification(fgId, fullName, "已推送")
+                } else {
+                    updateNotification(fgId, fullName, "本轮PASS")
+                }
+            } catch (e: Exception) {
+                updateNotification(fgId, fullName, "心跳异常: ${e.message?.take(20) ?: "未知"}")
+            } finally {
+                jobs.remove(personaId)
+                // Schedule next heartbeat
+                scheduleAlarm(personaId)
             }
         }
     }
 
     private fun stopHeartbeat(personaId: String) {
-        val job = jobs.remove(personaId) ?: return
-        job.cancel()
+        jobs.remove(personaId)?.cancel()
+        cancelAlarm(personaId)
+        configs.remove(personaId)
         runningPersonas.remove(personaId)
         personaConvs.remove(personaId)?.let { runningConversations.remove(it) }
     }
@@ -190,14 +257,33 @@ class ActiveModeService : Service() {
             }
         }
 
+        // Extract appointment entries from appointments.md (managed by code)
+        val apptFile = File(memDir, "appointments.md")
+        val apptBlocks = if (apptFile.exists()) {
+            apptFile.readText().split("\n## ").mapIndexed { i, p ->
+                if (i == 0) p.removePrefix("## ").trim() else p.trim()
+            }.filter { it.startsWith("约定-") }
+        } else emptyList()
+
         val userPrompt = buildString {
             append(pasHint)
             append("现在是 $timeStr。$contextNote\n")
             if (shouldSkip) {
                 append("现在不是合适的聊天时间。你必须回复 PASS。")
             } else {
-                append("随便说点什么吧，一句简短的话就够了。可以问候、吐槽、或者随便聊聊。")
-                append("不要回复 PASS，除非你真的完全不想说话。")
+                append("根据你们最近的聊天内容自然地继续聊下去。")
+                append("如果之前有约定或没聊完的话题（比如约好了一会儿一起玩、晚点再聊），主动提起并延续它。")
+                append("不要聊与最近对话完全无关的新话题。")
+                append("说一句简短的话就够了。不要回复 PASS，除非你真的完全不想说话。")
+            }
+            if (apptBlocks.isNotEmpty()) {
+                val summaries = apptBlocks.map { b ->
+                    val title = b.substringBefore("\n")
+                    val body = b.substringAfter("\n", "").replace(Regex("\\[[^]]*]"), "").trim()
+                    "$title：$body"
+                }.take(5)
+                append("\n\n【你们之间的约定】\n${summaries.joinToString("\n")}")
+                append("\n根据当前时间判断：如果某个约定现在可以提起了就主动提；还没到或已过期就忽略。")
             }
         }
 
@@ -229,7 +315,45 @@ class ActiveModeService : Service() {
         // Match "PASS" or "PASS（...）" etc
         val isPass = content.uppercase().startsWith("PASS") ||
                       content.equals("PASS", ignoreCase = true)
+        // Manage appointment lifecycle: executed → delete; expired 3x → delete
+        if (apptFile.exists() && apptBlocks.isNotEmpty()) {
+            updateAppointments(apptFile, apptBlocks, content)
+        }
         return if (isPass) "" else content
+    }
+
+    /**
+     * Appointment lifecycle:
+     * - If heartbeat reply mentions the appointment keyword → executed/responded → remove
+     * - Otherwise bump expiry counter; at 3 → remove
+     */
+    private fun updateAppointments(apptFile: File, blocks: List<String>, result: String) {
+        try {
+            val keepBlocks = mutableListOf<String>()
+            var changed = false
+            for (block in blocks) {
+                val body = block.substringAfter("\n", "").trim()
+                val keyword = body.replace(Regex("\\[[^]]*]"), "").trim().take(10)
+                if (keyword.isNotBlank() && result.contains(keyword)) {
+                    changed = true  // executed / responded → drop
+                    continue
+                }
+                val cntRegex = Regex("""\[过期(\d+)次]""")
+                val cnt = cntRegex.find(body)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val newCnt = cnt + 1
+                if (newCnt >= 3) {
+                    changed = true  // expired 3 times → drop
+                } else {
+                    val newBody = if (cnt == 0) "$body [过期1次]" else body.replace(cntRegex, "[过期${newCnt}次]")
+                    keepBlocks.add("## ${block.substringBefore("\n")}\n$newBody")
+                    changed = true
+                }
+            }
+            if (changed) {
+                apptFile.writeText(keepBlocks.joinToString("\n").trim() + if (keepBlocks.isEmpty()) "" else "\n")
+                if (keepBlocks.isEmpty()) apptFile.delete()
+            }
+        } catch (_: Exception) {}
     }
 
     private fun pushNotification(persona: Persona, content: String) {
