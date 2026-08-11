@@ -227,18 +227,18 @@ class ActiveModeService : Service() {
         try {
             val storage = StorageManager(this)
             val convs = storage.getConversations().toMutableList()
-            val idx = convs.indexOfFirst { it.profileId == personaId || it.profileId.isBlank() }
-            if (idx >= 0) {
-                val target = convs[idx]
-                convs[idx] = target.copy(
-                    messages = target.messages + ChatMessage(
-                        role = "assistant",
-                        content = content,
-                        timestamp = System.currentTimeMillis()
-                    )
-                )
-                storage.saveConversations(convs)
-            }
+            // Save to most recently active conversation
+            val idx = convs.indices.maxByOrNull { convs[it].updatedAt } ?: return
+            val target = convs[idx]
+            convs[idx] = target.copy(
+                messages = target.messages + ChatMessage(
+                    role = "assistant",
+                    content = "[${persona.emoji}${persona.name}] $content",
+                    timestamp = System.currentTimeMillis()
+                ),
+                updatedAt = System.currentTimeMillis()
+            )
+            storage.saveConversations(convs)
         } catch (_: Exception) {}
     }
 

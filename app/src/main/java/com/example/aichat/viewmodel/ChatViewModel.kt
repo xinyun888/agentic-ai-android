@@ -213,6 +213,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var lastBaseUrl: String = ""
     private val gson = Gson()
 
+    /** Persist messages to a specific conversation. Sync UI only if that conversation is being viewed. */
+    private fun commitMessages(convId: String, msgs: List<ChatMessage>) {
+        storage.updateMessages(convId, msgs)
+        if (convId == currentConvId) messages = msgs
+    }
+
+    /** Append a user message to a specific conversation, independent of current UI state. */
+    private fun commitUserMessage(convId: String, msg: ChatMessage) {
+        val conv = storage.getConversation(convId)
+        val msgs = (conv?.messages ?: emptyList()) + msg
+        storage.updateMessages(convId, msgs)
+        if (convId == currentConvId) messages = msgs
+    }
+
     fun loadConversation(convId: String) {
         if (convId == currentConvId && messages.isNotEmpty()) return
         currentConvId = convId
@@ -224,6 +238,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         currentPlan = null
         planPhase = PlanPhase.IDLE
         completedTaskIds.clear()
+        // Per-conversation loading state: this conversation may still be loading in background
+        isLoading = convId in loadingConvs
         // Check for breakpoint
         restoreState()
     }
@@ -238,7 +254,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val hasImage = pendingImageUri != null
         val hasFile = pendingFileText != null
         if (content.isBlank() && !hasImage && !hasFile) return
-        if (isLoading) return
+        // Per-conversation isolation: only block if THIS conversation is loading
+        val myConvId = currentConvId
+        if (myConvId in loadingConvs) return
 
         // Build API content (with file text if applicable)
         var apiContent = content.ifBlank {
@@ -270,9 +288,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
         val imageUri = pendingImageUri
         pendingImageUri = null
-        messages = messages + userMessage
-        loadingConvs.add(currentConvId)
-        isLoading = true
+        // Commit user message to storage; sync UI only if this conversation is being viewed
+        commitUserMessage(myConvId, userMessage)
+        loadingConvs.add(myConvId)
+        isLoading = myConvId in loadingConvs
         errorMessage = null
         // Keep previous agent steps, don't clear
         // agentSteps = emptyList() — removed to preserve history
@@ -283,7 +302,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         // Run on IO thread so backgrounding doesn't cancel network calls
-        currentJobs[currentConvId] = viewModelScope.launch(Dispatchers.IO) {
+        currentJobs[myConvId] = viewModelScope.launch(Dispatchers.IO) {
+            // This conversation's own message list — independent of shared UI state
+            var myMsgs = storage.getConversation(myConvId)?.messages ?: emptyList()
             try {
                 // Clear plan state for new message (unless executing plan)
                 if (planPhase != PlanPhase.EXECUTING) {
@@ -358,7 +379,7 @@ ${PlanParser.planInstruction()}
                 }
 
                 // Add message history — sliding window: last 8 turns + summary of older
-                val historyMsgs = messages.map { msg ->
+                val historyMsgs = myMsgs.map { msg ->
                     if (msg.imageUri != null && msg.role == "user" && profile.visionModel.isBlank()) {
                         val contentsList = mutableListOf<Map<String, Any?>>()
                         if (msg.content.isNotBlank()) contentsList.add(mapOf("type" to "text", "text" to msg.content))
@@ -575,8 +596,8 @@ ${PlanParser.planInstruction()}
                                 val displayText = textContent.replace(Regex("```json[\\s\\S]*?```"), "").trim()
                                 val finalDisplay = if (displayText.isNotEmpty()) displayText
                                     else "📋 已生成任务计划（${parsed.tasks.size} 个步骤），请确认后开始执行。"
-                                messages = messages + ChatMessage(role = "assistant", content = finalDisplay)
-                                storage.updateMessages(currentConvId, messages)
+                                myMsgs = myMsgs + ChatMessage(role = "assistant", content = finalDisplay)
+                                commitMessages(myConvId, myMsgs)
                                 conversationDtos.add(ChatMessageDto(role = "assistant", content = finalDisplay))
                                 finishReason = "stop"
                                 continue
@@ -670,13 +691,14 @@ ${PlanParser.planInstruction()}
                                         val tc = unescapeUnicode(delta?.get("content") as? String)
                                         if (!rc.isNullOrBlank()) thinkBuf.append(rc)
                                         if (!tc.isNullOrBlank()) textBuf.append(tc)
-                                        // Update UI live
-                                        withContext(Dispatchers.Main) {
-                                            messages = messages.filter { it.role != "assistant_live" } + ChatMessage(
-                                                role = "assistant_live",
-                                                content = textBuf.toString(),
-                                                thinking = thinkBuf.toString()
-                                            )
+                                        // Update UI live (only if viewing this conversation)
+                                        myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
+                                            role = "assistant_live",
+                                            content = textBuf.toString(),
+                                            thinking = thinkBuf.toString()
+                                        )
+                                        if (myConvId == currentConvId) {
+                                            withContext(Dispatchers.Main) { messages = myMsgs }
                                         }
                                     } catch (_: Exception) {}
                                 }
@@ -688,12 +710,12 @@ ${PlanParser.planInstruction()}
                         withContext(NonCancellable + Dispatchers.Main) {
                             val finalText = textBuf.toString()
                             val finalThink = thinkBuf.toString()
-                            messages = messages.filter { it.role != "assistant_live" } + ChatMessage(
+                            myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                 role = "assistant",
                                 content = finalText,
                                 thinking = finalThink
                             )
-                            storage.updateMessages(currentConvId, messages)
+                            commitMessages(myConvId, myMsgs)
                         }
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = textBuf.toString()))
                         finishReason = "stop"
@@ -708,22 +730,22 @@ ${PlanParser.planInstruction()}
             } catch (e: Exception) {
                 withContext(NonCancellable + Dispatchers.Main) {
                     // Save partial content if streaming was interrupted (screen switch, network drop, etc.)
-                    val liveMsg = messages.find { it.role == "assistant_live" }
+                    val liveMsg = myMsgs.find { it.role == "assistant_live" }
                     if (liveMsg != null && liveMsg.content.isNotBlank()) {
-                        messages = messages.filter { it.role != "assistant_live" } + ChatMessage(
+                        myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                             role = "assistant",
                             content = liveMsg.content + "\n\n⚠️ [连接中断，以上为已生成内容]",
                             thinking = liveMsg.thinking
                         )
-                        storage.updateMessages(currentConvId, messages)
+                        commitMessages(myConvId, myMsgs)
                     }
                     errorMessage = "请求失败: ${e.localizedMessage ?: "未知错误"}"
                 }
             } finally {
                 withContext(NonCancellable + Dispatchers.Main) {
-                    currentJobs.remove(currentConvId)
-                    loadingConvs.remove(currentConvId)
-                    isLoading = currentConvId in loadingConvs
+                    currentJobs.remove(myConvId)
+                    loadingConvs.remove(myConvId)
+                    isLoading = myConvId in loadingConvs
                 }
             }
         }
@@ -1012,7 +1034,10 @@ ${PlanParser.planInstruction()}
                 }
             }
 
-            messages = messages + ChatMessage(role = "system", content = resumeMsg)
+            val myConvId = currentConvId
+            var myMsgs = storage.getConversation(myConvId)?.messages ?: emptyList()
+            myMsgs = myMsgs + ChatMessage(role = "system", content = resumeMsg)
+            commitMessages(myConvId, myMsgs)
             resumePending = false
             hasSavedState = false
             // Clean up
@@ -1021,8 +1046,8 @@ ${PlanParser.planInstruction()}
             // Trigger agent to continue - inject saved DTOs
             viewModelScope.launch(Dispatchers.IO) {
                 try {
-                    loadingConvs.add(currentConvId)
-                    isLoading = true
+                    loadingConvs.add(myConvId)
+                    isLoading = myConvId in loadingConvs
                     val dtos = state.conversationDtos.map { dto ->
                         ChatMessageDto(
                             role = dto["role"] as? String ?: "",
@@ -1049,8 +1074,8 @@ ${PlanParser.planInstruction()}
                     if (resp.isSuccessful) {
                         val reply = resp.body()?.choices?.firstOrNull()?.message?.content ?: ""
                         withContext(Dispatchers.Main) {
-                            messages = messages + ChatMessage(role = "assistant", content = reply)
-                            storage.updateMessages(currentConvId, messages)
+                            myMsgs = myMsgs + ChatMessage(role = "assistant", content = reply)
+                            commitMessages(myConvId, myMsgs)
                         }
                     }
                 } catch (e: Exception) {
@@ -1059,9 +1084,9 @@ ${PlanParser.planInstruction()}
                     }
                 } finally {
                     withContext(NonCancellable + Dispatchers.Main) {
-                        currentJobs.remove(currentConvId)
-                        loadingConvs.remove(currentConvId)
-                        isLoading = currentConvId in loadingConvs
+                        currentJobs.remove(myConvId)
+                        loadingConvs.remove(myConvId)
+                        isLoading = myConvId in loadingConvs
                     }
                 }
             }
