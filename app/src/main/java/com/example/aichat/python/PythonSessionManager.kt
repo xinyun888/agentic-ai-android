@@ -221,17 +221,28 @@ context = type('_Ctx', (), {
     }
 
     private fun pipInstall(py: Python, pkg: String): Boolean {
+        val safePkg = pkg.replace("'", "").replace("\"", "").trim()
         return try {
-            val pip = py.getModule("pip")
-            pip?.callAttr("main", listOf("install", pkg))?.toInt() == 0
+            // pip.main() was removed in pip 21+. Use subprocess with sys.executable (works in Chaquopy)
+            // + Tsinghua mirror to avoid PyPI timeout in China.
+            val builtins = py.getModule("builtins")
+            val ns = builtins.callAttr("dict")
+            ns.callAttr("__setitem__", "__pkg__", safePkg)
+            ns.callAttr("__setitem__", "__result__", builtins.callAttr("int", -1))
+            val script = """
+import sys, subprocess
+r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
+                    '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple',
+                    __pkg__], capture_output=True, text=True, timeout=180)
+__result__ = r.returncode
+""".trimIndent()
+            builtins.callAttr("exec", script, ns)
+            ns.callAttr("get", "__result__").toInt() == 0
         } catch (e: Exception) {
             try {
-                val mod = py.getModule("subprocess")
-                val result = mod?.callAttr("run",
-                    listOf("python", "-m", "pip", "install", pkg),
-                    mapOf("capture_output" to true, "text" to true)
-                )
-                result?.get("returncode")?.toInt() == 0
+                // Fallback: internal pip API
+                val pip = py.getModule("pip._internal")
+                pip?.callAttr("main", listOf("install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", pkg))?.toInt() == 0
             } catch (_: Exception) {
                 false
             }

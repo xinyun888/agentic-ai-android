@@ -142,6 +142,7 @@ fun ChatScreen(
         val i = Intent(context, com.example.aichat.service.ActiveModeService::class.java).apply {
             action = com.example.aichat.service.ActiveModeService.ACTION_START
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_PERSONA_ID, viewModel.activePersonaId)
+            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_CONV_ID, viewModel.currentConversationId())
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_INTERVAL_MIN, pmFrequency)
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_IMMERSIVE, pmImmersive)
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_SHOW_THINKING, !pmHideThink)
@@ -330,7 +331,7 @@ fun ChatScreen(
                         )
                     }
                     // Active mode toggle
-                    val isActiveRunning = com.example.aichat.service.ActiveModeService.isRunning
+                    val isActiveRunning = com.example.aichat.service.ActiveModeService.isRunning(viewModel.activePersonaId)
                     IconButton(
                         onClick = { showActiveModeDialog = true },
                         modifier = Modifier.size(36.dp)
@@ -1020,7 +1021,7 @@ fun ChatScreen(
     // Active mode configuration dialog
     if (showActiveModeDialog) {
         val ctx = context
-        val isRunning = com.example.aichat.service.ActiveModeService.isRunning
+        val isRunning = com.example.aichat.service.ActiveModeService.isRunning(viewModel.activePersonaId)
 
         AlertDialog(
             onDismissRequest = { showActiveModeDialog = false },
@@ -1028,6 +1029,7 @@ fun ChatScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
                     Text("角色：${viewModel.getActivePersona(ctx).emoji} ${viewModel.getActivePersona(ctx).name}")
+                    Text("每轮心跳消息会写回当前对话。多个角色可同时开启。", style = MaterialTheme.typography.labelSmall)
                     Text("频率", style = MaterialTheme.typography.labelSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
                         frequencyOptions.forEachIndexed { i, freq ->
@@ -1056,6 +1058,7 @@ fun ChatScreen(
                     if (isRunning) {
                         val stopIntent = Intent(ctx, com.example.aichat.service.ActiveModeService::class.java).apply {
                             action = com.example.aichat.service.ActiveModeService.ACTION_STOP
+                            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_PERSONA_ID, viewModel.activePersonaId)
                         }
                         ctx.startService(stopIntent)
                         showActiveModeDialog = false

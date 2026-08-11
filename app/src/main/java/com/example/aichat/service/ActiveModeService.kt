@@ -15,13 +15,13 @@ import com.example.aichat.MainActivity
 import com.example.aichat.R
 import com.example.aichat.data.*
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 class ActiveModeService : Service() {
 
@@ -31,26 +31,28 @@ class ActiveModeService : Service() {
         const val ACTION_START = "com.example.aichat.ACTION_START_ACTIVE"
         const val ACTION_STOP = "com.example.aichat.ACTION_STOP_ACTIVE"
         const val EXTRA_PERSONA_ID = "persona_id"
+        const val EXTRA_CONV_ID = "conv_id"
         const val EXTRA_INTERVAL_MIN = "interval_min"
         const val EXTRA_IMMERSIVE = "immersive"
         const val EXTRA_SHOW_THINKING = "show_thinking"
         const val EXTRA_START_HOUR = "start_hour"
         const val EXTRA_END_HOUR = "end_hour"
 
-        var isRunning = false
-            private set
+        /** Set of persona IDs currently running — supports multiple companions */
+        val runningPersonas: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        val runningConversations: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+        fun isRunning(personaId: String): Boolean = personaId in runningPersonas
     }
 
-    private var heartbeatJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val client = OkHttpClient()
     private val gson = Gson()
-    private var personaId = "worker"
-    private var intervalMin = 15
-    private var immersive = false
-    private var showThinking = false
-    private var startHour = 0
-    private var endHour = 24
+
+    /** One job per persona — parallel companions */
+    private val jobs = ConcurrentHashMap<String, Job>()
+    /** personaId → convId mapping, for cleanup */
+    private val personaConvs = ConcurrentHashMap<String, String>()
 
     override fun onCreate() {
         super.onCreate()
@@ -60,17 +62,20 @@ class ActiveModeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) return START_STICKY
         val action = intent.action ?: ""
+        val personaId = intent.getStringExtra(EXTRA_PERSONA_ID) ?: "worker"
         when {
-            action == ACTION_START || (action.isEmpty() && !isRunning) -> {
-                personaId = intent.getStringExtra(EXTRA_PERSONA_ID) ?: "worker"
-                intervalMin = intent.getIntExtra(EXTRA_INTERVAL_MIN, 15)
-                immersive = intent.getBooleanExtra(EXTRA_IMMERSIVE, false)
-                showThinking = intent.getBooleanExtra(EXTRA_SHOW_THINKING, false)
-                startHour = intent.getIntExtra(EXTRA_START_HOUR, 0)
-                endHour = intent.getIntExtra(EXTRA_END_HOUR, 24)
-                startHeartbeat()
+            action == ACTION_START -> {
+                val convId = intent.getStringExtra(EXTRA_CONV_ID) ?: ""
+                val intervalMin = intent.getIntExtra(EXTRA_INTERVAL_MIN, 15)
+                val immersive = intent.getBooleanExtra(EXTRA_IMMERSIVE, false)
+                val showThinking = intent.getBooleanExtra(EXTRA_SHOW_THINKING, false)
+                val startHour = intent.getIntExtra(EXTRA_START_HOUR, 0)
+                val endHour = intent.getIntExtra(EXTRA_END_HOUR, 24)
+                startHeartbeat(personaId, convId, intervalMin, immersive, showThinking, startHour, endHour)
             }
-            action == ACTION_STOP -> stopSelf()
+            action == ACTION_STOP -> {
+                stopHeartbeat(personaId)
+            }
         }
         return START_STICKY
     }
@@ -78,42 +83,62 @@ class ActiveModeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        heartbeatJob?.cancel()
+        jobs.values.forEach { it.cancel() }
+        jobs.clear()
+        runningPersonas.clear()
+        runningConversations.clear()
         scope.cancel()
-        isRunning = false
         super.onDestroy()
     }
 
-    private fun startHeartbeat() {
-        if (isRunning) return
-        isRunning = true
+    private fun startHeartbeat(
+        personaId: String, convId: String, intervalMin: Int, immersive: Boolean,
+        showThinking: Boolean, startHour: Int, endHour: Int
+    ) {
+        // Already running for this persona — ignore duplicate
+        if (personaId in runningPersonas) return
+        runningPersonas.add(personaId)
+        if (convId.isNotBlank()) {
+            runningConversations.add(convId)
+            personaConvs[personaId] = convId
+        }
+
         val persona = Personas.getById(personaId)
         val fullName = "${persona.emoji} ${persona.name}"
-        startForeground(1001, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · ${if (immersive) "沉浸" else "轻盈"}"))
 
-        heartbeatJob = scope.launch {
-            updateNotification("${fullName} 正在陪伴 · ${intervalMin}分钟后首次心跳")
+        // Per-persona foreground notification id (always positive)
+        val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
+        startForeground(fgId, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · 每轮心跳写回对话", fgId))
+
+        jobs[personaId] = scope.launch {
+            updateNotification(fgId, fullName, "${intervalMin}分钟后首次心跳")
             while (isActive) {
                 delay(intervalMin * 60_000L)
-                if (!isInTimeRange()) continue
+                if (!isInTimeRange(startHour, endHour)) continue
                 try {
-                    val result = doHeartbeat(persona)
-                    if (result.isNotBlank() && result != "PASS") {
-                        pushNotification(persona.name, result)
-                        // Also save to conversation so it appears in chat
-                        saveToConversation(persona, result)
-                        updateNotification("${fullName} 正在陪伴 · 已推送")
+                    val result = doHeartbeat(persona, convId, immersive, showThinking)
+                    if (result.isNotBlank() && !result.uppercase().startsWith("PASS")) {
+                        pushNotification(persona, result)
+                        saveToConversation(convId, persona, result)
+                        updateNotification(fgId, fullName, "已推送")
                     } else {
-                        updateNotification("${fullName} 正在陪伴 · 本轮PASS")
+                        updateNotification(fgId, fullName, "本轮PASS")
                     }
                 } catch (e: Exception) {
-                    updateNotification("${fullName} 心跳异常 · ${e.message?.take(20) ?: "未知"}")
+                    updateNotification(fgId, fullName, "心跳异常: ${e.message?.take(20) ?: "未知"}")
                 }
             }
         }
     }
 
-    private suspend fun doHeartbeat(persona: Persona): String {
+    private fun stopHeartbeat(personaId: String) {
+        val job = jobs.remove(personaId) ?: return
+        job.cancel()
+        runningPersonas.remove(personaId)
+        personaConvs.remove(personaId)?.let { runningConversations.remove(it) }
+    }
+
+    private suspend fun doHeartbeat(persona: Persona, convId: String, immersive: Boolean, showThinking: Boolean): String {
         val storage = StorageManager(this)
         val profile = storage.getActiveProfile()
             ?: storage.getProfiles().firstOrNull()
@@ -141,22 +166,26 @@ class ActiveModeService : Service() {
 ⚠️ 当前是休息时段或用户不在使用手机。你必须严格回复 PASS。
 """.trimIndent() else ""
 
+        // Memory file isolated per conversation
+        val memDir = if (convId.isBlank()) File(filesDir, "memory")
+                     else File(File(filesDir, "memory"), convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")).also { it.mkdirs() }
+
         if (immersive) {
             messages.add(ChatMessageDto(role = "system", content = persona.prompt))
-            val memFile = File(filesDir, "memory/memory.md")
+            val memFile = File(memDir, "memory.md")
             if (memFile.exists()) memFile.readText().take(1500).let {
                 if (it.isNotBlank()) messages.add(ChatMessageDto(role = "system", content = "长期记忆：\n$it"))
             }
         } else {
             messages.add(ChatMessageDto(role = "system", content = persona.heartbeatPrompt()))
-            val memFile = File(filesDir, "memory/memory.md")
+            val memFile = File(memDir, "memory.md")
             if (memFile.exists()) memFile.readText().take(400).let {
                 if (it.isNotBlank()) messages.add(ChatMessageDto(role = "system", content = "记忆：$it"))
             }
-            val convs = storage.getConversations()
-            val lastMsgs = convs.filter { it.profileId == personaId || it.profileId.isBlank() }
-                .flatMap { it.messages }.filter { it.role != "system" }.takeLast(4)
-            lastMsgs.forEach {
+            // Pull last messages from THIS conversation for context
+            val conv = convId.ifBlank { null }?.let { StorageManager(this).getConversation(it) }
+            val lastMsgs = conv?.messages?.filter { it.role != "system" }?.takeLast(4)
+            lastMsgs?.forEach {
                 messages.add(ChatMessageDto(role = it.role, content = it.content))
             }
         }
@@ -198,20 +227,20 @@ class ActiveModeService : Service() {
         val msg = first["message"] as? Map<*, *> ?: return ""
         val content = msg["content"]?.toString()?.trim() ?: return ""
         // Match "PASS" or "PASS（...）" etc
-        val isPass = content.uppercase().startsWith("PASS") || 
+        val isPass = content.uppercase().startsWith("PASS") ||
                       content.equals("PASS", ignoreCase = true)
         return if (isPass) "" else content
     }
 
-    private fun pushNotification(title: String, content: String) {
+    private fun pushNotification(persona: Persona, content: String) {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra("open_conversation", personaId)
+            putExtra("open_persona", persona.id)
         }
         val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val display = if (content.length > 200) content.take(200) + "…" else content
         val notif = NotificationCompat.Builder(this, CHANNEL_PUSH)
-            .setContentTitle("${Personas.getById(personaId).emoji} $title")
+            .setContentTitle("${persona.emoji} ${persona.name}")
             .setContentText(display)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pi)
@@ -223,40 +252,42 @@ class ActiveModeService : Service() {
         nm.notify((System.currentTimeMillis() % 100000).toInt(), notif)
     }
 
-    private fun saveToConversation(persona: Persona, content: String) {
+    private fun saveToConversation(convId: String, persona: Persona, content: String) {
         try {
+            if (convId.isBlank()) return
             val storage = StorageManager(this)
             val convs = storage.getConversations().toMutableList()
-            // Save to most recently active conversation
-            val idx = convs.indices.maxByOrNull { convs[it].updatedAt } ?: return
-            val target = convs[idx]
-            convs[idx] = target.copy(
-                messages = target.messages + ChatMessage(
-                    role = "assistant",
-                    content = "[${persona.emoji}${persona.name}] $content",
-                    timestamp = System.currentTimeMillis()
-                ),
-                updatedAt = System.currentTimeMillis()
-            )
-            storage.saveConversations(convs)
+            val idx = convs.indexOfFirst { it.id == convId }
+            if (idx >= 0) {
+                val target = convs[idx]
+                convs[idx] = target.copy(
+                    messages = target.messages + ChatMessage(
+                        role = "assistant",
+                        content = "[${persona.emoji}${persona.name}] $content",
+                        timestamp = System.currentTimeMillis()
+                    ),
+                    updatedAt = System.currentTimeMillis()
+                )
+                storage.saveConversations(convs)
+            }
         } catch (_: Exception) {}
     }
 
-    private fun updateNotification(text: String) {
+    private fun updateNotification(fgId: Int, fullName: String, text: String) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(1001, buildNotification("", text))
+        nm.notify(fgId, buildNotification(fullName + " 正在陪伴", text, fgId))
     }
 
-    private fun buildNotification(title: String, text: String): Notification {
+    private fun buildNotification(title: String, text: String, fgId: Int): Notification {
         val intent = Intent(this, MainActivity::class.java)
-        val pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val pi = PendingIntent.getActivity(this, fgId, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL_FG)
             .setContentTitle(title).setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pi).setOngoing(true).build()
     }
 
-    private fun isInTimeRange(): Boolean {
+    private fun isInTimeRange(startHour: Int, endHour: Int): Boolean {
         val now = java.time.LocalTime.now()
         return now.hour in startHour until endHour
     }

@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.aichat.data.*
 import com.example.aichat.data.tools.*
 import com.example.aichat.python.PythonSessionManager
+import com.example.aichat.service.ActiveModeService
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
@@ -213,6 +214,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var lastBaseUrl: String = ""
     private val gson = Gson()
 
+    fun currentConversationId(): String = currentConvId
+
     /** Persist messages to a specific conversation. Sync UI only if that conversation is being viewed. */
     private fun commitMessages(convId: String, msgs: List<ChatMessage>) {
         storage.updateMessages(convId, msgs)
@@ -318,7 +321,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 // Static persona + rules (always first for DeepSeek prefix caching)
                 val persona = getActivePersona(getApplication<android.app.Application>())
-                val workspaceFiles = workspaceStatus()
+                val workspaceFiles = workspaceStatus(myConvId)
                 conversationDtos.add(
                     ChatMessageDto(role = "system",
                         content = persona.prompt + "\n\n" + """
@@ -332,6 +335,8 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 ⑤ **写完自测**：任何代码写完后立即 python_exec 跑一遍验证。
 ⑥ **对外回答**：最终回答用户时，禁止说"我用了 xxx 工具""根据 xxx 的执行结果"等内部过程描述。直接给结论，像你本来就该知道一样。
 ⑦ **长期记忆**：每次发现用户偏好、项目决策、重要上下文时，立即用 `memory_save` 记下来。下次对话开始时会自动加载你的记忆，这样你不会忘。
+⑧ **对话隔离**：工作区和记忆都按对话隔离。write_file / build_html 保存文件时，写到 workspace/${if (myConvId.isBlank()) "" else sanitize(myConvId) + "/"} 目录下（你的专属目录）。默认只查看工作区中本对话的文件。如果用户主动要求查看其他对话或全局文件，可以用 read_file 读取完整路径。
+⑨ **工具调用纪律**：需要计算、执行代码、搜索、读写文件时，直接发出工具调用（function calling），系统会自动执行并把结果返回给你。禁止把工具调用、代码、JSON 结构写进你的回答文本——回答里只放最终结论。禁止假装执行（如"我用Python算了一下结果是X"）——没调用工具就是没算。
 
 $workspaceFiles
 
@@ -422,8 +427,8 @@ ${PlanParser.planInstruction()}
                         content = "你处于「学习模式」。每个操作完成后，用 [WHY] 起头，用 1-2 句话解释你为什么要这样做、为什么选择这个工具而不是其他方案。"))
                 }
 
-                // Auto-load model's workspace memory
-                val memFile = java.io.File(getApplication<android.app.Application>().filesDir, "memory/memory.md")
+                // Auto-load model's workspace memory (isolated per conversation)
+                val memFile = java.io.File(memoryDir(myConvId), "memory.md")
                 if (memFile.exists() && memFile.readText().isNotBlank()) {
                     val mem = memFile.readText().take(4000)
                     dynamicSystemMsgs.add(ChatMessageDto(role = "system",
@@ -449,8 +454,8 @@ ${PlanParser.planInstruction()}
                     }
                 }
 
-                // User memory（跨项目偏好）
-                val memory = loadUserMemory()
+                // User memory（按对话隔离）
+                val memory = loadUserMemory(myConvId)
                 if (memory.isNotBlank()) {
                     dynamicSystemMsgs.add(ChatMessageDto(role = "system",
                         content = "## 用户记忆\n\n以下是之前对话中记录的偏好和习惯，请在思考和决策时参考：\n\n$memory"))
@@ -498,7 +503,7 @@ ${PlanParser.planInstruction()}
                             val keyRequests = userMsgs.mapNotNull { (it.content?.toString() ?: "").take(200) }
                                 .filter { it.length > 20 }
                             if (keyRequests.isNotEmpty()) {
-                                saveUserMemory("用户曾处理：${keyRequests.take(3).joinToString("；")}")
+                                saveUserMemory(myConvId, "用户曾处理：${keyRequests.take(3).joinToString("；")}")
                             }
                             conversationDtos.removeAll { it in drop }
                         }
@@ -518,8 +523,9 @@ ${PlanParser.planInstruction()}
                         // Agent loop: use "low" reasoning instead of "max" — fast enough for tool
                         // decisions but still gives the model a chance to think before acting.
                         // Final SSE streaming answer still uses "max" for deep reasoning.
-                        reasoningEffort = if (profile.thinkingEnabled) "low" else null,
-                        thinking = if (profile.thinkingEnabled) mapOf("type" to "enabled") else null,
+                        // Companionship conversations hide thinking entirely
+                        reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "low" else null,
+                        thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(
                             ToolRegistry.toolCallsToJson(),
                             object : TypeToken<List<Map<String, Any>>>() {}.type
@@ -553,7 +559,7 @@ ${PlanParser.planInstruction()}
                             withContext(Dispatchers.Main) {
                                 agentSteps = agentSteps + AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments)
                             }
-                            val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication())
+                            val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication(), myConvId)
                             // Preview detection: build_html output
                             val previewJson = Regex("""\{"type":"preview","file":"([^"]+)","title":"([^"]*)"\}""").find(result.content)
                             if (previewJson != null && tc.function.name == "build_html") {
@@ -621,7 +627,7 @@ ${PlanParser.planInstruction()}
                             )
                             for (pat in prefPatterns) {
                                 val found = pat.find(textContent) ?: continue
-                                saveUserMemory(found.value.trim())
+                                saveUserMemory(myConvId, found.value.trim())
                             }
                         }
 
@@ -641,10 +647,14 @@ ${PlanParser.planInstruction()}
                                 }
                                 m
                             },
+                            // Include tools so the model keeps using tool-call mechanism in streaming,
+                            // instead of emitting tool-call text as its answer
+                            "tools" to gson.fromJson(ToolRegistry.toolCallsToJson(), object : TypeToken<List<Map<String, Any>>>() {}.type),
+                            "tool_choice" to "auto",
                             "stream" to true
                         ).let { base ->
                             val full = base.toMutableMap()
-                            if (profile.thinkingEnabled) {
+                            if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) {
                                 full["reasoning_effort"] = "max"
                                 full["thinking"] = mapOf("type" to "enabled")
                             }
@@ -676,6 +686,8 @@ ${PlanParser.planInstruction()}
                         val reader = BufferedReader(InputStreamReader(streamResp.body!!.byteStream()))
                         val textBuf = StringBuilder()
                         val thinkBuf = StringBuilder()
+                        // Collect streaming tool_calls (index -> accumulated name/arguments)
+                        val streamToolCalls = mutableMapOf<Int, MutableMap<String, String>>()
 
                         reader.useLines { lines ->
                             lines.forEach { line ->
@@ -691,6 +703,17 @@ ${PlanParser.planInstruction()}
                                         val tc = unescapeUnicode(delta?.get("content") as? String)
                                         if (!rc.isNullOrBlank()) thinkBuf.append(rc)
                                         if (!tc.isNullOrBlank()) textBuf.append(tc)
+                                        // Streaming tool calls
+                                        val tcs = delta?.get("tool_calls") as? List<Map<String, Any>>
+                                        if (!tcs.isNullOrEmpty()) {
+                                            for (t in tcs) {
+                                                val idx = (t["index"] as? Double)?.toInt() ?: 0
+                                                val fn = t["function"] as? Map<String, Any> ?: continue
+                                                val entry = streamToolCalls.getOrPut(idx) { mutableMapOf("name" to "", "arguments" to "") }
+                                                (fn["name"] as? String)?.let { entry["name"] = entry["name"] + it }
+                                                (fn["arguments"] as? String)?.let { entry["arguments"] = entry["arguments"] + it }
+                                            }
+                                        }
                                         // Update UI live (only if viewing this conversation)
                                         myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                             role = "assistant_live",
@@ -705,6 +728,51 @@ ${PlanParser.planInstruction()}
                             }
                         }
                         streamResp.close()
+
+                        // If the model streamed tool calls, execute them and continue the agent loop
+                        if (streamToolCalls.isNotEmpty()) {
+                            val calls = streamToolCalls.entries.sortedBy { it.key }.mapIndexed { i, (_, m) ->
+                                val rawArgs = m["arguments"] ?: "{}"
+                                val parsedArgs: Map<String, String> = try {
+                                    gson.fromJson(rawArgs, object : TypeToken<Map<String, String>>() {}.type)
+                                } catch (e: Exception) { mapOf("_raw" to rawArgs) }
+                                com.example.aichat.data.tools.ToolCall(
+                                    id = "stream_${System.currentTimeMillis()}_$i",
+                                    name = m["name"] ?: "",
+                                    arguments = parsedArgs
+                                )
+                            }
+                            // Keep live message on screen while tools run
+                            conversationDtos.add(ChatMessageDto(
+                                role = "assistant", content = null,
+                                toolCalls = calls.map { ToolCallDto(
+                                    id = it.id, type = "function",
+                                    function = ToolCallFunctionDto(name = it.name, arguments = gson.toJson(it.arguments))
+                                )}
+                            ))
+                            for (tc in calls) {
+                                withContext(Dispatchers.Main) {
+                                    agentSteps = agentSteps + AgentStep(type = "tool_call", toolName = tc.name, toolArgs = gson.toJson(tc.arguments))
+                                }
+                                val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.name, arguments = tc.arguments), getApplication(), myConvId)
+                                val previewJson = Regex("""\{"type":"preview","file":"([^"]+)","title":"([^"]*)"\}""").find(result.content)
+                                if (previewJson != null && tc.name == "build_html") {
+                                    val f = previewJson.groupValues[1]
+                                    val t = previewJson.groupValues[2].ifBlank { f }
+                                    withContext(Dispatchers.Main) {
+                                        previewItems = previewItems.filter { it.file != f } + PreviewItem(f, t)
+                                        activePreviewIndex = previewItems.lastIndex
+                                        previewMode = PreviewMode.HALF
+                                    }
+                                }
+                                withContext(Dispatchers.Main) {
+                                    agentSteps = agentSteps + AgentStep(type = "tool_result", toolName = tc.name, content = result.content)
+                                }
+                                conversationDtos.add(ChatMessageDto(role = "tool", content = result.content, toolCallId = tc.id))
+                            }
+                            if (planPhase == PlanPhase.EXECUTING) saveState(conversationDtos, round)
+                            continue
+                        }
 
                         // Finalize with NonCancellable so backgrounding doesn't lose the message
                         withContext(NonCancellable + Dispatchers.Main) {
@@ -797,13 +865,17 @@ ${PlanParser.planInstruction()}
 
     // --- Web Search (multi-source OkHttp, works from China) ---
 
-    private fun workspaceStatus(): String {
-        val wsDir = java.io.File(getApplication<android.app.Application>().filesDir, "workspace").also { it.mkdirs() }
+    private fun workspaceStatus(convId: String): String {
+        val wsRoot = java.io.File(getApplication<android.app.Application>().filesDir, "workspace").also { it.mkdirs() }
+        // Isolate: only show this conversation's own subdirectory
+        val wsDir = if (convId.isBlank()) wsRoot
+                    else java.io.File(wsRoot, sanitize(convId)).also { it.mkdirs() }
         val files = wsDir.listFiles()?.toList() ?: return ""
         val count = files.size
         if (count == 0) return ""
         val names = files.sortedBy { it.name }.take(15).joinToString(", ") { it.name }
-        return "工作区有 $count 个文件: $names" + if (count > 15) " ..." else ""
+        val pathHint = if (convId.isBlank()) "workspace/" else "workspace/${sanitize(convId)}/"
+        return "工作区（$pathHint）有 $count 个文件: $names" + if (count > 15) " ..." else ""
     }
 
     private suspend fun performSearch(query: String): String {
@@ -916,22 +988,30 @@ ${PlanParser.planInstruction()}
         return results
     }
 
-    // --- User Memory ---
+    // --- User Memory (isolated per conversation) ---
 
-    private fun getMemoryFile(): java.io.File {
-        return java.io.File(getApplication<android.app.Application>().filesDir, ".agent_memory.txt")
+    private fun memoryDir(convId: String): java.io.File {
+        val dir = java.io.File(getApplication<android.app.Application>().filesDir, "memory")
+        return if (convId.isBlank()) dir else java.io.File(dir, sanitize(convId)).also { it.mkdirs() }
     }
 
-    private fun loadUserMemory(): String {
+    private fun sanitize(id: String): String = id.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+
+    private fun getMemoryFile(convId: String): java.io.File {
+        return java.io.File(memoryDir(convId), ".agent_memory.txt")
+    }
+
+    private fun loadUserMemory(convId: String): String {
         return try {
-            val f = getMemoryFile()
+            val f = getMemoryFile(convId)
             if (f.exists()) f.readText(Charsets.UTF_8).take(2000) else ""
         } catch (_: Exception) { "" }
     }
 
-    private fun saveUserMemory(entry: String) {
+    private fun saveUserMemory(convId: String, entry: String) {
         try {
-            val f = getMemoryFile()
+            val f = getMemoryFile(convId)
+            f.parentFile?.mkdirs()
             val existing = if (f.exists()) f.readText(Charsets.UTF_8) else ""
             if (existing.contains(entry)) return // dedup
             f.writeText("$existing\n$entry".trim(), Charsets.UTF_8)
@@ -1062,8 +1142,8 @@ ${PlanParser.planInstruction()}
                     val request = ChatRequest(
                         model = profile.model,
                         messages = dtos,
-                        reasoningEffort = if (profile.thinkingEnabled) "max" else null,
-                        thinking = if (profile.thinkingEnabled) mapOf("type" to "enabled") else null,
+                        reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "max" else null,
+                        thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(ToolRegistry.toolCallsToJson(),
                             object : TypeToken<List<Map<String, Any>>>() {}.type),
                         stream = false

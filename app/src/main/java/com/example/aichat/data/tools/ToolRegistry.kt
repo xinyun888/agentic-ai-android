@@ -42,6 +42,9 @@ data class ToolResult(
 interface Tool {
     val definition: ToolDef
     suspend fun execute(args: Map<String, String>, context: Context): ToolResult
+    /** Per-conversation execution. Default delegates to execute(); memory tools override for isolation. */
+    suspend fun executeForConv(args: Map<String, String>, context: Context, convId: String): ToolResult =
+        execute(args, context)
 }
 
 // ==================== Workspace ====================
@@ -549,10 +552,13 @@ class MemorySaveTool : Tool {
             "required" to listOf("key", "content")
         )
     )
-    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult {
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
         val key = args["key"]?.trim() ?: return ToolResult("", false, "需要 key")
         val content = args["content"]?.trim() ?: return ToolResult("", false, "需要 content")
-        val memDir = java.io.File(context.filesDir, "memory").also { it.mkdirs() }
+        val memDir = memDirFor(convId, context)
         val memFile = java.io.File(memDir, "memory.md")
         try {
             val existing = if (memFile.exists()) memFile.readText() else ""
@@ -571,14 +577,25 @@ class MemorySaveTool : Tool {
     }
 }
 
+/** Memory directory, isolated per conversation */
+private fun memDirFor(convId: String, context: android.content.Context): java.io.File {
+    val dir = java.io.File(context.filesDir, "memory").also { it.mkdirs() }
+    if (convId.isBlank()) return dir
+    val sub = convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+    return java.io.File(dir, sub).also { it.mkdirs() }
+}
+
 class MemoryLoadTool : Tool {
     override val definition = ToolDef(
         name = "memory_load",
         description = "读取你的长期记忆，回顾之前记住的用户偏好、项目决策和重要上下文",
         parameters = mapOf("type" to "object", "properties" to emptyMap<String, Any>())
     )
-    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult {
-        val memFile = java.io.File(context.filesDir, "memory/memory.md")
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
+        val memFile = java.io.File(memDirFor(convId, context), "memory.md")
         if (!memFile.exists()) return ToolResult("", true, "(记忆为空)")
         val content = memFile.readText().take(10000)
         return ToolResult("", true, content)
@@ -730,11 +747,11 @@ object ToolRegistry {
         return tools.map { it.definition }
     }
 
-    suspend fun execute(toolCall: ToolCall, context: Context): ToolResult {
+    suspend fun execute(toolCall: ToolCall, context: Context, convId: String = ""): ToolResult {
         val tool = tools.find { it.definition.name == toolCall.name }
             ?: return ToolResult(toolCall.id, false, "未知工具: ${toolCall.name}")
         return try {
-            tool.execute(toolCall.arguments, context).copy(toolCallId = toolCall.id)
+            tool.executeForConv(toolCall.arguments, context, convId).copy(toolCallId = toolCall.id)
         } catch (e: Exception) {
             ToolResult(toolCall.id, false, "执行错误: ${e.message}")
         }
