@@ -509,8 +509,8 @@ class PipInstallTool(private val pyManager: () -> com.example.aichat.python.Pyth
         val results = mutableListOf<String>()
         for (pkg in pkgs.split(Regex("\\s+"))) {
             if (pkg.isBlank()) continue
-            val ok = py.install(pkg)
-            results.add(if (ok) "✓ $pkg 安装成功" else "✗ $pkg 安装失败")
+            val err = py.installVerbose(pkg)
+            results.add(if (err.isEmpty()) "✓ $pkg 安装成功" else "✗ $pkg 安装失败: $err")
         }
         return ToolResult("", true, results.joinToString("\n"))
     }

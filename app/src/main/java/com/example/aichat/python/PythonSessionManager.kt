@@ -90,6 +90,12 @@ class PythonSessionManager(private val context: Context) {
         pipInstall(Python.getInstance(), packageName)
     }
 
+    /** Install and return error details ("" = success) so the model can report the real cause. */
+    suspend fun installVerbose(packageName: String): String = withContext(Dispatchers.IO) {
+        ensureInitialized()
+        pipInstallVerbose(Python.getInstance(), packageName)
+    }
+
     fun closeSession(sessionId: String) {
         sessions.remove(sessionId)
     }
@@ -220,32 +226,42 @@ context = type('_Ctx', (), {
         return null
     }
 
-    private fun pipInstall(py: Python, pkg: String): Boolean {
-        val safePkg = pkg.replace("'", "").replace("\"", "").trim()
-        return try {
-            // pip.main() was removed in pip 21+. Use subprocess with sys.executable (works in Chaquopy)
-            // + Tsinghua mirror to avoid PyPI timeout in China.
-            val builtins = py.getModule("builtins")
-            val ns = builtins.callAttr("dict")
-            ns.callAttr("__setitem__", "__pkg__", safePkg)
-            ns.callAttr("__setitem__", "__result__", builtins.callAttr("int", -1))
-            val script = """
-import sys, subprocess
-r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
-                    '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple',
-                    __pkg__], capture_output=True, text=True, timeout=180)
-__result__ = r.returncode
-""".trimIndent()
-            builtins.callAttr("exec", script, ns)
-            ns.callAttr("get", "__result__").toInt() == 0
+    private val pipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+    /** Returns "" on success, or an error description. Primary path: in-process pip._internal.main. */
+    private fun pipInstallVerbose(py: Python, pkg: String): String {
+        // 1) In-process pip._internal.main — pip 21+ removed pip.main; _internal.main still works.
+        //    No subprocess, so it doesn't matter that Chaquopy's sys.executable isn't executable.
+        try {
+            val pip = py.getModule("pip._internal")
+            val rc = pip?.callAttr("main", listOf("install", "--no-cache-dir", "--disable-pip-version-check",
+                "-i", pipMirror, pkg))
+            return if (rc?.toInt() == 0) "" else "pip._internal 退出码: ${rc?.toInt() ?: "null"}"
         } catch (e: Exception) {
+            // 2) Fallback: subprocess with sys.executable + capture stderr for diagnostics
             try {
-                // Fallback: internal pip API
-                val pip = py.getModule("pip._internal")
-                pip?.callAttr("main", listOf("install", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple", pkg))?.toInt() == 0
-            } catch (_: Exception) {
-                false
+                val builtins = py.getModule("builtins")
+                val ns = builtins.callAttr("dict")
+                ns.callAttr("__setitem__", "__pkg__", pkg)
+                ns.callAttr("__setitem__", "__rc__", builtins.callAttr("int", -1))
+                ns.callAttr("__setitem__", "__err__", builtins.callAttr("str", ""))
+                val script = """
+import sys, subprocess
+r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', '--disable-pip-version-check',
+                    '-i', '$pipMirror', __pkg__],
+                   capture_output=True, text=True, timeout=180)
+__rc__ = r.returncode
+__err__ = (r.stdout[-600:] + r.stderr[-600:]).strip()
+""".trimIndent()
+                builtins.callAttr("exec", script, ns)
+                val rc = ns.callAttr("get", "__rc__").toInt()
+                val err = ns.callAttr("get", "__err__").toString()
+                return if (rc == 0) "" else "pip 退出码 $rc: $err"
+            } catch (e2: Exception) {
+                return "pip 执行失败: ${e2.message}"
             }
         }
     }
+
+    private fun pipInstall(py: Python, pkg: String): Boolean = pipInstallVerbose(py, pkg).isEmpty()
 }

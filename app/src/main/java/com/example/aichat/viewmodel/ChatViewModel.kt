@@ -329,6 +329,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 
 ## 工具使用铁律
 ① **时间和日期**：任何时候涉及"现在""今天""当前"，必须用 python_exec 执行 `import datetime; print(datetime.datetime.now())` 获取真实时间，禁止用训练数据中的时间。
+⑪ **日期换算（硬性）**：任何"某月某日是什么干支/农历/节气/星期"的换算问题，必须用 python_exec 调用 lunar_python 或 datetime 计算，禁止凭记忆推算。示例：`from lunar_python import Solar; s=Solar.fromYmd(2026,8,10); l=s.getLunar(); print('农历:', l.toString()); print('日干支:', l.getEightChar().getDay())`。日期算错是最严重的错误，宁可调用工具也不要猜。
 ② **计算和数据**：涉及数字计算、数据分析、表格处理，必须用 python_exec，不要心算。
 ③ **实时信息**：天气、新闻、股价、汇率等，用 web_fetch 搜索，不要编造。
 ④ **文件操作**：读写文件用 read_file / write_file，生成页面用 build_html。
@@ -557,6 +558,12 @@ ${PlanParser.planInstruction()}
 
                     // ALWAYS process tool calls if present, regardless of finishReason
                     if (!msg.toolCalls.isNullOrEmpty()) {
+                        // Preserve any text the model emitted alongside tool calls
+                        if (!msg.content.isNullOrBlank()) {
+                            myMsgs = myMsgs + ChatMessage(role = "assistant", content = msg.content)
+                            commitMessages(myConvId, myMsgs)
+                            conversationDtos.add(ChatMessageDto(role = "assistant", content = msg.content))
+                        }
                         // Don't pass the model's "我来搜索..." chatter to API — it's noise
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = null, toolCalls = msg.toolCalls))
                         for (tc in msg.toolCalls) {
@@ -738,6 +745,20 @@ ${PlanParser.planInstruction()}
 
                         // If the model streamed tool calls, execute them and continue the agent loop
                         if (streamToolCalls.isNotEmpty()) {
+                            // Preserve text/thinking already emitted this round — the model may
+                            // have written part of its answer before calling a tool (e.g. saving memory).
+                            // Without this, the final answer gets swallowed.
+                            val partialText = textBuf.toString()
+                            val partialThink = thinkBuf.toString()
+                            if (partialText.isNotBlank() || partialThink.isNotBlank()) {
+                                myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
+                                    role = "assistant",
+                                    content = partialText,
+                                    thinking = partialThink
+                                )
+                                commitMessages(myConvId, myMsgs)
+                                conversationDtos.add(ChatMessageDto(role = "assistant", content = partialText))
+                            }
                             val calls = streamToolCalls.entries.sortedBy { it.key }.mapIndexed { i, (_, m) ->
                                 val rawArgs = m["arguments"] ?: "{}"
                                 val parsedArgs: Map<String, String> = try {
