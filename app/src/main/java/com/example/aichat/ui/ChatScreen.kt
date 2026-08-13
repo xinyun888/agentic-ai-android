@@ -58,7 +58,7 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.zip.ZipInputStream
 
-// File type helpers — extract text from Office XML formats
+// 文件类型辅助函数 —— 从 Office XML 格式提取文本
 fun readZipXmlText(bytes: ByteArray, targetEntry: String): String {
     val sb = StringBuilder()
     ZipInputStream(bytes.inputStream()).use { zis ->
@@ -111,7 +111,7 @@ fun readXlsxText(bytes: ByteArray): String {
     return sb.toString().ifEmpty { "(空表格)" }
 }
 
-// Text-like extensions: read as UTF-8 text directly
+// 文本类扩展名：直接按 UTF-8 文本读取
 val TEXT_EXTS = setOf("txt", "md", "csv", "json", "xml", "html", "htm", "css", "js", "ts",
     "py", "java", "kt", "cpp", "c", "h", "rs", "go", "rb", "php", "swift",
     "yaml", "yml", "toml", "ini", "cfg", "log", "sql", "sh", "bat", "ps1")
@@ -157,16 +157,16 @@ fun ChatScreen(
         ActivityResultContracts.RequestPermission()
     ) { granted -> if (granted) startNow() }
     var workspaceFiles by remember { mutableStateOf<List<java.io.File>>(emptyList()) }
-    // File viewer overlay state
+    // 文件查看器浮层状态
     var viewerFile by remember { mutableStateOf<java.io.File?>(null) }
     var viewerContent by remember { mutableStateOf("") }
 
-    // Image picker
+    // 图片选择器
     val imagePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
-            // Convert to base64 data URI for API
+            // 转为 base64 data URI 供 API 使用
             val base64 = context.contentResolver.openInputStream(it)?.use { stream ->
                 val bytes = stream.readBytes()
                 val mime = context.contentResolver.getType(it) ?: "image/jpeg"
@@ -176,7 +176,7 @@ fun ChatScreen(
         }
     }
 
-    // File picker — save to workspace, let Agent handle with tools
+    // 文件选择器 —— 保存到工作区，交给 Agent 用工具处理
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -187,7 +187,7 @@ fun ChatScreen(
             } ?: "未知文件"
             val ext = name.substringAfterLast('.').lowercase()
 
-            // Save to workspace
+            // 保存到工作区
             val wsDir = java.io.File(context.filesDir, "workspace").also { it.mkdirs() }
             val destFile = java.io.File(wsDir, name)
             try {
@@ -197,7 +197,7 @@ fun ChatScreen(
             } catch (_: Exception) { return@let }
             viewModel.pendingFileText = Pair(name, ext)
 
-            // Also extract text preview if it's a document format
+            // 若是文档格式，同时提取文本预览
             if (ext in TEXT_EXTS || ext in setOf("docx", "pptx", "xlsx")) {
                 val text = try {
                     val bytes = destFile.readBytes()
@@ -214,7 +214,7 @@ fun ChatScreen(
         }
     }
 
-    // Share launcher
+    // 分享启动器
     val shareLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { _ -> }
@@ -259,7 +259,7 @@ fun ChatScreen(
                     containerColor = MaterialTheme.colorScheme.surface
                 ),
                 actions = {
-                    // Persona selector
+                    // 角色选择器
                     var showPersonaMenu by remember { mutableStateOf(false) }
                     Box {
                         TextButton(onClick = { showPersonaMenu = true }) {
@@ -285,14 +285,14 @@ fun ChatScreen(
                                     }
                                 )
                             }
-                            // Custom persona management
+                            // 自定义角色管理
                             Divider()
                             DropdownMenuItem(
                                 text = { Text("+ 创建角色", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary) },
                                 onClick = { editingPersona = null; showPersonaEditor = true; showPersonaMenu = false },
                                 leadingIcon = { Icon(Icons.Filled.Add, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary) }
                             )
-                            // Delete button for custom personas
+                            // 自定义角色的删除按钮
                             val customPersonas = Personas.loadCustom(context)
                             customPersonas.forEach { cp ->
                                 DropdownMenuItem(
@@ -312,7 +312,7 @@ fun ChatScreen(
                             }
                         }
                     }
-                    // Workspace files
+                    // 工作区文件
                     IconButton(
                         onClick = {
                             workspaceFiles = workspaceDir.listFiles()?.sortedBy { it.name }?.toList() ?: emptyList()
@@ -330,7 +330,7 @@ fun ChatScreen(
                             modifier = Modifier.size(20.dp)
                         )
                     }
-                    // Active mode toggle
+                    // 主动模式开关
                     val isActiveRunning = com.example.aichat.service.ActiveModeService.isRunning(viewModel.activePersonaId)
                     IconButton(
                         onClick = { showActiveModeDialog = true },
@@ -339,7 +339,7 @@ fun ChatScreen(
                         Text("❤️", fontSize = if (isActiveRunning) 18.sp else 14.sp,
                             modifier = Modifier.alpha(if (isActiveRunning) 1f else 0.4f))
                     }
-                    // Phone control setup
+                    // 手机控制设置
                     val accessibilityEnabled = com.example.aichat.service.ScreenControlService.instance != null
                     IconButton(
                         onClick = {
@@ -356,7 +356,7 @@ fun ChatScreen(
                             modifier = Modifier.size(20.dp)
                         )
                     }
-                    // Learning mode toggle
+                    // 学习模式开关
                     IconButton(
                         onClick = { viewModel.learningMode = !viewModel.learningMode },
                         modifier = Modifier.size(36.dp)
@@ -376,7 +376,7 @@ fun ChatScreen(
         },
         bottomBar = {
             Column {
-                // Image preview
+                // 图片预览
                 viewModel.pendingImageUri?.let { dataUri ->
                     Surface(
                         modifier = Modifier
@@ -414,7 +414,7 @@ fun ChatScreen(
                     Spacer(modifier = Modifier.height(4.dp))
                 }
 
-                // File preview
+                // 文件预览
                 viewModel.pendingFileText?.let { (name, _) ->
                     val fileSize = java.io.File(context.filesDir, "workspace/$name").let {
                         if (it.exists()) "${it.length() / 1024}KB" else ""
@@ -480,7 +480,7 @@ fun ChatScreen(
                         shape = RoundedCornerShape(24.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    // + button with dropdown menu
+                    // 带下拉菜单的 + 按钮
                     var showTools by remember { mutableStateOf(false) }
                     Box {
                         IconButton(onClick = { showTools = true }) {
@@ -564,7 +564,7 @@ fun ChatScreen(
                 alpha = 0.7f
             )
             Column {
-            // Resume banner
+            // 恢复任务横幅
             if (viewModel.resumePending) {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -591,7 +591,7 @@ fun ChatScreen(
                 }
             }
 
-            // Error banner
+            // 错误横幅
             viewModel.errorMessage?.let { error ->
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -614,7 +614,7 @@ fun ChatScreen(
                 }
             }
 
-            // Plan card (review mode or executing)
+            // 计划卡片（审核模式或执行中）
             val plan = viewModel.currentPlan
             val showPlan = plan != null && (viewModel.planPhase == ChatViewModel.PlanPhase.REVIEWING || viewModel.planPhase == ChatViewModel.PlanPhase.EXECUTING)
             if (showPlan) {
@@ -631,7 +631,7 @@ fun ChatScreen(
                 )
             }
 
-            // Preview panel — collapsed bar + expandable list + 3-mode preview
+            // 预览面板 —— 折叠条 + 可展开列表 + 三态预览
             val items = viewModel.previewItems
             if (items.isNotEmpty()) {
                 val active = viewModel.activePreviewFile()
@@ -641,7 +641,7 @@ fun ChatScreen(
                 when (mode) {
                     ChatViewModel.PreviewMode.COLLAPSED -> {
                         Column {
-                            // Collapsed bar
+                            // 折叠条
                             Surface(
                                 modifier = Modifier.fillMaxWidth(),
                                 color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)
@@ -651,7 +651,7 @@ fun ChatScreen(
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Text("\uD83D\uDCC1 ${items.size} 个预览", style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
-                                    // File list toggle
+                                    // 文件列表开关
                                     IconButton(
                                         onClick = { showFileList = !showFileList },
                                         modifier = Modifier.size(32.dp)
@@ -660,7 +660,7 @@ fun ChatScreen(
                                             tint = if (showFileList) MaterialTheme.colorScheme.primary
                                                    else MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
-                                    // Open preview
+                                    // 打开预览
                                     IconButton(
                                         onClick = { viewModel.togglePreview() },
                                         modifier = Modifier.size(32.dp)
@@ -669,7 +669,7 @@ fun ChatScreen(
                                     }
                                 }
                             }
-                            // Expandable file list
+                            // 可展开的文件列表
                             if (showFileList) {
                                 Surface(
                                     modifier = Modifier.fillMaxWidth().heightIn(max = 160.dp),
@@ -700,7 +700,7 @@ fun ChatScreen(
                                                         Text(item.title, style = MaterialTheme.typography.bodySmall)
                                                         Text(item.file, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                                     }
-                                                    // Open this in preview
+                                                    // 在预览中打开此项
                                                     IconButton(onClick = { viewModel.selectPreview(i); viewModel.togglePreview() }, modifier = Modifier.size(28.dp)) {
                                                         Icon(Icons.Filled.PlayArrow, "预览", Modifier.size(16.dp))
                                                     }
@@ -726,7 +726,7 @@ fun ChatScreen(
                                         .padding(4.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    // Scrollable tab bar
+                                    // 可滚动的标签栏
                                     LazyRow(modifier = Modifier.weight(1f)) {
                                         items(items.size) { i ->
                                             val item = items[i]
@@ -746,7 +746,7 @@ fun ChatScreen(
                                             }
                                         }
                                     }
-                                    // Share
+                                    // 分享
                                     val activeFile = viewModel.activePreviewFile()
                                     if (activeFile != null) {
                                         IconButton(onClick = { shareFile(activeFile) }, modifier = Modifier.size(28.dp)) {
@@ -754,7 +754,7 @@ fun ChatScreen(
                                                 tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                         }
                                     }
-                                    // Fullscreen toggle
+                                    // 全屏开关
                                     IconButton(onClick = { viewModel.togglePreview() }, modifier = Modifier.size(28.dp)) {
                                         Icon(
                                             if (mode == ChatViewModel.PreviewMode.FULL) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
@@ -775,11 +775,11 @@ fun ChatScreen(
                             }
                         }
                     }
-                    ChatViewModel.PreviewMode.FULL -> { /* handled by full-screen overlay */ }
+                    ChatViewModel.PreviewMode.FULL -> { /* 由全屏浮层处理 */ }
                 }
             }
 
-            // Workspace file list
+            // 工作区文件列表
             if (showWorkspaceFiles && workspaceFiles.isNotEmpty()) {
                 Surface(
                     modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp),
@@ -801,7 +801,7 @@ fun ChatScreen(
                                         when (ext) {
                                             "html", "htm" -> viewModel.addPreviewItem(f.name)
                                             else -> {
-                                                // Open in text viewer
+                                                // 在文本查看器中打开
                                                 try {
                                                     viewerFile = f
                                                     viewerContent = f.readText(Charsets.UTF_8).take(50000)
@@ -847,7 +847,7 @@ fun ChatScreen(
                 }
             }
 
-            // Messages
+            // 消息列表
             LazyColumn(
                 state = listState,
                 modifier = Modifier
@@ -857,11 +857,11 @@ fun ChatScreen(
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 items(viewModel.messages) { message ->
-                    // Show thinking BEFORE assistant/live message
+                    // 在助手/实时消息之前显示思考过程
                     if (message.thinking.isNotBlank() && (message.role == "assistant" || message.role == "assistant_live")) {
                         ThinkingChainCard(content = message.thinking)
                     }
-                    // Tool steps for user messages (vision preprocessing)
+                    // 用户消息的工具步骤（视觉预处理）
                     if (message.role == "user" && message.imageUri != null) {
                         viewModel.agentSteps.filter { it.toolName.isNotBlank() }.forEach { step ->
                             when (step.type) {
@@ -894,7 +894,7 @@ fun ChatScreen(
                 }
             }
 
-            // === FULL-SCREEN PREVIEW OVERLAY (covers entire Box) ===
+            // === 全屏预览浮层（覆盖整个 Box）===
             val fullItems = viewModel.previewItems
             val fullActive = viewModel.activePreviewFile()
             if (fullItems.isNotEmpty() && viewModel.previewMode == ChatViewModel.PreviewMode.FULL && fullActive != null) {
@@ -928,7 +928,7 @@ fun ChatScreen(
                 }
             }
 
-            // === TEXT FILE VIEWER OVERLAY ===
+            // === 文本文件查看器浮层 ===
             val vf = viewerFile
             if (vf != null) {
                 Surface(
@@ -966,7 +966,7 @@ fun ChatScreen(
         }
     }
 
-    // Persona editor dialog — supports both create and edit
+    // 角色编辑器对话框 —— 同时支持创建和编辑
     if (showPersonaEditor) {
         val editing = editingPersona
         var pName by remember { mutableStateOf(editing?.name ?: "") }
@@ -1018,7 +1018,7 @@ fun ChatScreen(
         )
     }
 
-    // Active mode configuration dialog
+    // 主动模式配置对话框
     if (showActiveModeDialog) {
         val ctx = context
         val isRunning = com.example.aichat.service.ActiveModeService.isRunning(viewModel.activePersonaId)
@@ -1064,7 +1064,7 @@ fun ChatScreen(
                         showActiveModeDialog = false
                         return@TextButton
                     }
-                    // Check notification permission — if denied, launcher will auto-start on grant
+                    // 检查通知权限 —— 若被拒绝，授权后启动器会自动启动
                     if (Build.VERSION.SDK_INT >= 33 && ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
                         != android.content.pm.PackageManager.PERMISSION_GRANTED) {
                         notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -1104,7 +1104,7 @@ fun MessageBubble(message: ChatMessage) {
             color = bubbleColor
         ) {
             Column {
-                // Image display
+                // 图片展示
                 message.imageUri?.let { uri ->
                     AsyncImage(
                         model = ImageRequest.Builder(LocalContext.current)
@@ -1119,7 +1119,7 @@ fun MessageBubble(message: ChatMessage) {
                         contentScale = ContentScale.Crop
                     )
                 }
-                // Text
+                // 文本
                 if (message.content.isNotBlank()) {
                     Text(
                         text = message.content,
@@ -1127,7 +1127,7 @@ fun MessageBubble(message: ChatMessage) {
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
-                // Copy button
+                // 复制按钮
                 val context = LocalContext.current
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(end = 4.dp, bottom = 2.dp),

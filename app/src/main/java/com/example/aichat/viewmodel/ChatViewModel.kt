@@ -53,7 +53,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     var isLoading by mutableStateOf(false)
         private set
 
-    // Parallel conversations: one Job per conversation ID
+    // 并行对话：每个对话 ID 对应一个 Job
     private val currentJobs = mutableMapOf<String, Job>()
     private val loadingConvs = mutableSetOf<String>()
 
@@ -78,19 +78,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     var pendingImageUri by mutableStateOf<String?>(null)
 
-    var pendingFileText by mutableStateOf<Pair<String, String>?>(null)  // (fileName, ext)
-    var fileTextContent by mutableStateOf("")  // pre-extracted text for text-based files
+    var pendingFileText by mutableStateOf<Pair<String, String>?>(null)  // (文件名, 扩展名)
+    var fileTextContent by mutableStateOf("")  // 文本类文件的预提取文本
 
     var activePersonaId by mutableStateOf("default")
 
-    // Plan mode state
+    // 计划模式状态
     var currentPlan by mutableStateOf<TaskPlan?>(null)
         private set
     var planPhase by mutableStateOf<PlanPhase>(PlanPhase.IDLE)
         private set
     val completedTaskIds = mutableSetOf<Int>()
 
-    // HTML preview state
+    // HTML 预览状态
     var previewItems by mutableStateOf<List<PreviewItem>>(emptyList())
         private set
     var activePreviewIndex by mutableStateOf(-1)
@@ -114,14 +114,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun collapsePreview() { previewMode = PreviewMode.COLLAPSED; activePreviewIndex = -1 }
 
-    /** Open a workspace file in the preview panel (HTML) or prepare for text viewer */
+    /** 在预览面板打开工作区文件（HTML），或为文本查看器做准备 */
     fun addPreviewItem(fileName: String) {
         previewItems = previewItems.filter { it.file != fileName } + PreviewItem(file = fileName, title = fileName)
         activePreviewIndex = previewItems.lastIndex
         previewMode = PreviewMode.HALF
     }
 
-    /** Create a share intent URI for a workspace file */
+    /** 为工作区文件创建分享 intent URI */
     fun shareUri(fileName: String): android.net.Uri {
         val ctx = getApplication<android.app.Application>()
         val file = java.io.File(ctx.filesDir, "workspace/$fileName")
@@ -130,14 +130,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun activePreviewFile(): String? = previewItems.getOrNull(activePreviewIndex)?.file
     fun activePreviewTitle(): String? = previewItems.getOrNull(activePreviewIndex)?.title
 
-    // Learning mode
+    // 学习模式
     var learningMode by mutableStateOf(false)
 
-    // Dangerous operation confirmation
+    // 危险操作确认
     var pendingConfirmation by mutableStateOf<DangerousOp?>(null)
         private set
 
-    // Resume state
+    // 恢复状态
     var hasSavedState by mutableStateOf(false)
         private set
     var resumePending by mutableStateOf(false)
@@ -178,7 +178,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         planPhase = PlanPhase.EXECUTING
     }
 
-    /** Trigger agent to execute the confirmed plan. Called from UI after confirm. */
+    /** 触发 agent 执行已确认的计划，由 UI 在确认后调用。 */
     fun executeCurrentPlan(profile: ApiProfile) {
         val plan = currentPlan ?: return
         if (planPhase != PlanPhase.EXECUTING) return
@@ -216,13 +216,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun currentConversationId(): String = currentConvId
 
-    /** Persist messages to a specific conversation. Sync UI only if that conversation is being viewed. */
+    /** 写消息到指定对话，正在查看时才同步 UI */
     private fun commitMessages(convId: String, msgs: List<ChatMessage>) {
         storage.updateMessages(convId, msgs)
         if (convId == currentConvId) messages = msgs
     }
 
-    /** Append a user message to a specific conversation, independent of current UI state. */
+    /** 追加用户消息到指定对话 */
     private fun commitUserMessage(convId: String, msg: ChatMessage) {
         val conv = storage.getConversation(convId)
         val msgs = (conv?.messages ?: emptyList()) + msg
@@ -241,9 +241,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         currentPlan = null
         planPhase = PlanPhase.IDLE
         completedTaskIds.clear()
-        // Per-conversation loading state: this conversation may still be loading in background
+        // 切对话时同步该对话的加载状态
         isLoading = convId in loadingConvs
-        // Check for breakpoint
+        // 检查断点
         restoreState()
     }
 
@@ -257,11 +257,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val hasImage = pendingImageUri != null
         val hasFile = pendingFileText != null
         if (content.isBlank() && !hasImage && !hasFile) return
-        // Per-conversation isolation: only block if THIS conversation is loading
+        // 只挡当前对话，其他对话并行不受影响
         val myConvId = currentConvId
         if (myConvId in loadingConvs) return
 
-        // Build API content (with file text if applicable)
+        // 构建 API 内容（如适用则附带文件文本）
         var apiContent = content.ifBlank {
             if (hasImage) "请描述这张图片" else ""
         }
@@ -291,35 +291,35 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
         val imageUri = pendingImageUri
         pendingImageUri = null
-        // Commit user message to storage; sync UI only if this conversation is being viewed
+        // 用户消息写进存储，正在查看时同步 UI
         commitUserMessage(myConvId, userMessage)
         loadingConvs.add(myConvId)
         isLoading = myConvId in loadingConvs
         errorMessage = null
-        // Keep previous agent steps, don't clear
-        // agentSteps = emptyList() — removed to preserve history
+        // 保留之前的 agent 步骤，不清空
+        // agentSteps = emptyList() — 已移除，以保留历史
 
         if (lastBaseUrl != profile.baseUrl) {
             apiService = null
             lastBaseUrl = profile.baseUrl
         }
 
-        // Run on IO thread so backgrounding doesn't cancel network calls
+        // 在 IO 线程运行，避免退到后台时取消网络请求
         currentJobs[myConvId] = viewModelScope.launch(Dispatchers.IO) {
-            // This conversation's own message list — independent of shared UI state
+            // 本对话自己的消息列表，不依赖共享 UI 状态
             var myMsgs = storage.getConversation(myConvId)?.messages ?: emptyList()
             try {
-                // Clear plan state for new message (unless executing plan)
+                // 新消息时清空计划状态（除非正在执行计划）
                 if (planPhase != PlanPhase.EXECUTING) {
                     currentPlan = null
                     planPhase = PlanPhase.IDLE
                     forgetPreviews()
                 }
 
-                // Build conversation history as DTOs
+                // 将对话历史构建为 DTO
                 val conversationDtos = mutableListOf<ChatMessageDto>()
 
-                // Static persona + rules (always first for DeepSeek prefix caching)
+                // 静态 persona + 规则（始终放在最前，以利用 DeepSeek 前缀缓存）
                 val persona = getActivePersona(getApplication<android.app.Application>())
                 val workspaceFiles = workspaceStatus(myConvId)
                 conversationDtos.add(
@@ -338,6 +338,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 ⑦ **长期记忆**：每次发现用户偏好、项目决策、重要上下文时，立即用 `memory_save` 记下来。下次对话开始时会自动加载你的记忆，这样你不会忘。
 ⑧ **对话隔离**：工作区和记忆都按对话隔离。write_file / build_html 保存文件时，写到 workspace/${if (myConvId.isBlank()) "" else sanitize(myConvId) + "/"} 目录下（你的专属目录）。默认只查看工作区中本对话的文件。如果用户主动要求查看其他对话或全局文件，可以用 read_file 读取完整路径。
 ⑨ **工具调用纪律**：需要计算、执行代码、搜索、读写文件时，直接发出工具调用（function calling），系统会自动执行并把结果返回给你。禁止把工具调用、代码、JSON 结构写进你的回答文本——回答里只放最终结论。禁止假装执行（如"我用Python算了一下结果是X"）——没调用工具就是没算。
+⑫ **连贯完成任务（硬性）**：需要工具时直接发出 function calling，系统自动执行，禁止把"我要调用工具""接下来用python计算"这类过程描述写进回答文本——用户只看到最终答案。工具结果返回后，**必须继续完成用户的完整请求**：如果任务需要多步工具（如排盘→分析→交叉验证→总结），就连续调用直到全部完成，最后一次性输出完整的最终答案。禁止工具执行完只输出"已排盘完成""工具执行成功"之类的短句就结束——那等于没完成任务。
 ⑩ **约定识别**：当用户提到未来的约定或承诺（"一会儿""等下""晚上""明天""下周"+要做的事）时，立即用 memory_save 记录。key 格式"约定-xxx"，content 必须写明：约定内容 + 约定时间（参照"## 当前时间"推算）。这样即使过很久，你也能在约定的时间提起它。
 
 $workspaceFiles
@@ -347,16 +348,16 @@ ${PlanParser.planInstruction()}
                     )
                 )
 
-                // Collect dynamic system messages (inserted AFTER history for cache friendliness)
+                // 收集动态系统消息（放在历史之后，以利于缓存）
                 val dynamicSystemMsgs = mutableListOf<ChatMessageDto>()
 
-                // Real-time clock so the model always knows the current time
+                // 实时时间，供模型判断时效
                 val now = java.time.LocalDateTime.now()
                 val nowStr = "${now.year}年${now.monthValue}月${now.dayOfMonth}日 ${now.hour}:${String.format("%02d", now.minute)}"
                 dynamicSystemMsgs.add(ChatMessageDto(role = "system",
                     content = "## 当前时间\n\n现在是 $nowStr。判断约定/待办/时效性话题时以此为准。"))
 
-                // Add search/verify context (run on IO)
+                // 添加搜索/核验上下文（在 IO 上运行）
                 val effectiveSearch = searchEnabled || factCheckEnabled
                 if (effectiveSearch) {
                     val searchContext = performSearch(content)
@@ -368,7 +369,7 @@ ${PlanParser.planInstruction()}
                     }
                 }
 
-                // Fact-check mode prompt
+                // 事实查证模式提示词
                 if (factCheckEnabled) {
                     dynamicSystemMsgs.add(
                         ChatMessageDto(role = "system",
@@ -376,7 +377,7 @@ ${PlanParser.planInstruction()}
                     )
                 }
 
-                // Vision pre-processing
+                // 视觉预处理
                 if (imageUri != null && profile.visionModel.isNotBlank()) {
                     val (visionDesc, _) = describeImage(imageUri, content, profile)
                     if (visionDesc != null) {
@@ -391,7 +392,7 @@ ${PlanParser.planInstruction()}
                     }
                 }
 
-                // Add message history — sliding window: last 8 turns + summary of older
+                // 添加消息历史 — 滑动窗口：最近 8 轮 + 更早内容的摘要
                 val historyMsgs = myMsgs.map { msg ->
                     if (msg.imageUri != null && msg.role == "user" && profile.visionModel.isBlank()) {
                         val contentsList = mutableListOf<Map<String, Any?>>()
@@ -402,13 +403,13 @@ ${PlanParser.planInstruction()}
                         ChatMessageDto(role = msg.role, content = msg.content)
                     }
                 }
-                // Keep system messages + last 16 user/assistant pairs, smart-summarize the rest
+                // 保留系统消息 + 最近 16 组用户/助手对话，其余做智能摘要
                 val keepRecent = 16
                 val userAssistant = historyMsgs.filter { it.role != "system" }
                 if (userAssistant.size > keepRecent * 2) {
                     val dropped = userAssistant.dropLast(keepRecent * 2)
                     val oldCount = dropped.size
-                    // Build a real summary from what's being dropped
+                    // 对将被丢弃的内容生成真实摘要
                     val userQs = dropped.filter { it.role == "user" }.mapNotNull { (it.content?.toString() ?: "").take(80) }
                     val asReplies = dropped.filter { it.role == "assistant" }.mapNotNull { (it.content?.toString() ?: "").take(80) }
                     val summary = buildString {
@@ -429,19 +430,19 @@ ${PlanParser.planInstruction()}
                     conversationDtos.addAll(historyMsgs)
                 }
 
-                // Learning mode
+                // 学习模式
                 if (learningMode) {
                     dynamicSystemMsgs.add(ChatMessageDto(role = "system",
                         content = "你处于「学习模式」。每个操作完成后，用 [WHY] 起头，用 1-2 句话解释你为什么要这样做、为什么选择这个工具而不是其他方案。"))
                 }
 
-                // Auto-load model's workspace memory (isolated per conversation)
+                // 自动加载本对话记忆
                 val memFile = java.io.File(memoryDir(myConvId), "memory.md")
                 if (memFile.exists() && memFile.readText().isNotBlank()) {
                     val mem = memFile.readText().take(4000)
                     dynamicSystemMsgs.add(ChatMessageDto(role = "system",
                         content = "## 你的长期记忆\n\n以下是之前对话中你主动记录的重要信息（用 memory_load 可随时重读）：\n\n$mem"))
-                    // Proactive recall: scan user message for keywords matching memory entries
+                    // 主动召回：扫描用户消息，匹配记忆条目中的关键词
                     val memContent = memFile.readText()
                     val userLower = content.lowercase()
                     val sections = memContent.split(Regex("^## ", RegexOption.MULTILINE)).filter { it.isNotBlank() }
@@ -449,7 +450,7 @@ ${PlanParser.planInstruction()}
                         val lines = sec.trim().split("\n", limit = 2)
                         val key = lines.firstOrNull()?.trim() ?: return@mapNotNull null
                         val body = lines.getOrNull(1)?.trim() ?: ""
-                        // Check if user message mentions the key or key words from the body
+                        // 检查用户消息是否提到该 key 或正文中的关键词
                         val keyWords = (key + " " + body).split(Regex("[\\s,，、。.；;:：]"))
                             .filter { it.length > 2 }
                         if (keyWords.any { kw -> userLower.contains(kw.lowercase()) }) {
@@ -462,34 +463,36 @@ ${PlanParser.planInstruction()}
                     }
                 }
 
-                // User memory（按对话隔离）
+                // 用户记忆（按对话隔离）
                 val memory = loadUserMemory(myConvId)
                 if (memory.isNotBlank()) {
                     dynamicSystemMsgs.add(ChatMessageDto(role = "system",
                         content = "## 用户记忆\n\n以下是之前对话中记录的偏好和习惯，请在思考和决策时参考：\n\n$memory"))
                 }
 
-                // Append dynamic system messages after history (after static prefix for cache)
+                // 将动态系统消息追加到历史之后（位于静态前缀之后以利于缓存）
                 conversationDtos.addAll(dynamicSystemMsgs)
 
-                // Agent loop: no hard round limit, model decides when to stop
+                // Agent 循环：不设硬性轮数上限，由模型决定何时停止
                 var finishReason: String? = null
                 var round = 0
                 val consecutiveErrors = mutableMapOf<String, Int>()
+                // continuationRetries：限制自动续写次数（长度截断保护）
+                var continuationRetries = 0
 
                 while (finishReason != "stop" && isActive) {
                     round++
 
-                    // Context compression: aggressively trim when over 60K chars (~20K tokens)
+                    // 上下文压缩：仅超长会话触发，1M 上下文基本用不到，兜底小模型
                     val totalChars = conversationDtos.sumOf { (it.content?.toString()?.length ?: 0) }
-                    if (totalChars > 60_000 && conversationDtos.size > 8) {
+                    if (totalChars > 300_000 && conversationDtos.size > 8) {
                         val oldTools = conversationDtos.filter { it.role == "tool" }
                         if (oldTools.size > 3) {
                             val remove = oldTools.dropLast(3)
-                            // Smart summary: extract what these tool calls actually did
+                            // 智能摘要：提取这些工具调用的实际作用
                             val toolNames = remove.mapNotNull { dto ->
                                 conversationDtos.find { it.toolCallId == dto.toolCallId }?.let { _ ->
-                                    // Find the assistant message that called this tool
+                                    // 找到调用此工具的 assistant 消息
                                     val callMsg = conversationDtos.find { m ->
                                         m.toolCalls?.any { tc -> tc.id == dto.toolCallId } == true
                                     }
@@ -502,11 +505,11 @@ ${PlanParser.planInstruction()}
                             conversationDtos.add(2, ChatMessageDto(role = "system",
                                 content = "已使用的工具（${remove.size}次）：${toolNames.joinToString("，")}。结果摘要：$toolOutcomes"))
                         }
-                        // Trim oldest user/assistant pairs beyond 16
+                        // 裁剪超过 16 组的最早用户/助手对话
                         val ua = conversationDtos.filter { it.role == "user" || it.role == "assistant" }
                         if (ua.size > 32) {
                             val drop = ua.take(ua.size - 32)
-                            // Save critical context to memory before dropping
+                            // 丢弃前将关键上下文保存到记忆
                             val userMsgs = drop.filter { it.role == "user" }
                             val keyRequests = userMsgs.mapNotNull { (it.content?.toString() ?: "").take(200) }
                                 .filter { it.length > 20 }
@@ -517,7 +520,7 @@ ${PlanParser.planInstruction()}
                         }
                     }
 
-                    // Error loop detection: if same tool+error 3+ times, nudge
+                    // 错误循环检测：同一工具报错 3 次及以上时进行提示
                     val worstError = consecutiveErrors.entries.maxByOrNull { it.value }
                     if (worstError != null && worstError.value >= 3) {
                         conversationDtos.add(ChatMessageDto(role = "system",
@@ -528,10 +531,10 @@ ${PlanParser.planInstruction()}
                     val request = ChatRequest(
                         model = profile.model,
                         messages = conversationDtos,
-                        // Agent loop: use "low" reasoning instead of "max" — fast enough for tool
-                        // decisions but still gives the model a chance to think before acting.
-                        // Final SSE streaming answer still uses "max" for deep reasoning.
-                        // Companionship conversations hide thinking entirely
+                        // Agent 循环：使用 "low" 推理而非 "max" — 对工具决策足够快，
+                        // 但仍给模型在行动前思考的机会。
+                        // 最终 SSE 流式回答仍使用 "max" 进行深度推理。
+                        // 陪伴对话不显示思维链
                         reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "low" else null,
                         thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(
@@ -556,15 +559,15 @@ ${PlanParser.planInstruction()}
                     finishReason = choice?.finishReason
                     val msg = choice?.message ?: continue
 
-                    // ALWAYS process tool calls if present, regardless of finishReason
+                    // 只要存在工具调用就必须处理，无论 finishReason 为何
                     if (!msg.toolCalls.isNullOrEmpty()) {
-                        // Preserve any text the model emitted alongside tool calls
+                        // 保留模型随工具调用输出的文本
                         if (!msg.content.isNullOrBlank()) {
                             myMsgs = myMsgs + ChatMessage(role = "assistant", content = msg.content)
                             commitMessages(myConvId, myMsgs)
                             conversationDtos.add(ChatMessageDto(role = "assistant", content = msg.content))
                         }
-                        // Don't pass the model's "我来搜索..." chatter to API — it's noise
+                        // 不要把模型"我来搜索..."之类的闲聊传给 API — 那是噪音
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = null, toolCalls = msg.toolCalls))
                         for (tc in msg.toolCalls) {
                             val args: Map<String, String> = try {
@@ -574,19 +577,19 @@ ${PlanParser.planInstruction()}
                                 agentSteps = agentSteps + AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments)
                             }
                             val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication(), myConvId)
-                            // Preview detection: build_html output
+                            // 预览检测：build_html 输出
                             val previewJson = Regex("""\{"type":"preview","file":"([^"]+)","title":"([^"]*)"\}""").find(result.content)
                             if (previewJson != null && tc.function.name == "build_html") {
                                 val f = previewJson.groupValues[1]
                                 val t = previewJson.groupValues[2].ifBlank { f }
                                 withContext(Dispatchers.Main) {
-                                    // Deduplicate by file name
+                                    // 按文件名去重
                                     previewItems = previewItems.filter { it.file != f } + PreviewItem(f, t)
                                     activePreviewIndex = previewItems.lastIndex
                                     previewMode = PreviewMode.HALF
                                 }
                             }
-                            // Error tracking
+                            // 错误追踪
                             val errKey = if (!result.success) "${tc.function.name}:${result.content.take(60)}" else ""
                             if (errKey.isNotBlank()) {
                                 consecutiveErrors[errKey] = (consecutiveErrors[errKey] ?: 0) + 1
@@ -598,12 +601,12 @@ ${PlanParser.planInstruction()}
                             }
                             conversationDtos.add(ChatMessageDto(role = "tool", content = result.content, toolCallId = tc.id))
                         }
-                        // Save breakpoint after each tool round
+                        // 每轮工具调用后保存断点
                         if (planPhase == PlanPhase.EXECUTING) {
                             saveState(conversationDtos, round)
                         }
                     } else {
-                        // Plan detection: check if model output contains a plan JSON
+                        // 计划检测：检查模型输出是否包含计划 JSON
                         val textContent = msg.content ?: ""
                         if (planPhase != PlanPhase.EXECUTING && textContent.contains("\"tasks\"")) {
                             val parsed = PlanParser.tryParse(textContent)
@@ -612,7 +615,7 @@ ${PlanParser.planInstruction()}
                                     currentPlan = parsed
                                     planPhase = PlanPhase.REVIEWING
                                 }
-                                // Show the plan text to user (strip the JSON block)
+                                // 向用户展示计划文本（去掉 JSON 代码块）
                                 val displayText = textContent.replace(Regex("```json[\\s\\S]*?```"), "").trim()
                                 val finalDisplay = if (displayText.isNotEmpty()) displayText
                                     else "📋 已生成任务计划（${parsed.tasks.size} 个步骤），请确认后开始执行。"
@@ -624,7 +627,7 @@ ${PlanParser.planInstruction()}
                             }
                         }
 
-                        // Task completion tracking
+                        // 任务完成追踪
                         if (planPhase == PlanPhase.EXECUTING && currentPlan != null) {
                             val doneRegex = Regex("""\[TASK_DONE:\s*(\d+)\]""").findAll(textContent)
                             doneRegex.forEach { match ->
@@ -634,7 +637,7 @@ ${PlanParser.planInstruction()}
                             if (completedTaskIds.size >= currentPlan!!.tasks.size) {
                                 planPhase = PlanPhase.COMPLETED
                             }
-                            // User memory: auto-detect preference statements
+                            // 用户记忆：自动检测偏好表述
                             val prefPatterns = listOf(
                                 Regex("""用户(偏好|习惯|喜欢|倾向于)(.+?)[。.]"""),
                                 Regex("""建议使用(.+?)[。.]""")
@@ -645,7 +648,7 @@ ${PlanParser.planInstruction()}
                             }
                         }
 
-                        // === REAL SSE STREAMING for final answer ===
+                        // 最终答案流式输出
                         val streamRequest = mapOf(
                             "model" to profile.model,
                             "messages" to conversationDtos.map { dto ->
@@ -661,10 +664,7 @@ ${PlanParser.planInstruction()}
                                 }
                                 m
                             },
-                            // Include tools so the model keeps using tool-call mechanism in streaming,
-                            // instead of emitting tool-call text as its answer
-                            "tools" to gson.fromJson(ToolRegistry.toolCallsToJson(), object : TypeToken<List<Map<String, Any>>>() {}.type),
-                            "tool_choice" to "auto",
+                            // 答案轮不给 tools，工具已在上一轮调完，避免边答边调工具导致截断
                             "stream" to true
                         ).let { base ->
                             val full = base.toMutableMap()
@@ -697,11 +697,15 @@ ${PlanParser.planInstruction()}
                             return@launch
                         }
 
-                        val reader = BufferedReader(InputStreamReader(streamResp.body!!.byteStream()))
+                        val reader = BufferedReader(InputStreamReader(streamResp.body!!.byteStream()), 65536)
                         val textBuf = StringBuilder()
                         val thinkBuf = StringBuilder()
-                        // Collect streaming tool_calls (index -> accumulated name/arguments)
+                        // 收集流式 tool_calls
                         val streamToolCalls = mutableMapOf<Int, MutableMap<String, String>>()
+                        // 节流刷新 UI，避免 token 过快导致主线程卡顿（数据不丢，缓冲全量累积）
+                        var lastUiUpdate = 0L
+                        // 流式 finish_reason，检测 length 截断
+                        var streamFinishReason: String? = null
 
                         reader.useLines { lines ->
                             lines.forEach { line ->
@@ -713,11 +717,14 @@ ${PlanParser.planInstruction()}
                                         val json = gson.fromJson(data, Map::class.java)
                                         val choices = json["choices"] as? List<Map<String, Any>>
                                         val delta = choices?.firstOrNull()?.get("delta") as? Map<String, Any>
+                                        (choices?.firstOrNull()?.get("finish_reason") as? String)?.let {
+                                            if (it.isNotBlank() && it != "null") streamFinishReason = it
+                                        }
                                         val rc = delta?.get("reasoning_content") as? String
                                         val tc = unescapeUnicode(delta?.get("content") as? String)
                                         if (!rc.isNullOrBlank()) thinkBuf.append(rc)
                                         if (!tc.isNullOrBlank()) textBuf.append(tc)
-                                        // Streaming tool calls
+                                        // 流式工具调用
                                         val tcs = delta?.get("tool_calls") as? List<Map<String, Any>>
                                         if (!tcs.isNullOrEmpty()) {
                                             for (t in tcs) {
@@ -728,14 +735,18 @@ ${PlanParser.planInstruction()}
                                                 (fn["arguments"] as? String)?.let { entry["arguments"] = entry["arguments"] + it }
                                             }
                                         }
-                                        // Update UI live (only if viewing this conversation)
-                                        myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
-                                            role = "assistant_live",
-                                            content = textBuf.toString(),
-                                            thinking = thinkBuf.toString()
-                                        )
-                                        if (myConvId == currentConvId) {
-                                            withContext(Dispatchers.Main) { messages = myMsgs }
+                                        // 节流刷新 UI，避免主线程被淹没
+                                        val nowMs = System.currentTimeMillis()
+                                        if (nowMs - lastUiUpdate >= 80) {
+                                            lastUiUpdate = nowMs
+                                            myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
+                                                role = "assistant_live",
+                                                content = textBuf.toString(),
+                                                thinking = thinkBuf.toString()
+                                            )
+                                            if (myConvId == currentConvId) {
+                                                withContext(Dispatchers.Main) { messages = myMsgs }
+                                            }
                                         }
                                     } catch (_: Exception) {}
                                 }
@@ -743,11 +754,9 @@ ${PlanParser.planInstruction()}
                         }
                         streamResp.close()
 
-                        // If the model streamed tool calls, execute them and continue the agent loop
+                        // 流式返回工具调用则执行并继续
                         if (streamToolCalls.isNotEmpty()) {
-                            // Preserve text/thinking already emitted this round — the model may
-                            // have written part of its answer before calling a tool (e.g. saving memory).
-                            // Without this, the final answer gets swallowed.
+                            // 先保存本轮已输出的文本/思考，否则会被吞掉
                             val partialText = textBuf.toString()
                             val partialThink = thinkBuf.toString()
                             if (partialText.isNotBlank() || partialThink.isNotBlank()) {
@@ -770,7 +779,7 @@ ${PlanParser.planInstruction()}
                                     arguments = parsedArgs
                                 )
                             }
-                            // Keep live message on screen while tools run
+                            // 工具运行期间保持消息显示
                             conversationDtos.add(ChatMessageDto(
                                 role = "assistant", content = null,
                                 toolCalls = calls.map { ToolCallDto(
@@ -802,7 +811,7 @@ ${PlanParser.planInstruction()}
                             continue
                         }
 
-                        // Finalize with NonCancellable so backgrounding doesn't lose the message
+                        // 用 NonCancellable 收尾，避免退到后台时丢失消息
                         withContext(NonCancellable + Dispatchers.Main) {
                             val finalText = textBuf.toString()
                             val finalThink = thinkBuf.toString()
@@ -815,6 +824,21 @@ ${PlanParser.planInstruction()}
                         }
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = textBuf.toString()))
                         finishReason = "stop"
+
+                        // length 说明被 max_tokens 截断，自动续写
+                        if (streamFinishReason == "length" && isActive && continuationRetries < 2) {
+                            continuationRetries++
+                            // 先回滚被截断的消息，续写直接替换它
+                            val lastMsg = myMsgs.lastOrNull { it.role == "assistant" }
+                            if (lastMsg != null) {
+                                myMsgs = myMsgs.filterNot { it.content == lastMsg.content && it.timestamp == lastMsg.timestamp }
+                                commitMessages(myConvId, myMsgs)
+                            }
+                            conversationDtos.add(ChatMessageDto(role = "system",
+                                content = "上一条回复因长度限制被截断。请从中断处继续输出，直到完整结束，不要重复已写过的内容。"))
+                            finishReason = null
+                            continue
+                        }
                     }
                 }
 
@@ -825,7 +849,7 @@ ${PlanParser.planInstruction()}
                 }
             } catch (e: Exception) {
                 withContext(NonCancellable + Dispatchers.Main) {
-                    // Save partial content if streaming was interrupted (screen switch, network drop, etc.)
+                    // 若流式输出被中断（切屏、网络断开等），保存已生成的部分内容
                     val liveMsg = myMsgs.find { it.role == "assistant_live" }
                     if (liveMsg != null && liveMsg.content.isNotBlank()) {
                         myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
@@ -847,7 +871,7 @@ ${PlanParser.planInstruction()}
         }
     }
 
-    /** Decode \uXXXX unicode escapes and common HTML entities to actual characters */
+    /** 将 \uXXXX unicode 转义和常见 HTML 实体解码为实际字符 */
     private fun unescapeUnicode(input: String?): String? {
         if (input == null || !input.contains("\\u")) return input
         return try {
@@ -891,11 +915,11 @@ ${PlanParser.planInstruction()}
         return service
     }
 
-    // --- Web Search (multi-source OkHttp, works from China) ---
+    // --- 网络搜索（多源 OkHttp，国内可用）---
 
     private fun workspaceStatus(convId: String): String {
         val wsRoot = java.io.File(getApplication<android.app.Application>().filesDir, "workspace").also { it.mkdirs() }
-        // Isolate: only show this conversation's own subdirectory
+        // 只显示本对话的工作区目录
         val wsDir = if (convId.isBlank()) wsRoot
                     else java.io.File(wsRoot, sanitize(convId)).also { it.mkdirs() }
         val files = wsDir.listFiles()?.toList() ?: return ""
@@ -908,19 +932,19 @@ ${PlanParser.planInstruction()}
 
     private suspend fun performSearch(query: String): String {
         return withContext(Dispatchers.IO) {
-            // 1. DuckDuckGo Instant Answer API (free, structured JSON)
+            // 1. DuckDuckGo Instant Answer API（免费，结构化 JSON）
             try {
                 val ddg = tryDdgApi(query)
                 if (ddg.isNotBlank()) return@withContext ddg
             } catch (_: Exception) {}
 
-            // 2. Bing HTML scraping (works from China)
+            // 2. Bing HTML 抓取（国内可用）
             try {
                 val results = trySearchEngine("https://www.bing.com/search?q=${URLEncoder.encode(query, "UTF-8")}&setlang=zh-cn", ::parseBingHtml)
                 if (results.isNotEmpty()) return@withContext results
             } catch (_: Exception) {}
 
-            // 3. DuckDuckGo Lite fallback
+            // 3. DuckDuckGo Lite 兜底
             try {
                 val results = trySearchEngine("https://lite.duckduckgo.com/lite/?q=${URLEncoder.encode(query, "UTF-8")}", ::parseSearchHtml)
                 if (results.isNotEmpty()) return@withContext results
@@ -941,16 +965,16 @@ ${PlanParser.planInstruction()}
         val json = gson.fromJson(body, Map::class.java) ?: return ""
 
         val sb = StringBuilder()
-        // Abstract/answer
+        // 摘要/回答
         (json["AbstractText"] as? String)?.takeIf { it.isNotBlank() }?.let {
             sb.appendLine("【摘要】$it")
             (json["AbstractSource"] as? String)?.let { src -> sb.appendLine("来源: $src") }
         }
-        // Answer (e.g. calculator, time, weather)
+        // 直接回答（如计算器、时间、天气）
         (json["Answer"] as? String)?.takeIf { it.isNotBlank() }?.let {
             sb.appendLine("【直接回答】$it")
         }
-        // Related topics
+        // 相关条目
         val topics = json["RelatedTopics"] as? List<Map<String, Any?>>
         if (!topics.isNullOrEmpty()) {
             sb.appendLine("\n【相关条目】")
@@ -981,7 +1005,7 @@ ${PlanParser.planInstruction()}
 
     private fun parseSearchHtml(html: String): List<String> {
         val results = mutableListOf<String>()
-        // DDG Lite: each result is a <tr> with link and snippet
+        // DDG Lite：每条结果是带链接和摘要的 <tr>
         val linkRegex = Regex("<a[^>]*href=\"([^\"]+)\"[^>]*>([^<]+)</a>")
         val snippetRegex = Regex("<td class=\"result-snippet\">([^<]+)</td>")
         val matches = linkRegex.findAll(html).take(8)
@@ -1000,7 +1024,7 @@ ${PlanParser.planInstruction()}
 
     private fun parseBingHtml(html: String): List<String> {
         val results = mutableListOf<String>()
-        // Bing: results in <li class="b_algo">
+        // Bing：结果位于 <li class="b_algo"> 中
         val blockRegex = Regex("<li class=\"b_algo\"[^>]*>(.*?)</li>", RegexOption.DOT_MATCHES_ALL)
         val blocks = blockRegex.findAll(html).take(8)
         for ((i, block) in blocks.withIndex()) {
@@ -1016,7 +1040,7 @@ ${PlanParser.planInstruction()}
         return results
     }
 
-    // --- User Memory (isolated per conversation) ---
+    // --- 用户记忆（按对话隔离）---
 
     private fun memoryDir(convId: String): java.io.File {
         val dir = java.io.File(getApplication<android.app.Application>().filesDir, "memory")
@@ -1041,12 +1065,12 @@ ${PlanParser.planInstruction()}
             val f = getMemoryFile(convId)
             f.parentFile?.mkdirs()
             val existing = if (f.exists()) f.readText(Charsets.UTF_8) else ""
-            if (existing.contains(entry)) return // dedup
+            if (existing.contains(entry)) return // 去重
             f.writeText("$existing\n$entry".trim(), Charsets.UTF_8)
         } catch (_: Exception) {}
     }
 
-    // --- Dangerous Operation Detection ---
+    // --- 危险操作检测 ---
 
     fun checkDangerousOp(toolName: String, args: Map<String, String>): Boolean {
         val wsDir = java.io.File(getApplication<android.app.Application>().filesDir, "workspace")
@@ -1064,7 +1088,7 @@ ${PlanParser.planInstruction()}
         }
     }
 
-    // --- Resume / Breakpoint ---
+    // --- 恢复 / 断点 ---
 
     private data class AgentState(
         val conversationDtos: List<Map<String, Any?>> = emptyList(),
@@ -1105,7 +1129,7 @@ ${PlanParser.planInstruction()}
             val f = getStateFile()
             if (!f.exists()) return false
             val state = gson.fromJson(f.readText(Charsets.UTF_8), AgentState::class.java)
-            state.conversationDtos.isEmpty() // if empty, no valid state
+            state.conversationDtos.isEmpty() // 若为空，则无有效状态
             hasSavedState = true
             resumePending = !state.conversationDtos.isNullOrEmpty()
             resumePending
@@ -1121,7 +1145,7 @@ ${PlanParser.planInstruction()}
             val state = gson.fromJson(f.readText(Charsets.UTF_8), AgentState::class.java)
             if (state.conversationDtos.isNullOrEmpty()) return
 
-            // Restore plan state (normalize null lists from Gson)
+            // 恢复计划状态（将 Gson 解析出的 null 列表归一化）
             if (state.planJson.isNotBlank()) {
                 val raw = gson.fromJson(state.planJson, TaskPlan::class.java)
                 currentPlan = raw?.copy(
@@ -1133,7 +1157,7 @@ ${PlanParser.planInstruction()}
             completedTaskIds.clear()
             completedTaskIds.addAll(state.completedTaskIds)
 
-            // Build a resume message
+            // 构建恢复消息
             val resumeMsg = buildString {
                 appendLine("🔁 从断点恢复执行")
                 if (currentPlan != null) {
@@ -1148,10 +1172,10 @@ ${PlanParser.planInstruction()}
             commitMessages(myConvId, myMsgs)
             resumePending = false
             hasSavedState = false
-            // Clean up
+            // 清理
             f.delete()
 
-            // Trigger agent to continue - inject saved DTOs
+            // 触发 agent 继续 — 注入已保存的 DTO
             viewModelScope.launch(Dispatchers.IO) {
                 try {
                     loadingConvs.add(myConvId)
@@ -1177,7 +1201,7 @@ ${PlanParser.planInstruction()}
                         stream = false
                     )
 
-                    // Simple non-streaming resume call
+                    // 简单的非流式恢复调用
                     val resp = getApiService(profile).chatCompletion("Bearer ${profile.apiKey}", request)
                     if (resp.isSuccessful) {
                         val reply = resp.body()?.choices?.firstOrNull()?.message?.content ?: ""
@@ -1207,7 +1231,7 @@ ${PlanParser.planInstruction()}
         getStateFile().delete()
     }
 
-    // --- Vision API (OkHttp direct, bypasses Retrofit URL prefix issue) ---
+    // --- 视觉 API（直接走 OkHttp，绕过 Retrofit URL 前缀问题）---
 
     private suspend fun describeImage(imageDataUri: String, userQuestion: String, profile: ApiProfile): Pair<String?, String> {
         return try {

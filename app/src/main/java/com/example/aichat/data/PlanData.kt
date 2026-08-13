@@ -4,11 +4,11 @@ import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 
 /**
- * Agent task plan, parsed from model's structured output.
+ * Agent 任务计划，从模型的结构化输出解析而来。
  */
 data class TaskPlan(
-    val complexity: Int = 1,          // 1-5 self-assessed complexity
-    val reasoning: String = "",        // why this complexity level
+    val complexity: Int = 1,          // 1-5 自评复杂度
+    val reasoning: String = "",        // 为什么是这个复杂度级别
     val tasks: List<PlanTask> = emptyList(),
     val optimizations: List<Optimization> = emptyList()
 )
@@ -16,33 +16,33 @@ data class TaskPlan(
 data class PlanTask(
     val id: Int,
     val description: String,
-    val tool: String = "",             // suggested tool name
-    val question: String = "",         // clarification question if ambiguous
+    val tool: String = "",             // 建议使用的工具名
+    val question: String = "",         // 有歧义时的澄清问题
     var confirmed: Boolean = false,
     var skipped: Boolean = false
 )
 
 data class Optimization(
-    val original: String,              // which step
-    val better: String,                // what's the better approach
+    val original: String,              // 哪一步
+    val better: String,                // 更好的方案是什么
     val reason: String = ""
 )
 
 /**
- * Plan parser: extracts JSON plan from model output.
- * Returns null if no plan found (simple task).
+ * 计划解析器：从模型输出中提取 JSON 计划。
+ * 若没有计划（简单任务）则返回 null。
  */
 object PlanParser {
     private val gson = Gson()
 
     fun tryParse(text: String): TaskPlan? {
-        // Look for ```json ... ``` block
+        // 查找 ```json ... ``` 代码块
         val jsonBlock = Regex("```json\\s*\\n([\\s\\S]*?)\\n```").find(text)
         val json = jsonBlock?.groupValues?.get(1)?.trim() ?: return null
 
         return try {
             val raw = gson.fromJson(json, TaskPlan::class.java)
-            // Gson may set lists to null if missing in JSON → normalize
+            // Gson 在 JSON 缺失时可能将列表设为 null → 归一化
             val plan = raw.copy(
                 tasks = raw.tasks ?: emptyList(),
                 optimizations = raw.optimizations ?: emptyList()
@@ -53,7 +53,7 @@ object PlanParser {
         }
     }
 
-    /** Build a prompt snippet that teaches the model how to output plans */
+    /** 生成一段教会模型如何输出计划的 prompt 片段 */
     fun planInstruction(): String = """
 ## 任务规划
 

@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 import java.util.zip.ZipInputStream
 
-// ==================== Core Types ====================
+// ==================== 核心类型 ====================
 
 data class ToolDef(
     val name: String,
@@ -37,17 +37,17 @@ data class ToolResult(
     val content: String
 )
 
-// ==================== Tool Interface ====================
+// ==================== 工具接口 ====================
 
 interface Tool {
     val definition: ToolDef
     suspend fun execute(args: Map<String, String>, context: Context): ToolResult
-    /** Per-conversation execution. Default delegates to execute(); memory tools override for isolation. */
+    /** 按会话执行。默认委托给 execute()；记忆类工具为隔离而覆写。 */
     suspend fun executeForConv(args: Map<String, String>, context: Context, convId: String): ToolResult =
         execute(args, context)
 }
 
-// ==================== Workspace ====================
+// ==================== 工作区 ====================
 
 class Workspace(private val context: Context) {
     val root: File
@@ -77,7 +77,7 @@ class Workspace(private val context: Context) {
     }
 }
 
-// ==================== Tool Implementations ====================
+// ==================== 工具实现 ====================
 
 class ReadFileTool : Tool {
     override val definition = ToolDef(
@@ -117,7 +117,7 @@ class ReadFileTool : Tool {
             while (entry != null) {
                 if (entry.name == "word/document.xml") {
                     val xml = zis.readBytes().toString(Charsets.UTF_8)
-                    // Strip XML tags, keep text
+                    // 去除 XML 标签，保留文本
                     sb.append(xml.replace(Regex("<[^>]+>"), " ")
                         .replace(Regex("\\s+"), " ").trim())
                     break
@@ -227,7 +227,7 @@ class WebFetchTool : Tool {
                 .build()
             val response = client.newCall(request).execute()
             val html = response.body?.string() ?: ""
-            // Try to extract meaningful content first
+            // 先尝试提取有意义的内容
             val text = extractArticleText(html)
                 .takeIf { it.length > 100 }
                 ?: html
@@ -250,9 +250,9 @@ class WebFetchTool : Tool {
         }
     }
 
-    /** Extract main article text from HTML, skipping nav/sidebar/ads */
+    /** 从 HTML 提取正文，跳过导航/侧边栏/广告 */
     private fun extractArticleText(html: String): String {
-        // Prefer <article> or <main> tags
+        // 优先使用 <article> 或 <main> 标签
         val article = Regex("<article[^>]*>(.*?)</article>", RegexOption.DOT_MATCHES_ALL).find(html)
         val main = Regex("<main[^>]*>(.*?)</main>", RegexOption.DOT_MATCHES_ALL).find(html)
         val target = article?.groupValues?.get(1) ?: main?.groupValues?.get(1) ?: return ""
@@ -407,7 +407,7 @@ class HttpTool : Tool {
     }
 }
 
-// ==================== Build HTML ====================
+// ==================== 生成 HTML ====================
 
 class BuildHtmlTool : Tool {
     override val definition = ToolDef(
@@ -439,9 +439,9 @@ class BuildHtmlTool : Tool {
     }
 }
 
-// ==================== Registry ====================
+// ==================== 注册表 ====================
 
-// ==================== Python Tools ====================
+// ==================== Python 工具 ====================
 
 class PythonExecTool(private val pyManager: () -> com.example.aichat.python.PythonSessionManager?) : Tool {
     override val definition = ToolDef(
@@ -463,7 +463,7 @@ class PythonExecTool(private val pyManager: () -> com.example.aichat.python.Pyth
         val code = args["code"] ?: return ToolResult("", false, "缺少 code 参数")
         val session = args["session"] ?: "default"
 
-        // Pre-install packages if needed
+        // 需要时预安装包
         val install = args["install"]
         if (!install.isNullOrBlank()) {
             for (pkg in install.split(Regex("\\s+"))) {
@@ -475,7 +475,7 @@ class PythonExecTool(private val pyManager: () -> com.example.aichat.python.Pyth
         }
 
         val result = py.execute(code, session) { progress ->
-            // Progress streaming available via onProgress callback
+            // 进度通过 onProgress 回调流式输出
         }
 
         val sb = StringBuilder()
@@ -537,7 +537,7 @@ class PythonSessionCloseTool(private val pyManager: () -> com.example.aichat.pyt
     }
 }
 
-// ===== Memory Tools (model-controlled memory card) =====
+// ===== 记忆工具（模型控制的记忆卡）=====
 
 class MemorySaveTool : Tool {
     override val definition = ToolDef(
@@ -558,7 +558,7 @@ class MemorySaveTool : Tool {
     override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
         val key = args["key"]?.trim() ?: return ToolResult("", false, "需要 key")
         val content = args["content"]?.trim() ?: return ToolResult("", false, "需要 content")
-        // Appointments (约定-xxx) are stored separately so heartbeat code can manage their lifecycle
+        // 约定（约定-xxx）单独存储，便于心跳代码管理其生命周期
         if (key.startsWith("约定-")) {
             val apptFile = java.io.File(memDirFor(convId, context), "appointments.md")
             try {
@@ -579,7 +579,7 @@ class MemorySaveTool : Tool {
         val memFile = java.io.File(memDir, "memory.md")
         try {
             val existing = if (memFile.exists()) memFile.readText() else ""
-            // Deduplicate: replace existing entry with same key
+            // 去重：替换同 key 的已有条目
             val pattern = Regex("## ${Regex.escape(key)}\n[^#]*").find(existing)
             val body = if (pattern != null) {
                 existing.replace(pattern.value, "## $key\n$content")
@@ -594,7 +594,7 @@ class MemorySaveTool : Tool {
     }
 }
 
-/** Memory directory, isolated per conversation */
+/** 记忆目录，按会话隔离 */
 private fun memDirFor(convId: String, context: android.content.Context): java.io.File {
     val dir = java.io.File(context.filesDir, "memory").also { it.mkdirs() }
     if (convId.isBlank()) return dir
@@ -619,7 +619,327 @@ class MemoryLoadTool : Tool {
     }
 }
 
-// ===== Screen Control Tools =====
+// ===== 起卦工具（纯 Kotlin 实现，省 token，模型直接调用） =====
+
+class GuaYaoTool : Tool {
+    override val definition = ToolDef(
+        name = "gua_yao",
+        description = "起卦占卜工具。六爻摇卦、梅花易数、小六壬，返回完整卦象和吉凶。需要占卜时直接调用，不要自己写起卦代码。",
+        parameters = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "method" to mapOf("type" to "string", "description" to "起卦方法：liuyao(六爻摇卦) / meihua(梅花易数) / xiaoliuren(小六壬)"),
+                "question" to mapOf("type" to "string", "description" to "所问之事，如'问感情''问事业'（可选）"),
+                "year" to mapOf("type" to "string", "description" to "农历年地支（梅花需要，如'酉'），不传用当前年"),
+                "month" to mapOf("type" to "string", "description" to "农历月（梅花、小六壬需要，如'六月'）"),
+                "day" to mapOf("type" to "string", "description" to "农历日（梅花、小六壬需要，如'廿九'）"),
+                "hour" to mapOf("type" to "string", "description" to "农历时辰（梅花、小六壬需要，如'戌时'）")
+            ),
+            "required" to listOf("method")
+        )
+    )
+
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult {
+        return try {
+            val method = args["method"]?.trim()?.lowercase() ?: ""
+            val question = args["question"]?.trim().orEmpty()
+            val q = if (question.isNotBlank()) "问：$question\n" else ""
+            when (method) {
+                "liuyao" -> ToolResult("", true, q + liuyao())
+                "meihua" -> ToolResult("", true, q + meihua(args))
+                "xiaoliuren", "小六壬" -> ToolResult("", true, q + xiaoliuren(args))
+                else -> ToolResult("", false, "未知起卦方法: $method（可选 liuyao/meihua/xiaoliuren）")
+            }
+        } catch (e: Exception) {
+            ToolResult("", false, "起卦失败: ${e.message}")
+        }
+    }
+
+    private fun liuyao(): String {
+        // 六爻：掷三枚铜钱六次，6老阴 7少阳 8少阴 9老阳
+        val yao = IntArray(6) { kotlin.random.Random.nextInt(6, 10) }
+        val names = listOf("初爻", "二爻", "三爻", "四爻", "五爻", "上爻")
+        val yaoName = mapOf(6 to "老阴", 7 to "少阳", 8 to "少阴", 9 to "老阳")
+        val ben = StringBuilder()
+        val bian = StringBuilder()
+        val dong = mutableListOf<Int>()
+        for (i in 0 until 6) {
+            val y = yao[i]
+            val yang = (y == 7 || y == 9)
+            ben.append(if (yang) "阳" else "阴")
+            if (y == 6 || y == 9) {
+                dong.add(i)
+                bian.append(if (yang) "阴" else "阳")
+            } else {
+                bian.append(if (yang) "阳" else "阴")
+            }
+        }
+        val benStr = ben.toString()
+        val bianStr = bian.toString()
+        val upIdx = triToIndex(benStr.substring(3))
+        val downIdx = triToIndex(benStr.substring(0, 3))
+        val benGua = LIU_SHI_SI[upIdx * 8 + downIdx]
+        val bianGua = guaName(bianStr)
+
+        // 八宫、世应
+        val gongIdx = GONG_IDX[upIdx * 8 + downIdx]
+        val xu = GONG_XU[upIdx * 8 + downIdx]
+        val shi = SHI[xu - 1]
+        val ying = ((shi - 1 + 3) % 6) + 1
+        val meWx = GONG_WX[gongIdx]
+
+        val sb = StringBuilder()
+        sb.append("六爻摇卦结果：\n")
+        sb.append("本卦：$benGua（${BA_GUA[gongIdx]}宫）  变卦：$bianGua\n")
+        sb.append("世爻：${names[shi - 1]}  应爻：${names[ying - 1]}\n")
+        sb.append("动爻：${if (dong.isEmpty()) "无（静卦）" else dong.joinToString("、") { names[it] }}\n\n")
+        sb.append("爻位 | 纳甲 | 六亲\n")
+        for (i in 0 until 6) {
+            val najia = najiaForYao(upIdx, downIdx, i)
+            val liuqin = liuQin(najia, meWx)
+            sb.append("${names[i]} ${yaoName[yao[i]]} | $najia | $liuqin\n")
+        }
+        sb.append("\n（请结合卦象、六亲、世应、动爻解读所问之事）")
+        return sb.toString()
+    }
+
+    // 某爻的纳甲：内卦三爻用下卦纳甲内三爻，外卦三爻用上卦纳甲外三爻
+    private fun najiaForYao(upIdx: Int, downIdx: Int, i: Int): String {
+        return if (i < 3) NA_JIA[downIdx][i] else NA_JIA[upIdx][i]
+    }
+
+    // 六亲：以本卦宫五行为"我"
+    private fun liuQin(najia: String, meWx: String): String {
+        val zhi = najia.last().toString()
+        val wx = ZHI_WX[zhi] ?: return "?"
+        return when {
+            wx == meWx -> "兄弟"
+            sheng(wx, meWx) -> "父母"   // 生我
+            sheng(meWx, wx) -> "子孙"   // 我生
+            ke(wx, meWx) -> "官鬼"      // 克我
+            ke(meWx, wx) -> "妻财"      // 我克
+            else -> "?"
+        }
+    }
+
+    private fun sheng(a: String, b: String): Boolean {
+        return (a == "木" && b == "火") || (a == "火" && b == "土") || (a == "土" && b == "金") ||
+               (a == "金" && b == "水") || (a == "水" && b == "木")
+    }
+    private fun ke(a: String, b: String): Boolean {
+        return (a == "木" && b == "土") || (a == "土" && b == "水") || (a == "水" && b == "火") ||
+               (a == "火" && b == "金") || (a == "金" && b == "木")
+    }
+
+    private fun meihua(args: Map<String, String>): String {
+        val m = lunarNum(args["month"]) ?: return "梅花起卦需要农历月（如'六月'）"
+        val d = lunarNum(args["day"]) ?: return "梅花起卦需要农历日（如'廿九'）"
+        val h = shichen(args["hour"])
+        // 年用地支序数（子1丑2...亥12），未提供则按公历年算地支序：(year-4)%12+1
+        val nowYear = java.time.LocalDate.now().year
+        val year = args["year"]?.trim()?.let { zhiXu(it) }
+            ?: ((nowYear - 4) % 12 + 1)
+        val sum1 = year + m + d
+        val sum2 = year + m + d + h
+        val upIdx = ((sum1 % 8).let { if (it == 0) 8 else it }) - 1
+        val downIdx = ((sum2 % 8).let { if (it == 0) 8 else it }) - 1
+        val dongPos = (sum2 % 6).let { if (it == 0) 6 else it }  // 动爻位置 1-6
+
+        val benGua = LIU_SHI_SI[upIdx * 8 + downIdx]
+        // 本卦六爻（下到上）：下卦三爻 + 上卦三爻
+        val benYao = triYang(downIdx) + triYang(upIdx)  // 6 个"阳/阴"
+        // 互卦：本卦二三四爻为下卦，三四五爻为上卦
+        val huXia = triToIndex(benYao.substring(1, 4))
+        val huShang = triToIndex(benYao.substring(2, 5))
+        val huGua = LIU_SHI_SI[huShang * 8 + huXia]
+        // 变卦：动爻变
+        val bianArr = benYao.toCharArray()
+        bianArr[dongPos - 1] = if (bianArr[dongPos - 1] == '阳') '阴' else '阳'
+        val bianStr = String(bianArr)
+        val bianGua = guaName(bianStr)
+        // 体用：动爻所在的卦为用，另一个为体
+        val ti = if (dongPos <= 3) "下卦${BA_GUA[downIdx]}" else "上卦${BA_GUA[upIdx]}"
+        val yong = if (dongPos <= 3) "上卦${BA_GUA[upIdx]}" else "下卦${BA_GUA[downIdx]}"
+
+        return buildString {
+            append("梅花易数（时间起卦）：\n")
+            append("上卦：${BA_GUA[upIdx]}  下卦：${BA_GUA[downIdx]}  动爻：第${dongPos}爻\n")
+            append("本卦：$benGua\n")
+            append("互卦：$huGua\n")
+            append("变卦：$bianGua\n")
+            append("体卦：$ti  用卦：$yong\n")
+            append("（请结合体用生克、卦辞与动爻爻辞解读所问之事）")
+        }
+    }
+
+    // 八卦索引 -> 三爻阴阳字符串（下到上）
+    private fun triYang(idx: Int): String {
+        return when (idx) {
+            0 -> "阳阳阳"  // 乾
+            1 -> "阳阳阴"  // 兑
+            2 -> "阳阴阳"  // 离
+            3 -> "阳阴阴"  // 震
+            4 -> "阴阳阳"  // 巽
+            5 -> "阴阳阴"  // 坎
+            6 -> "阴阴阳"  // 艮
+            else -> "阴阴阴"  // 坤
+        }
+    }
+
+    // 地支序数：子1丑2...亥12
+    private fun zhiXu(s: String): Int? {
+        val map = mapOf("子" to 1, "丑" to 2, "寅" to 3, "卯" to 4, "辰" to 5, "巳" to 6,
+            "午" to 7, "未" to 8, "申" to 9, "酉" to 10, "戌" to 11, "亥" to 12)
+        val t = s.trim().removeSuffix("年")
+        if (t.isBlank()) return null
+        t.toIntOrNull()?.let { return it }
+        // 干支如"丙午"取尾字"午"
+        return map[t] ?: map[t.last().toString()]
+    }
+
+    private fun xiaoliuren(args: Map<String, String>): String {
+        val m = lunarNum(args["month"]) ?: return "小六壬需要农历月（如'六月'）"
+        val d = lunarNum(args["day"]) ?: return "小六壬需要农历日（如'廿九'）"
+        val h = shichen(args["hour"])
+        val pos = arrayOf("大安", "留连", "速喜", "赤口", "小吉", "空亡")
+        val meaning = mapOf(
+            "大安" to "吉，平稳顺利", "留连" to "拖延阻碍，事难速成",
+            "速喜" to "喜事临门，快而有成", "赤口" to "口舌是非，宜谨言",
+            "小吉" to "小事可成，和气生财", "空亡" to "谋事难成，宜守不宜进"
+        )
+        var i = (m - 1) % 6
+        i = (i + d - 1) % 6
+        i = (i + h - 1) % 6
+        val p = pos[i]
+        return "小六壬：$p（${meaning[p]}）\n（农历${m}月${d}日 ${args["hour"] ?: "?"}时）"
+    }
+
+    private fun lunarNum(s: String?): Int? {
+        if (s.isNullOrBlank()) return null
+        val digits = mapOf(
+            "正" to 1, "一" to 1, "二" to 2, "两" to 2, "三" to 3, "四" to 4, "五" to 5,
+            "六" to 6, "七" to 7, "八" to 8, "九" to 9, "十" to 10, "冬" to 11, "腊" to 12
+        )
+        var t = s.trim()
+        t = t.removeSuffix("月").removeSuffix("日").removeSuffix("号")
+        if (t.isBlank()) return null
+        t.toIntOrNull()?.let { return it }
+        // 初X = X（如"初五"）
+        if (t.startsWith("初")) {
+            val tail = t.removePrefix("初")
+            return digits[tail] ?: tail.toIntOrNull()
+        }
+        digits[t]?.let { return it }
+        // 十一~十九
+        if (t.startsWith("十")) {
+            val tail = t.removePrefix("十")
+            if (tail.isEmpty()) return 10
+            digits[tail]?.let { return 10 + it }
+        }
+        // 廿X = 20+X
+        if (t.startsWith("廿")) {
+            val tail = t.removePrefix("廿")
+            if (tail.isEmpty()) return 20
+            digits[tail]?.let { return 20 + it }
+        }
+        // 二十X = 20+X（如"二十八"）
+        if (t.startsWith("二十")) {
+            val tail = t.removePrefix("二十")
+            if (tail.isEmpty()) return 20
+            digits[tail]?.let { return 20 + it }
+        }
+        if (t == "三十") return 30
+        return null
+    }
+
+    private fun shichen(s: String?): Int {
+        if (s.isNullOrBlank()) return 0
+        val map = mapOf(
+            "子" to 0, "丑" to 1, "寅" to 2, "卯" to 3, "辰" to 4, "巳" to 5,
+            "午" to 6, "未" to 7, "申" to 8, "酉" to 9, "戌" to 10, "亥" to 11
+        )
+        val t = s.trim().removeSuffix("时")
+        map[t]?.let { return it }
+        return t.toIntOrNull() ?: 0
+    }
+
+    private fun guaName(yangStr: String): String {
+        // yangStr 是 6 个"阳/阴"，从下往上；上卦=后三爻，下卦=前三爻
+        val up = yangStr.substring(3)
+        val down = yangStr.substring(0, 3)
+        val upIdx = triToIndex(up)
+        val downIdx = triToIndex(down)
+        return guaNameByIndex(upIdx, downIdx)
+    }
+
+    private fun triToIndex(tri: String): Int {
+        // 三爻（下到上，初爻=bit0）转八卦索引 0-7
+        var v = 0
+        for (i in 0 until 3) if (tri[i] == '阳') v = v or (1 shl i)
+        // 乾111=7, 兑011=3, 离101=5, 震001=1, 巽110=6, 坎010=2, 艮100=4, 坤000=0
+        return when (v) {
+            7 -> 0  // 乾
+            3 -> 1  // 兑
+            5 -> 2  // 离
+            1 -> 3  // 震
+            6 -> 4  // 巽
+            2 -> 5  // 坎
+            4 -> 6  // 艮
+            else -> 7  // 坤
+        }
+    }
+
+    private fun guaNameByIndex(upIdx: Int, downIdx: Int): String {
+        return LIU_SHI_SI[upIdx * 8 + downIdx]
+    }
+
+    companion object {
+        private val BA_GUA = listOf("乾", "兑", "离", "震", "巽", "坎", "艮", "坤")
+        private val LIU_SHI_SI = arrayOf(
+            // 上乾
+            "乾为天", "天泽履", "天火同人", "天雷无妄", "天风姤", "天水讼", "天山遁", "天地否",
+            // 上兑
+            "泽天夬", "兑为泽", "泽火革", "泽雷随", "泽风大过", "泽水困", "泽山咸", "泽地萃",
+            // 上离
+            "火天大有", "火泽睽", "离为火", "火雷噬嗑", "火风鼎", "火水未济", "火山旅", "火地晋",
+            // 上震
+            "雷天大壮", "雷泽归妹", "雷火丰", "震为雷", "雷风恒", "雷水解", "雷山小过", "雷地豫",
+            // 上巽
+            "风天小畜", "风泽中孚", "风火家人", "风雷益", "巽为风", "风水涣", "风山渐", "风地观",
+            // 上坎
+            "水天需", "水泽节", "水火既济", "水雷屯", "水风井", "坎为水", "水山蹇", "水地比",
+            // 上艮
+            "山天大畜", "山泽损", "山火贲", "山雷颐", "山风蛊", "山水蒙", "艮为山", "山地剥",
+            // 上坤
+            "地天泰", "地泽临", "地火明夷", "地雷复", "地风升", "地水师", "地山谦", "坤为地"
+        )
+        // 八卦纳甲（初爻到上爻，天干+地支），京房纳甲
+        private val NA_JIA = arrayOf(
+            arrayOf("甲子", "甲寅", "甲辰", "壬午", "壬申", "壬戌"),  // 乾
+            arrayOf("丁巳", "丁卯", "丁丑", "丁亥", "丁酉", "丁未"),  // 兑
+            arrayOf("己卯", "己丑", "己亥", "己酉", "己未", "己巳"),  // 离
+            arrayOf("庚子", "庚寅", "庚辰", "庚午", "庚申", "庚戌"),  // 震
+            arrayOf("辛丑", "辛亥", "辛酉", "辛未", "辛巳", "辛卯"),  // 巽
+            arrayOf("戊寅", "戊辰", "戊午", "戊申", "戊戌", "戊子"),  // 坎
+            arrayOf("丙辰", "丙午", "丙申", "丙戌", "丙子", "丙寅"),  // 艮
+            arrayOf("乙未", "乙巳", "乙卯", "癸丑", "癸亥", "癸酉")   // 坤
+        )
+        // 地支五行
+        private val ZHI_WX = mapOf(
+            "子" to "水", "丑" to "土", "寅" to "木", "卯" to "木", "辰" to "土", "巳" to "火",
+            "午" to "火", "未" to "土", "申" to "金", "酉" to "金", "戌" to "土", "亥" to "水"
+        )
+        // 宫五行（按八卦索引）
+        private val GONG_WX = arrayOf("金", "金", "火", "木", "木", "水", "土", "土")
+        // 64卦所属八宫（按 LIU_SHI_SI 顺序）
+        private val GONG_IDX = intArrayOf(0,6,2,4,0,2,0,0,7,1,5,3,3,1,1,1,0,6,2,4,2,2,2,0,7,1,5,3,3,3,1,3,4,6,4,4,4,2,6,0,7,5,5,5,3,5,1,7,6,6,6,4,4,2,6,0,7,7,5,7,3,5,1,7)
+        private val GONG_XU = intArrayOf(1,6,8,5,2,7,3,4,6,1,5,8,7,2,4,3,8,5,1,6,3,4,2,7,5,8,6,1,4,3,7,2,2,7,3,4,1,6,8,5,7,2,4,3,6,1,5,8,3,4,2,7,8,5,1,6,4,3,7,2,5,8,6,1)
+        // 世爻位置（按宫序 1-8）
+        private val SHI = intArrayOf(6, 1, 2, 3, 4, 5, 4, 3)
+    }
+}
+
+// ===== 屏幕控制工具 =====
 
 class ScreenInfoTool : Tool {
     override val definition = ToolDef(
@@ -739,7 +1059,7 @@ class ScreenHomeTool : Tool {
     }
 }
 
-// ==================== Registry ====================
+// ==================== 注册表 ====================
 
 object ToolRegistry {
     private var tools: List<Tool> = emptyList()
@@ -754,6 +1074,7 @@ object ToolRegistry {
             PythonExecTool(pyManager), PipInstallTool(pyManager),
             PythonSessionCloseTool(pyManager),
             MemorySaveTool(), MemoryLoadTool(),
+            GuaYaoTool(),
             ScreenInfoTool(), ScreenTapTool(), ScreenSwipeTool(),
             ScreenTypeTool(), ScreenBackTool(), ScreenHomeTool()
         )
@@ -768,7 +1089,12 @@ object ToolRegistry {
         val tool = tools.find { it.definition.name == toolCall.name }
             ?: return ToolResult(toolCall.id, false, "未知工具: ${toolCall.name}")
         return try {
-            tool.executeForConv(toolCall.arguments, context, convId).copy(toolCallId = toolCall.id)
+            val result = tool.executeForConv(toolCall.arguments, context, convId).copy(toolCallId = toolCall.id)
+            // 只在极端输出时截断；现代模型上下文大，完整排盘/代码结果应保留
+            val maxLen = 30000
+            if (result.content.length > maxLen) {
+                result.copy(content = result.content.take(maxLen) + "\n...[工具输出过长，已截断，仅展示前 $maxLen 字符]")
+            } else result
         } catch (e: Exception) {
             ToolResult(toolCall.id, false, "执行错误: ${e.message}")
         }

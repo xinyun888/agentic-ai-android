@@ -70,7 +70,7 @@ fun ProfileScreen(
                             newList.removeAt(index)
                             profiles = newList
                             viewModel.saveProfiles(newList)
-                            // If deleted the active one, set first as active
+                            // 若删除的是当前启用项，则将第一项设为启用
                             if (viewModel.getActiveProfileId() == profile.id) {
                                 viewModel.setActiveProfileId(newList.first().id)
                             }
@@ -111,7 +111,7 @@ fun ProfileCard(
         } else CardDefaults.cardColors()
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            // Header
+            // 头部
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -182,7 +182,7 @@ fun ProfileCard(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Thinking toggle
+                // 推理开关
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -203,7 +203,7 @@ fun ProfileCard(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Vision model config
+                // 视觉模型配置
                 Text("视觉模型（图片前置处理）", style = MaterialTheme.typography.bodyMedium)
                 Text("图片先发给视觉模型取描述，再注入主模型", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Spacer(modifier = Modifier.height(6.dp))
@@ -231,7 +231,7 @@ fun ProfileCard(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Actions
+            // 操作按钮
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End

@@ -3,7 +3,7 @@ package com.example.aichat.data
 import retrofit2.http.GET
 import retrofit2.http.Query
 
-// --- DuckDuckGo Instant Answer API ---
+// --- DuckDuckGo 即时回答 API ---
 
 data class DdgResponse(
     val AbstractText: String = "",
@@ -40,7 +40,7 @@ fun buildSearchContext(response: DdgResponse): String {
 
     response.RelatedTopics.take(5).forEachIndexed { i, topic ->
         if (topic.Text.isNotBlank()) {
-            // Strip HTML from topic text
+            // 去除主题文本中的 HTML
             val cleanText = topic.Text.replace(Regex("<[^>]*>"), "")
             parts.add("【结果${i + 1}】$cleanText")
         }

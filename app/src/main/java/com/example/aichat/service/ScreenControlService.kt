@@ -45,7 +45,7 @@ class ScreenControlService : AccessibilityService() {
         super.onDestroy()
     }
 
-    /** Get all visible node texts as a flat list */
+    /** 获取所有可见节点的文本（扁平列表） */
     fun getAccessibilityTree(): String {
         val sb = StringBuilder()
         try {
@@ -80,7 +80,7 @@ class ScreenControlService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    /** Perform a click at (x, y) */
+    /** 在 (x, y) 处执行点击 */
     fun performClick(x: Float, y: Float): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
         val path = Path().apply { moveTo(x, y) }
@@ -90,7 +90,7 @@ class ScreenControlService : AccessibilityService() {
         return dispatchGesture(gesture, null, null)
     }
 
-    /** Perform a swipe from (x1,y1) to (x2,y2) */
+    /** 从 (x1,y1) 滑动到 (x2,y2) */
     fun performSwipe(x1: Float, y1: Float, x2: Float, y2: Float, duration: Long = 300): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return false
         val path = Path().apply { moveTo(x1, y1); lineTo(x2, y2) }
@@ -100,7 +100,7 @@ class ScreenControlService : AccessibilityService() {
         return dispatchGesture(gesture, null, null)
     }
 
-    /** Type text into the currently focused field */
+    /** 向当前聚焦的输入框输入文本 */
     fun performSetText(text: String): Boolean {
         try {
             val root = rootInActiveWindow ?: return false
@@ -116,7 +116,7 @@ class ScreenControlService : AccessibilityService() {
         } catch (_: Exception) { return false }
     }
 
-    /** Find and click a node by text */
+    /** 按文本查找并点击节点 */
     fun findAndClickByText(text: String): Boolean {
         try {
             val root = rootInActiveWindow ?: return false
@@ -147,9 +147,9 @@ class ScreenControlService : AccessibilityService() {
         return false
     }
 
-    /** Press Back */
+    /** 按返回键 */
     fun performBack(): Boolean = performGlobalAction(GLOBAL_ACTION_BACK)
 
-    /** Press Home */
+    /** 按 Home 键 */
     fun performHome(): Boolean = performGlobalAction(GLOBAL_ACTION_HOME)
 }

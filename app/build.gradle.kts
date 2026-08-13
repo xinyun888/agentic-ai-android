@@ -65,6 +65,8 @@ chaquopy {
         version = "3.13"
         buildPython("C:/Users/Lenovo/.workbuddy/binaries/python/versions/3.13.12/python.exe")
         pip {
+            // lunar_python 在 PyPI 只有源码包，Chaquopy 只接受 wheel，这里用本地构建的 wheel
+            options("--find-links", file("../python-wheels").absolutePath)
             install("pandas")
             install("numpy")
             install("matplotlib")
@@ -76,6 +78,8 @@ chaquopy {
             install("lxml")
             install("regex")
             install("skyfield")
+            // 命理师：八字/农历/节气/干支/大运（纯 Python）
+            install("lunar_python")
         }
     }
 }

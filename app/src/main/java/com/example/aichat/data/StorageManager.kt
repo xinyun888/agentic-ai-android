@@ -5,7 +5,7 @@ import android.content.SharedPreferences
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 
-// --- Models ---
+// --- 数据模型 ---
 
 data class ApiProfile(
     val id: String = java.util.UUID.randomUUID().toString(),
@@ -28,7 +28,7 @@ data class Conversation(
     val updatedAt: Long = System.currentTimeMillis()
 )
 
-// --- Storage Manager ---
+// --- 存储管理器 ---
 
 class StorageManager(context: Context) {
 
@@ -36,7 +36,7 @@ class StorageManager(context: Context) {
         context.getSharedPreferences("moyu_storage", Context.MODE_PRIVATE)
     private val gson = Gson()
 
-    // ===== API Profiles =====
+    // ===== API 配置 =====
 
     fun getProfiles(): List<ApiProfile> {
         val json = prefs.getString("profiles", null) ?: return listOf(ApiProfile(name = "Default"))
@@ -65,7 +65,7 @@ class StorageManager(context: Context) {
             ?: getProfiles().firstOrNull()
     }
 
-    // ===== Conversations =====
+    // ===== 会话 =====
 
     fun getConversations(): List<Conversation> {
         val json = prefs.getString("conversations", null) ?: return emptyList()
@@ -118,12 +118,12 @@ class StorageManager(context: Context) {
         prefs.edit().putString("active_conv_id", id).apply()
     }
 
-    // ===== Messages convenience =====
+    // ===== 消息便捷方法 =====
 
-    /** Save a conversation with updated messages */
+    /** 以更新后的消息保存会话 */
     fun updateMessages(convId: String, messages: List<ChatMessage>) {
         val conv = getConversation(convId) ?: return
-        // Auto-title: use first user message (trimmed)
+        // 自动命名：使用第一条用户消息（去除首尾空格）
         val title = if (conv.title == "新对话" && messages.isNotEmpty()) {
             val firstUser = messages.firstOrNull { it.role == "user" }
             firstUser?.content?.take(30)?.trim()?.let {

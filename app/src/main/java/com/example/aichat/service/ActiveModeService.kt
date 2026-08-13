@@ -40,7 +40,7 @@ class ActiveModeService : Service() {
         const val EXTRA_START_HOUR = "start_hour"
         const val EXTRA_END_HOUR = "end_hour"
 
-        /** Set of persona IDs currently running — supports multiple companions */
+        /** 正在运行的角色集合，支持多开 */
         val runningPersonas: MutableSet<String> = ConcurrentHashMap.newKeySet()
         val runningConversations: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
@@ -56,16 +56,35 @@ class ActiveModeService : Service() {
     private val client = OkHttpClient()
     private val gson = Gson()
 
-    /** One job per persona — parallel companions */
+    /** 每个角色一个心跳 Job */
     private val jobs = ConcurrentHashMap<String, Job>()
-    /** personaId → convId mapping, for cleanup */
+    /** personaId → convId */
     private val personaConvs = ConcurrentHashMap<String, String>()
-    /** personaId → heartbeat config (for AlarmManager wakeups after process death) */
+    /** personaId → 心跳配置，进程被杀后由闹钟恢复 */
     private val configs = ConcurrentHashMap<String, ActiveConfig>()
+
+    private fun prefs() = getSharedPreferences("active_mode", MODE_PRIVATE)
+
+    private fun loadConfigsFromPrefs() {
+        try {
+            val json = prefs().getString("configs", null) ?: return
+            val type = object : com.google.gson.reflect.TypeToken<Map<String, ActiveConfig>>() {}.type
+            val map: Map<String, ActiveConfig> = gson.fromJson(json, type) ?: return
+            configs.putAll(map)
+            runningPersonas.addAll(map.keys)
+            map.values.forEach { cfg -> if (cfg.convId.isNotBlank()) runningConversations.add(cfg.convId) }
+        } catch (_: Exception) {}
+    }
+
+    private fun saveConfigsToPrefs() {
+        try { prefs().edit().putString("configs", gson.toJson(configs)).apply() } catch (_: Exception) {}
+    }
 
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        // 恢复持久化配置，进程被杀后由闹钟拉起时能继续心跳
+        loadConfigsFromPrefs()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -86,7 +105,7 @@ class ActiveModeService : Service() {
                 stopHeartbeat(personaId)
             }
             action == ACTION_HEARTBEAT -> {
-                // AlarmManager wakeup — run heartbeat even if app is backgrounded/killed
+                // 闹钟唤醒，后台/被杀也能执行心跳
                 handleHeartbeat(personaId)
             }
         }
@@ -98,12 +117,9 @@ class ActiveModeService : Service() {
     override fun onDestroy() {
         jobs.values.forEach { it.cancel() }
         jobs.clear()
-        runningPersonas.forEach { cancelAlarm(it) }
-        runningPersonas.clear()
-        runningConversations.clear()
-        configs.clear()
         scope.cancel()
         super.onDestroy()
+        // 不在这里清 configs / 取消闹钟：进程被杀时，持久化配置和已注册的闹钟必须存活，下次才能恢复心跳
     }
 
     private fun buildHeartbeatPI(personaId: String): PendingIntent {
@@ -120,7 +136,7 @@ class ActiveModeService : Service() {
         val am = getSystemService(ALARM_SERVICE) as AlarmManager
         val at = System.currentTimeMillis() + cfg.intervalMin * 60_000L
         try {
-            // setExactAndAllowWhileIdle fires even in Doze (Android 12+ has per-app quota, fine at 5-60min)
+            // 精确闹钟，Doze 下也能触发
             am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
         } catch (_: Exception) {
             try { am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
@@ -137,7 +153,7 @@ class ActiveModeService : Service() {
         personaId: String, convId: String, intervalMin: Int, immersive: Boolean,
         showThinking: Boolean, startHour: Int, endHour: Int
     ) {
-        // Already running for this persona — ignore duplicate
+        // 已运行则忽略重复开启
         if (personaId in runningPersonas) return
         runningPersonas.add(personaId)
         if (convId.isNotBlank()) {
@@ -148,18 +164,19 @@ class ActiveModeService : Service() {
         val persona = Personas.getById(personaId)
         val fullName = "${persona.emoji} ${persona.name}"
 
-        // Per-persona foreground notification id (always positive)
+        // 每个角色独立的前台通知 id
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
         startForeground(fgId, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · 每轮心跳写回对话", fgId))
 
-        // Save config so AlarmManager wakeups (even after process death) can resume
+        // 持久化配置，进程被杀后闹钟拉起时能恢复
         configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
-        // Schedule first heartbeat after intervalMin (not immediately)
+        saveConfigsToPrefs()
+        // 间隔后首次心跳，不立即触发
         updateNotification(fgId, fullName, "${intervalMin}分钟后首次心跳")
         scheduleAlarm(personaId)
     }
 
-    /** Executed on AlarmManager wakeup — works even when app is backgrounded/killed */
+    /** 闹钟唤醒时执行心跳 */
     private fun handleHeartbeat(personaId: String) {
         val cfg = configs[personaId] ?: return
         if (personaId !in runningPersonas) return
@@ -167,7 +184,7 @@ class ActiveModeService : Service() {
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
         val fullName = "${persona.emoji} ${persona.name}"
 
-        // Ensure foreground while doing network work (in case service was restarted by alarm)
+        // 闹钟拉起服务时确保前台状态
         try {
             startForeground(fgId, buildNotification(fullName + " 正在陪伴", "心跳中...", fgId))
         } catch (_: Exception) {}
@@ -191,7 +208,6 @@ class ActiveModeService : Service() {
                 updateNotification(fgId, fullName, "心跳异常: ${e.message?.take(20) ?: "未知"}")
             } finally {
                 jobs.remove(personaId)
-                // Schedule next heartbeat
                 scheduleAlarm(personaId)
             }
         }
@@ -201,6 +217,7 @@ class ActiveModeService : Service() {
         jobs.remove(personaId)?.cancel()
         cancelAlarm(personaId)
         configs.remove(personaId)
+        saveConfigsToPrefs()
         runningPersonas.remove(personaId)
         personaConvs.remove(personaId)?.let { runningConversations.remove(it) }
     }
@@ -216,7 +233,7 @@ class ActiveModeService : Service() {
         val timeStr = "${now.monthValue}月${now.dayOfMonth}日 ${now.hour}:${String.format("%02d", now.minute)}"
         val hour = now.hour
 
-        // Detect screen state via PowerManager
+        // 检测屏幕亮灭
         val pm = getSystemService(POWER_SERVICE) as? PowerManager
         val screenOn = pm?.isInteractive ?: false
 
@@ -227,13 +244,13 @@ class ActiveModeService : Service() {
 
         val messages = mutableListOf<ChatMessageDto>()
 
-        // Build judgment prompt based on time of day
+        // 按时段构建判断提示
         val shouldSkip = hour in 0..6 || (!screenOn && hour in 22..23)
         val pasHint = if (shouldSkip) """
 ⚠️ 当前是休息时段或用户不在使用手机。你必须严格回复 PASS。
 """.trimIndent() else ""
 
-        // Memory file isolated per conversation
+        // 记忆按对话隔离
         val memDir = if (convId.isBlank()) File(filesDir, "memory")
                      else File(File(filesDir, "memory"), convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")).also { it.mkdirs() }
 
@@ -249,7 +266,7 @@ class ActiveModeService : Service() {
             if (memFile.exists()) memFile.readText().take(400).let {
                 if (it.isNotBlank()) messages.add(ChatMessageDto(role = "system", content = "记忆：$it"))
             }
-            // Pull last messages from THIS conversation for context
+            // 取本对话最近消息作上下文
             val conv = convId.ifBlank { null }?.let { StorageManager(this).getConversation(it) }
             val lastMsgs = conv?.messages?.filter { it.role != "system" }?.takeLast(4)
             lastMsgs?.forEach {
@@ -257,7 +274,7 @@ class ActiveModeService : Service() {
             }
         }
 
-        // Extract appointment entries from appointments.md (managed by code)
+        // 从 appointments.md 提取约定
         val apptFile = File(memDir, "appointments.md")
         val apptBlocks = if (apptFile.exists()) {
             apptFile.readText().split("\n## ").mapIndexed { i, p ->
@@ -312,21 +329,17 @@ class ActiveModeService : Service() {
         val first = choices.firstOrNull() as? Map<*, *> ?: return ""
         val msg = first["message"] as? Map<*, *> ?: return ""
         val content = msg["content"]?.toString()?.trim() ?: return ""
-        // Match "PASS" or "PASS（...）" etc
+        // 匹配 "PASS" 或 "PASS（...）"
         val isPass = content.uppercase().startsWith("PASS") ||
                       content.equals("PASS", ignoreCase = true)
-        // Manage appointment lifecycle: executed → delete; expired 3x → delete
-        if (apptFile.exists() && apptBlocks.isNotEmpty()) {
+        // 约定生命周期：执行过→删，过期 3 次→删；PASS（休息时段）不算过期
+        if (!isPass && apptFile.exists() && apptBlocks.isNotEmpty()) {
             updateAppointments(apptFile, apptBlocks, content)
         }
         return if (isPass) "" else content
     }
 
-    /**
-     * Appointment lifecycle:
-     * - If heartbeat reply mentions the appointment keyword → executed/responded → remove
-     * - Otherwise bump expiry counter; at 3 → remove
-     */
+    // 约定生命周期：心跳回复提到约定关键词→删除；否则过期计数，满 3 次→删除
     private fun updateAppointments(apptFile: File, blocks: List<String>, result: String) {
         try {
             val keepBlocks = mutableListOf<String>()
@@ -335,14 +348,14 @@ class ActiveModeService : Service() {
                 val body = block.substringAfter("\n", "").trim()
                 val keyword = body.replace(Regex("\\[[^]]*]"), "").trim().take(10)
                 if (keyword.isNotBlank() && result.contains(keyword)) {
-                    changed = true  // executed / responded → drop
+                    changed = true  // 已执行/回应，删除
                     continue
                 }
                 val cntRegex = Regex("""\[过期(\d+)次]""")
                 val cnt = cntRegex.find(body)?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 val newCnt = cnt + 1
                 if (newCnt >= 3) {
-                    changed = true  // expired 3 times → drop
+                    changed = true  // 过期 3 次，删除
                 } else {
                     val newBody = if (cnt == 0) "$body [过期1次]" else body.replace(cntRegex, "[过期${newCnt}次]")
                     keepBlocks.add("## ${block.substringBefore("\n")}\n$newBody")

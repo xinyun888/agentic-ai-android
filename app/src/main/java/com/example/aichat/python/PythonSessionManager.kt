@@ -28,12 +28,19 @@ class PythonSessionManager(private val context: Context) {
             if (!Python.isStarted()) {
                 Python.start(AndroidPlatform(context))
             }
+            // 把可写的 pip 目标目录加进 sys.path，运行时装的包才能 import
+            try {
+                val libsDir = File(context.filesDir, "pip_libs")
+                libsDir.mkdirs()
+                val py = Python.getInstance()
+                py.getModule("sys").callAttr("path").callAttr("insert", 0, libsDir.absolutePath)
+            } catch (_: Exception) {}
             initialized.set(true)
         }
     }
 
     /**
-     * Execute Python code in a session.
+     * 在会话中执行 Python 代码。
      */
     suspend fun execute(
         code: String,
@@ -44,23 +51,23 @@ class PythonSessionManager(private val context: Context) {
         ensureInitialized()
         val py = Python.getInstance()
 
-        // 1. Syntax pre-check
+        // 1. 语法预检查
         val syntaxErr = checkSyntax(py, code)
         if (syntaxErr != null) return@withContext PyResult("", syntaxErr)
 
-        // 2. Get or create session (a dict-like namespace)
+        // 2. 获取或创建会话（类似 dict 的命名空间）
         val sessionDict = getOrCreateSession(py, sessionId)
 
-        // 3. Auto-cwd to workspace
+        // 3. 自动切换到 workspace 目录
         val wsDir = File(context.filesDir, "workspace").also { it.mkdirs() }
 
-        // 4. Capture pre-execution file list
+        // 4. 记录执行前的文件列表
         val beforeFiles = wsDir.walkTopDown().filter { it.isFile }.map { it.absolutePath }.toSet()
 
-        // 5. Execute code
+        // 5. 执行代码
         val outcome = runScript(py, sessionDict, code, wsDir.absolutePath)
 
-        // 6. Handle errors
+        // 6. 处理错误
         if (outcome.error.isNotEmpty()) {
             val module = extractMissingModule(outcome.error)
             if (module != null && retryCount == 0) {
@@ -73,7 +80,7 @@ class PythonSessionManager(private val context: Context) {
             }
         }
 
-        // 7. Check for new files
+        // 7. 检查新增文件
         val afterFiles = wsDir.walkTopDown().filter { it.isFile }.map { it.absolutePath }.toSet()
         val newFiles = afterFiles - beforeFiles
         val relativeFiles = newFiles.map { it.removePrefix("${wsDir.absolutePath}/") }
@@ -90,7 +97,7 @@ class PythonSessionManager(private val context: Context) {
         pipInstall(Python.getInstance(), packageName)
     }
 
-    /** Install and return error details ("" = success) so the model can report the real cause. */
+    /** 安装并返回错误详情（"" 表示成功），以便模型能报告真实原因。 */
     suspend fun installVerbose(packageName: String): String = withContext(Dispatchers.IO) {
         ensureInitialized()
         pipInstallVerbose(Python.getInstance(), packageName)
@@ -100,21 +107,21 @@ class PythonSessionManager(private val context: Context) {
         sessions.remove(sessionId)
     }
 
-    // --- Private helpers ---
+    // --- 私有辅助函数 ---
 
     data class ScriptResult(val output: String, val error: String)
 
     /**
-     * Execute Python code in a given namespace dict.
+     * 在给定命名空间 dict 中执行 Python 代码。
      */
     private fun runScript(py: Python, ns: PyObject, code: String, wsPath: String): ScriptResult {
         val builtins = py.getModule("builtins")
 
-        // Store code as a string variable in namespace to avoid Kotlin injection issues
+        // 将代码以字符串变量存入命名空间，避免 Kotlin 注入问题
         ns.callAttr("__setitem__", "__user_code__", code)
         ns.callAttr("__setitem__", "__ws_path__", wsPath)
 
-        // Use exec to run the wrapper which executes the stored code
+        // 使用 exec 运行包装器来执行已存储的代码
         val wrapper = """
 import sys, io, os
 
@@ -166,10 +173,10 @@ __result__ = (_out.getvalue(), _err.getvalue())
             val wsDir = File(context.filesDir, "workspace").also { it.mkdirs() }
             val wsAbs = wsDir.absolutePath
 
-            // Create a dict as session namespace
+            // 创建 dict 作为会话命名空间
             val ns = py.getModule("builtins").callAttr("dict")
 
-            // Inject context bridge
+            // 注入上下文桥
             py.getModule("builtins").callAttr("exec", """
 import os as _os
 
@@ -226,40 +233,56 @@ context = type('_Ctx', (), {
         return null
     }
 
-    private val pipMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    private val pipMirrors = listOf(
+        "https://pypi.tuna.tsinghua.edu.cn/simple",
+        "https://mirrors.aliyun.com/pypi/simple/",
+        "https://mirrors.cloud.tencent.com/pypi/simple",
+        "https://pypi.org/simple"
+    )
 
-    /** Returns "" on success, or an error description. Primary path: in-process pip._internal.main. */
+    /** 成功返回空串，失败返回错误描述；装到可写的 app 私有目录 */
     private fun pipInstallVerbose(py: Python, pkg: String): String {
-        // 1) In-process pip._internal.main — pip 21+ removed pip.main; _internal.main still works.
-        //    No subprocess, so it doesn't matter that Chaquopy's sys.executable isn't executable.
+        val libsDir = File(context.filesDir, "pip_libs").absolutePath
+        // 进程内 pip._internal.main + --target（规避 APK 只读 site-packages）+ 多镜像轮询
+        val pip = try { py.getModule("pip._internal") } catch (_: Exception) { null }
+        if (pip != null) {
+            var lastErr = ""
+            for (mirror in pipMirrors) {
+                try {
+                    val rc = pip.callAttr("main", listOf("install", "--target", libsDir,
+                        "--no-cache-dir", "--disable-pip-version-check",
+                        "-i", mirror, pkg))
+                    if (rc?.toInt() == 0) return ""
+                    lastErr = "pip 退出码 ${rc?.toInt() ?: "null"} (镜像: $mirror)"
+                } catch (e: Exception) {
+                    lastErr = "pip 异常: ${e.message} (镜像: $mirror)"
+                }
+            }
+            return "所有镜像安装失败: $lastErr"
+        }
+        // 兜底：subprocess，带 stderr 诊断
         try {
-            val pip = py.getModule("pip._internal")
-            val rc = pip?.callAttr("main", listOf("install", "--no-cache-dir", "--disable-pip-version-check",
-                "-i", pipMirror, pkg))
-            return if (rc?.toInt() == 0) "" else "pip._internal 退出码: ${rc?.toInt() ?: "null"}"
-        } catch (e: Exception) {
-            // 2) Fallback: subprocess with sys.executable + capture stderr for diagnostics
-            try {
-                val builtins = py.getModule("builtins")
-                val ns = builtins.callAttr("dict")
-                ns.callAttr("__setitem__", "__pkg__", pkg)
-                ns.callAttr("__setitem__", "__rc__", builtins.callAttr("int", -1))
-                ns.callAttr("__setitem__", "__err__", builtins.callAttr("str", ""))
-                val script = """
+            val builtins = py.getModule("builtins")
+            val ns = builtins.callAttr("dict")
+            ns.callAttr("__setitem__", "__pkg__", pkg)
+            ns.callAttr("__setitem__", "__target__", libsDir)
+            ns.callAttr("__setitem__", "__rc__", builtins.callAttr("int", -1))
+            ns.callAttr("__setitem__", "__err__", builtins.callAttr("str", ""))
+            val script = """
 import sys, subprocess
-r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', '--disable-pip-version-check',
-                    '-i', '$pipMirror', __pkg__],
+r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--target', __target__,
+                    '--no-cache-dir', '--disable-pip-version-check',
+                    '-i', '${pipMirrors[0]}', __pkg__],
                    capture_output=True, text=True, timeout=180)
 __rc__ = r.returncode
 __err__ = (r.stdout[-600:] + r.stderr[-600:]).strip()
 """.trimIndent()
-                builtins.callAttr("exec", script, ns)
-                val rc = ns.callAttr("get", "__rc__").toInt()
-                val err = ns.callAttr("get", "__err__").toString()
-                return if (rc == 0) "" else "pip 退出码 $rc: $err"
-            } catch (e2: Exception) {
-                return "pip 执行失败: ${e2.message}"
-            }
+            builtins.callAttr("exec", script, ns)
+            val rc = ns.callAttr("get", "__rc__").toInt()
+            val err = ns.callAttr("get", "__err__").toString()
+            return if (rc == 0) "" else "pip 退出码 $rc: $err"
+        } catch (e2: Exception) {
+            return "pip 执行失败: ${e2.message}"
         }
     }
 

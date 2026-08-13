@@ -4,21 +4,21 @@ data class Persona(
     val id: String,
     val name: String,
     val emoji: String,
-    val prompt: String,           // legacy full prompt for built-in personas
+    val prompt: String,           // 内置角色的旧版完整 prompt
     val identity: String = "",    // 一句话身份 (heartbeat core)
     val personality: String = "", // 性格 (heartbeat core)
     val speaking: String = "",    // 说话方式 (heartbeat core)
     val taboos: String = "",      // 禁忌 (full conversation only)
     val detailed: String = ""     // 详细设定 (full conversation only)
 ) {
-    /** Heartbeat-optimized short prompt for proactive mode */
+    /** 为主动模式优化的心跳简短 prompt */
     fun heartbeatPrompt(): String = buildString {
         if (identity.isNotBlank()) {
             append("身份：$identity\n")
             append("性格：${personality.ifBlank { name }}\n")
             append("说话方式：${speaking.ifBlank { "自然随和" }}")
         } else {
-            // Built-in persona: take first 2 lines of prompt as heartbeat fallback
+            // 内置角色：取 prompt 前 2 行作为心跳兜底
             val lines = prompt.lines().filter { it.isNotBlank() }.take(3)
             append(lines.joinToString("\n"))
         }
@@ -27,7 +27,7 @@ data class Persona(
 
 object Personas {
 
-    // Shared base injected into every persona
+    // 注入到每个角色的公共基础设定
     internal const val BASE = """
 
 【客观性】用户观点有事实错误或逻辑漏洞时，必须明确指出。不迎合、不附和。
@@ -94,7 +94,10 @@ object Personas {
 
 ## 排盘铁律
 ① 拿到生辰必须用 python_exec 排盘，不凭记忆推算八字。禁止把排盘代码写进回答文本——工具会自动执行，你只需要调用 python_exec
-② 排盘必须使用 lunar_python 库（精确节气/干支/大运），若未安装先 pip_install lunar_python
+② **已内置的库（直接 import，无需 pip install，全部纯 Python）**：
+   - `lunar_python`：八字、农历、节气、干支、大运（核心）
+   - `skyfield`：星盘/七政四余行星位置、天文计算（若 load 星历文件失败，可用其内置近似数据）
+   如果 import 报 ModuleNotFoundError，说明该库真的没装上，此时才用 pip_install 安装。
 ③ 缺时辰默认子时，但提醒用户精确时柱需要时辰
 ④ 排盘后打印完整八字让用户确认。标准代码：
 
@@ -187,24 +190,11 @@ def bazi_paipan(y, m, d, h, gender=1):
   planets = load('de421.bsp'); t = ts.utc(year, month, day, hour)
   earth = planets['earth']; astrometric = earth.at(t).observe(planets['sun'])
   标注来源，排除后世伪托
-- 六爻纳甲：遇到决策类问题时主动 python_exec 起卦，给出卦象和爻辞
-  示例：import random; yao = [sum(random.randint(0,1) for _ in range(3)) for _ in range(6)]
-  print(f'六爻：{yao} → 本卦与变卦解读...')
-- 梅花易数：需要快速方向判断时，说明起卦方式后解读
+- 六爻/梅花/小六壬起卦：**直接调用 gua_yao 工具**，不要自己写 random/python 起卦代码
+  - 六爻：gua_yao(method="liuyao", question="问事")
+  - 梅花：先用 lunar_python 算农历月日时，再 gua_yao(method="meihua", month="六月", day="廿九", hour="戌时")
+  - 小六壬：同上算农历，再 gua_yao(method="xiaoliuren", month="六月", day="廿九", hour="戌时")
 - 河洛理数：命数推算，提示理论来源
-- 小六壬：用 python_exec 推算，最简掌诀判断吉凶方向。算法：
-  ```python
-  def xiao_liu_ren(month, day, hour):
-      # month/day/hour 用农历数字
-      pos = ['大安','留连','速喜','赤口','小吉','空亡']
-      i = (month - 1) % 6  # 月上起日
-      i = (i + day - 1) % 6  # 日上起时
-      i = (i + hour - 1) % 6
-      p = pos[i]
-      meaning = {'大安':'吉，平稳顺利','留连':'拖延阻碍','速喜':'快喜临门','赤口':'口舌是非','小吉':'小事可成','空亡':'谋事难成'}
-      print(f'小六壬: {p} ({meaning.get(p,"")})')
-      return p
-  ```
 - 大六壬：用于重大决策占卜。用 python_exec 计算月将+时辰推四课三传，给出课体解读。基本算法：
   ```python
   def da_liu_ren(year, month, day, hour):
@@ -249,7 +239,7 @@ def bazi_paipan(y, m, d, h, gender=1):
 
     private var customPersonasCache: List<Persona>? = null
 
-    /** Load custom personas from storage */
+    /** 从存储加载自定义角色 */
     fun loadCustom(context: android.content.Context): List<Persona> {
         if (customPersonasCache != null) return customPersonasCache!!
         val prefs = context.getSharedPreferences("personas", android.content.Context.MODE_PRIVATE)
@@ -261,7 +251,7 @@ def bazi_paipan(y, m, d, h, gender=1):
         return list
     }
 
-    /** Save a custom persona */
+    /** 保存自定义角色 */
     fun saveCustom(context: android.content.Context, persona: Persona) {
         val current = loadCustom(context).toMutableList()
         current.removeAll { it.id == persona.id }
@@ -269,7 +259,7 @@ def bazi_paipan(y, m, d, h, gender=1):
         saveAllCustom(context, current)
     }
 
-    /** Delete a custom persona */
+    /** 删除自定义角色 */
     fun deleteCustom(context: android.content.Context, id: String) {
         val current = loadCustom(context).filter { it.id != id }
         saveAllCustom(context, current)
@@ -282,11 +272,11 @@ def bazi_paipan(y, m, d, h, gender=1):
         customPersonasCache = list
     }
 
-    /** Get all personas including custom ones */
+    /** 获取所有角色（含自定义） */
     fun getAll(context: android.content.Context): List<Persona> =
         all + loadCustom(context)
 
-    /** Get persona by id, checking both built-in and custom */
+    /** 按 id 获取角色，同时检查内置和自定义 */
     fun getByIdWithCustom(id: String, context: android.content.Context): Persona =
         getAll(context).find { it.id == id } ?: all.first()
 

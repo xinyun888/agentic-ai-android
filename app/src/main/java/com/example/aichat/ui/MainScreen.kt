@@ -50,7 +50,7 @@ fun MainScreen(
         }
     ) { padding ->
         if (viewModel.conversations.isEmpty()) {
-            // Empty state
+            // 空状态
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -99,7 +99,7 @@ fun MainScreen(
         }
     }
 
-    // Delete confirmation dialog
+    // 删除确认对话框
     showDeleteDialog?.let { conv ->
         AlertDialog(
             onDismissRequest = { showDeleteDialog = null },
@@ -122,7 +122,7 @@ fun MainScreen(
         )
     }
 
-    // Rename dialog
+    // 重命名对话框
     showRenameDialog?.let { conv ->
         var newName by remember(conv.id) { mutableStateOf(conv.title) }
         AlertDialog(
@@ -175,7 +175,7 @@ fun ConversationItem(
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Avatar
+            // 头像
             Surface(
                 modifier = Modifier.size(44.dp),
                 shape = MaterialTheme.shapes.medium,
@@ -219,7 +219,7 @@ fun ConversationItem(
                 )
             }
 
-            // Rename button
+            // 重命名按钮
             IconButton(onClick = onRename) {
                 Icon(
                     Icons.Outlined.Edit,
@@ -229,7 +229,7 @@ fun ConversationItem(
                 )
             }
 
-            // Delete button
+            // 删除按钮
             IconButton(onClick = onDelete) {
                 Icon(
                     Icons.Outlined.Delete,
