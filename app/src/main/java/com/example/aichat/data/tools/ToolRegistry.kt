@@ -7,8 +7,11 @@ import android.content.Intent
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.example.aichat.data.HttpClient
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.FileInputStream
 import java.text.SimpleDateFormat
@@ -82,11 +85,13 @@ class Workspace(private val context: Context) {
 class ReadFileTool : Tool {
     override val definition = ToolDef(
         name = "read_file",
-        description = "读取工作区中的文件内容。支持 .txt, .md, .docx, .json 格式",
+        description = "读取工作区中的文件内容，支持分段读取。大文件请用 offset/limit 参数分段读",
         parameters = mapOf(
             "type" to "object",
             "properties" to mapOf(
-                "path" to mapOf("type" to "string", "description" to "文件路径，如 '报告.txt'")
+                "path" to mapOf("type" to "string", "description" to "文件路径，如 '报告.txt'"),
+                "offset" to mapOf("type" to "string", "description" to "起始字符位置，默认0（分段读取时用）"),
+                "limit" to mapOf("type" to "string", "description" to "读取字符数，默认10000")
             ),
             "required" to listOf("path")
         )
@@ -96,13 +101,15 @@ class ReadFileTool : Tool {
         val path = args["path"] ?: return ToolResult("", false, "缺少 path 参数")
         val file = Workspace(context).resolve(path)
         if (!file.exists()) return ToolResult("", false, "文件不存在: $path")
+        val offset = (args["offset"]?.trim()?.toIntOrNull() ?: 0).coerceAtLeast(0)
+        val limit = (args["limit"]?.trim()?.toIntOrNull() ?: 10000).coerceIn(1, 50000)
 
         return try {
             val content = when {
                 file.extension.lowercase() == "docx" -> readDocx(file)
-                file.length() > 500 * 1024 -> "文件过大 (${file.length() / 1024}KB)，只读取前 10KB:\n" +
-                        file.readText().take(10 * 1024)
-                else -> file.readText()
+                file.length() > 500 * 1024 -> "文件过大 (${file.length() / 1024}KB)，请用 offset/limit 分段读取:\n" +
+                        file.readText().substring(offset, minOf(offset + limit, file.length().toInt()))
+                else -> file.readText().substring(offset, minOf(offset + limit, file.length().toInt()))
             }
             ToolResult("", true, content)
         } catch (e: Exception) {
@@ -216,11 +223,7 @@ class WebFetchTool : Tool {
     override suspend fun execute(args: Map<String, String>, context: Context): ToolResult {
         val url = args["url"] ?: return ToolResult("", false, "缺少 url 参数")
         return try {
-            val client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
-                .followRedirects(true)
-                .build()
+            val client = HttpClient.shortTimeout
             val request = Request.Builder().url(url)
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
                 .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -377,12 +380,13 @@ class ShareTool : Tool {
 class HttpTool : Tool {
     override val definition = ToolDef(
         name = "http_request",
-        description = "发送 HTTP GET 请求到指定 URL 并返回结果",
+        description = "发送 HTTP 请求到指定 URL 并返回结果",
         parameters = mapOf(
             "type" to "object",
             "properties" to mapOf(
                 "url" to mapOf("type" to "string", "description" to "请求 URL"),
-                "method" to mapOf("type" to "string", "description" to "HTTP 方法 (GET/POST)，默认 GET")
+                "method" to mapOf("type" to "string", "description" to "HTTP 方法 (GET/POST/PUT/DELETE)，默认 GET"),
+                "body" to mapOf("type" to "string", "description" to "请求体（POST/PUT 时使用，JSON 字符串）")
             ),
             "required" to listOf("url")
         )
@@ -391,16 +395,20 @@ class HttpTool : Tool {
     override suspend fun execute(args: Map<String, String>, context: Context): ToolResult {
         val url = args["url"] ?: return ToolResult("", false, "缺少 url 参数")
         return try {
-            val client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
-                .build()
-            val request = Request.Builder().url(url)
+            val method = (args["method"] ?: "GET").uppercase()
+            val body = args["body"]
+            val builder = Request.Builder().url(url)
                 .header("User-Agent", "Mozilla/5.0")
-                .build()
+            when (method) {
+                "POST" -> builder.post((body ?: "").toRequestBody("application/json".toMediaType()))
+                "PUT" -> builder.put((body ?: "").toRequestBody("application/json".toMediaType()))
+                "DELETE" -> builder.delete()
+            }
+            val request = builder.build()
+            val client = HttpClient.shortTimeout
             val response = client.newCall(request).execute()
-            val body = response.body?.string()?.take(5000) ?: ""
-            ToolResult("", true, "HTTP ${response.code}\n$body")
+            val respBody = response.body?.string()?.take(5000) ?: ""
+            ToolResult("", true, "HTTP ${response.code}\n$respBody")
         } catch (e: Exception) {
             ToolResult("", false, "请求失败: ${e.message}")
         }
@@ -458,10 +466,14 @@ class PythonExecTool(private val pyManager: () -> com.example.aichat.python.Pyth
         )
     )
 
-    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult {
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
         val py = pyManager() ?: return ToolResult("", false, "Python 环境未初始化")
         val code = args["code"] ?: return ToolResult("", false, "缺少 code 参数")
-        val session = args["session"] ?: "default"
+        // 默认会话按对话隔离；模型显式指定 session 时尊重其选择
+        val session = args["session"]?.takeIf { it.isNotBlank() } ?: "conv_$convId"
 
         // 需要时预安装包
         val install = args["install"]
@@ -490,32 +502,6 @@ class PythonExecTool(private val pyManager: () -> com.example.aichat.python.Pyth
     }
 }
 
-class PipInstallTool(private val pyManager: () -> com.example.aichat.python.PythonSessionManager?) : Tool {
-    override val definition = ToolDef(
-        name = "pip_install",
-        description = "安装 Python 包到本地环境。支持空格分隔多个包名。注意：部分 C 扩展包可能不兼容。",
-        parameters = mapOf(
-            "type" to "object",
-            "properties" to mapOf(
-                "packages" to mapOf("type" to "string", "description" to "要安装的包名，空格分隔，如 'pymupdf selenium'")
-            ),
-            "required" to listOf("packages")
-        )
-    )
-
-    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult {
-        val py = pyManager() ?: return ToolResult("", false, "Python 环境未初始化")
-        val pkgs = args["packages"] ?: return ToolResult("", false, "缺少 packages 参数")
-        val results = mutableListOf<String>()
-        for (pkg in pkgs.split(Regex("\\s+"))) {
-            if (pkg.isBlank()) continue
-            val err = py.installVerbose(pkg)
-            results.add(if (err.isEmpty()) "✓ $pkg 安装成功" else "✗ $pkg 安装失败: $err")
-        }
-        return ToolResult("", true, results.joinToString("\n"))
-    }
-}
-
 class PythonSessionCloseTool(private val pyManager: () -> com.example.aichat.python.PythonSessionManager?) : Tool {
     override val definition = ToolDef(
         name = "session_close",
@@ -534,6 +520,99 @@ class PythonSessionCloseTool(private val pyManager: () -> com.example.aichat.pyt
         val session = args["session"] ?: "default"
         py.closeSession(session)
         return ToolResult("", true, "会话 '$session' 已关闭")
+    }
+}
+
+// ==================== 命理工具（固定实现，模型只传参） ====================
+
+/** 八字排盘：Kotlin 校验参数后调用打包内的固定脚本，模型禁止自写排盘代码 */
+class BaziPaipanTool(private val pyManager: () -> com.example.aichat.python.PythonSessionManager?) : Tool {
+    override val definition = ToolDef(
+        name = "bazi_paipan",
+        description = "八字排盘（确定性实现）。传生辰和性别，返回四柱/十神/起运/大运/流年。排盘只能用本工具，禁止自写排盘代码",
+        parameters = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "year" to mapOf("type" to "string", "description" to "出生年（公历1900-2100）"),
+                "month" to mapOf("type" to "string", "description" to "出生月（1-12）"),
+                "day" to mapOf("type" to "string", "description" to "出生日（1-31）"),
+                "hour" to mapOf("type" to "string", "description" to "出生时（0-23，未知可不填，将按子时假设并警告）"),
+                "minute" to mapOf("type" to "string", "description" to "出生分（0-59，可选）"),
+                "gender" to mapOf("type" to "string", "description" to "性别，必填：0=女 1=男"),
+                "is_lunar" to mapOf("type" to "string", "description" to "输入是否为农历：0=公历(默认) 1=农历"),
+                "longitude" to mapOf("type" to "string", "description" to "出生地东经度数（如成都104.06）。默认120=北京时间口径不修正；传入则按真太阳时修正")
+            ),
+            "required" to listOf("year", "month", "day", "gender")
+        )
+    )
+
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
+        val py = pyManager() ?: return ToolResult("", false, "Python 环境未初始化")
+        val y = args["year"]?.trim()?.toIntOrNull()
+            ?: return ToolResult("", false, "year 必须为数字")
+        val m = args["month"]?.trim()?.toIntOrNull()
+            ?: return ToolResult("", false, "month 必须为数字")
+        val d = args["day"]?.trim()?.toIntOrNull()
+            ?: return ToolResult("", false, "day 必须为数字")
+        val g = args["gender"]?.trim()?.toIntOrNull()
+            ?: return ToolResult("", false, "gender 必填：0=女 1=男")
+        if (y !in 1900..2100) return ToolResult("", false, "仅支持 1900-2100 年，超出范围拒绝排盘")
+        if (m !in 1..12 || d !in 1..31) return ToolResult("", false, "月/日超出合法范围")
+        if (g !in 0..1) return ToolResult("", false, "gender 必须为 0(女) 或 1(男)")
+        val hour = args["hour"]?.trim()?.takeIf { it.isNotEmpty() }
+        hour?.toIntOrNull()?.let { if (it !in 0..23) return ToolResult("", false, "小时超出 0-23 范围") }
+        val minute = (args["minute"]?.trim()?.toIntOrNull() ?: 0).let { if (it in 0..59) it else 0 }
+        val isLunar = if ((args["is_lunar"]?.trim() ?: "0") == "1") 1 else 0
+        val lng = args["longitude"]?.trim()?.toDoubleOrNull() ?: 120.0
+
+        val call = buildString {
+            append("from bazi_paipan import paipan\n")
+            append("paipan(year=$y, month=$m, day=$d, ")
+            append(if (hour == null) "hour=None" else "hour=${hour.toInt()}")
+            append(", minute=$minute, gender=$g, is_lunar=$isLunar, longitude=$lng)")
+        }
+        val session = args["session"]?.takeIf { it.isNotBlank() } ?: "conv_$convId"
+        val result = py.execute(call, session) { }
+        val sb = StringBuilder()
+        if (result.output.isNotBlank()) sb.appendLine(result.output)
+        if (result.error.isNotBlank()) sb.appendLine("--- 错误 ---\n${result.error}")
+        return ToolResult("", result.error.isEmpty(), sb.toString().trim())
+    }
+}
+
+/** 日期换算：农历/干支/星期/节气/生肖，固定实现 */
+class DateConvertTool(private val pyManager: () -> com.example.aichat.python.PythonSessionManager?) : Tool {
+    override val definition = ToolDef(
+        name = "date_convert",
+        description = "日期换算（确定性实现）。任何'某日是什么干支/农历/节气/星期/生肖'的换算必须用本工具，禁止自写代码或凭记忆推算",
+        parameters = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "date" to mapOf("type" to "string", "description" to "公历日期，如 2026-8-10 或 2026年8月10日"),
+                "hour" to mapOf("type" to "string", "description" to "小时 0-23，默认12（影响时柱）")
+            ),
+            "required" to listOf("date")
+        )
+    )
+
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
+        val py = pyManager() ?: return ToolResult("", false, "Python 环境未初始化")
+        val date = args["date"]?.trim() ?: return ToolResult("", false, "缺少 date 参数")
+        if (!date.matches(Regex("[0-9年/月日\\-]{6,20}"))) return ToolResult("", false, "日期格式非法，请用 2026-8-10 或 2026年8月10日")
+        val hour = (args["hour"]?.trim()?.toIntOrNull() ?: 12).let { if (it in 0..23) it else 12 }
+        val call = "from bazi_paipan import date_info\ndate_info(\"${date.replace("\"", "")}\", $hour)"
+        val session = args["session"]?.takeIf { it.isNotBlank() } ?: "conv_$convId"
+        val result = py.execute(call, session) { }
+        val sb = StringBuilder()
+        if (result.output.isNotBlank()) sb.appendLine(result.output)
+        if (result.error.isNotBlank()) sb.appendLine("--- 错误 ---\n${result.error}")
+        return ToolResult("", result.error.isEmpty(), sb.toString().trim())
     }
 }
 
@@ -656,8 +735,15 @@ class GuaYaoTool : Tool {
     }
 
     private fun liuyao(): String {
-        // 六爻：掷三枚铜钱六次，6老阴 7少阳 8少阴 9老阳
-        val yao = IntArray(6) { kotlin.random.Random.nextInt(6, 10) }
+        // 六爻：掷三枚铜钱六次。概率按三枚铜钱：老阴(6)1/8、少阳(7)3/8、少阴(8)3/8、老阳(9)1/8
+        val yao = IntArray(6) {
+            when (kotlin.random.Random.nextInt(8)) {
+                0 -> 6
+                1, 2, 3 -> 7
+                4, 5, 6 -> 8
+                else -> 9
+            }
+        }
         val names = listOf("初爻", "二爻", "三爻", "四爻", "五爻", "上爻")
         val yaoName = mapOf(6 to "老阴", 7 to "少阳", 8 to "少阴", 9 to "老阳")
         val ben = StringBuilder()
@@ -1071,8 +1157,9 @@ object ToolRegistry {
             WebFetchTool(), RegexTool(), TimeTool(),
             ClipboardTool(), ShareTool(), HttpTool(),
             BuildHtmlTool(),
-            PythonExecTool(pyManager), PipInstallTool(pyManager),
+            PythonExecTool(pyManager),
             PythonSessionCloseTool(pyManager),
+            BaziPaipanTool(pyManager), DateConvertTool(pyManager),
             MemorySaveTool(), MemoryLoadTool(),
             GuaYaoTool(),
             ScreenInfoTool(), ScreenTapTool(), ScreenSwipeTool(),
@@ -1085,23 +1172,88 @@ object ToolRegistry {
         return tools.map { it.definition }
     }
 
+    // 输出闸门策略：KEEP 不截断 / COMPACT 宽松上限 / SPILL 4KB+落盘指针
+    private enum class Gate { KEEP, COMPACT, SPILL }
+
+    private fun gateFor(name: String): Gate = when (name) {
+        "get_time", "gua_yao", "regex", "memory_save", "memory_load",
+        "clipboard_write", "share_text", "session_close", "date_convert",
+        "delete_file", "write_file" -> Gate.KEEP
+        "python_exec", "bazi_paipan", "list_files" -> Gate.COMPACT
+        "web_fetch", "read_file", "http_request" -> Gate.SPILL
+        else -> Gate.COMPACT
+    }
+
     suspend fun execute(toolCall: ToolCall, context: Context, convId: String = ""): ToolResult {
         val tool = tools.find { it.definition.name == toolCall.name }
             ?: return ToolResult(toolCall.id, false, "未知工具: ${toolCall.name}")
-        return try {
-            val result = tool.executeForConv(toolCall.arguments, context, convId).copy(toolCallId = toolCall.id)
-            // 只在极端输出时截断；现代模型上下文大，完整排盘/代码结果应保留
-            val maxLen = 30000
-            if (result.content.length > maxLen) {
-                result.copy(content = result.content.take(maxLen) + "\n...[工具输出过长，已截断，仅展示前 $maxLen 字符]")
-            } else result
+        val raw = try {
+            tool.executeForConv(toolCall.arguments, context, convId).copy(toolCallId = toolCall.id)
         } catch (e: Exception) {
-            ToolResult(toolCall.id, false, "执行错误: ${e.message}")
+            return ToolResult(toolCall.id, false, "执行错误: ${e.message}")
         }
+        return gate(raw, toolCall.name, context, convId)
     }
 
-    fun toolCallsToJson(): String = gson.toJson(
-        tools.map { tool ->
+    /** 错误优先闸门：失败结果错误置顶、全文保留；成功结果按策略截断并落盘 */
+    private fun gate(result: ToolResult, name: String, context: Context, convId: String): ToolResult {
+        if (!result.success) {
+            // 错误永不截断（只防极端 runaway 时保尾部，traceback 关键在最后）
+            val body = if (result.content.length > 6000) result.content.takeLast(6000) else result.content
+            return result.copy(content = "❌ 执行失败（代码未能完成，以下输出不完整、不可用于结论）\n--- 错误信息 ---\n$body")
+        }
+        val policy = gateFor(name)
+        if (policy == Gate.KEEP) return result
+        val limit = if (policy == Gate.COMPACT) 12000 else 4000
+        if (result.content.length <= limit) return result
+
+        // 语义边界切割：优先段落边界，其次行边界，不切表格行
+        var cut = limit
+        val head = result.content
+        val para = head.lastIndexOf("\n\n", limit)
+        if (para > limit / 2) cut = para
+        else {
+            val line = head.lastIndexOf("\n", limit)
+            if (line > limit / 2) cut = line
+        }
+        val headPart = head.take(cut)
+
+        // 落盘 + 指针
+        val spillDir = File(context.filesDir, "workspace").let { root ->
+            if (convId.isBlank()) File(root, ".tool_outputs")
+            else File(root, "${convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")}/.tool_outputs")
+        }.also { it.mkdirs() }
+        val fileName = "tool_${System.currentTimeMillis()}.txt"
+        try { File(spillDir, fileName).writeText(result.content) } catch (_: Exception) {}
+        val pointer = if (convId.isBlank()) ".tool_outputs/$fileName"
+            else "${convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")}/.tool_outputs/$fileName"
+
+        return result.copy(content = buildString {
+            appendLine("[结果过长已存盘: workspace/$pointer (共${result.content.length / 1024}KB)]")
+            appendLine("前 $cut 字符内容如下：")
+            appendLine(headPart)
+            appendLine("...")
+            appendLine("如需完整内容，用 read_file 读取 workspace/$pointer（大文件可加 offset/limit 参数分段读）")
+        })
+    }
+
+    // 命理师工具子集：只下发命理相关的工具，减少模型选择负担与 token
+    private val FORTUNE_TOOLS = setOf(
+        "python_exec", "session_close", "bazi_paipan", "date_convert", "gua_yao",
+        "memory_save", "memory_load", "read_file", "write_file", "list_files",
+        "web_fetch", "regex", "get_time"
+    )
+
+    fun toolCallsToJson(personaId: String = "", screenAvailable: Boolean = false): String = gson.toJson(
+        tools.filter { tool ->
+            val n = tool.definition.name
+            when {
+                personaId == "fortune" -> n in FORTUNE_TOOLS
+                n == "gua_yao" -> false
+                n.startsWith("screen_") -> screenAvailable
+                else -> true
+            }
+        }.map { tool ->
             mapOf(
                 "type" to "function",
                 "function" to mapOf(

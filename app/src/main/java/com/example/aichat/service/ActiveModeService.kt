@@ -32,6 +32,7 @@ class ActiveModeService : Service() {
         const val ACTION_START = "com.example.aichat.ACTION_START_ACTIVE"
         const val ACTION_STOP = "com.example.aichat.ACTION_STOP_ACTIVE"
         const val ACTION_HEARTBEAT = "com.example.aichat.ACTION_ACTIVE_HEARTBEAT"
+        const val ACTION_BOOT_RESUME = "com.example.aichat.ACTION_BOOT_RESUME"
         const val EXTRA_PERSONA_ID = "persona_id"
         const val EXTRA_CONV_ID = "conv_id"
         const val EXTRA_INTERVAL_MIN = "interval_min"
@@ -53,7 +54,7 @@ class ActiveModeService : Service() {
     )
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val client = OkHttpClient()
+    private val client = HttpClient.instance
     private val gson = Gson()
 
     /** 每个角色一个心跳 Job */
@@ -108,6 +109,13 @@ class ActiveModeService : Service() {
                 // 闹钟唤醒，后台/被杀也能执行心跳
                 handleHeartbeat(personaId)
             }
+            action == ACTION_BOOT_RESUME -> {
+                // 设备重启后恢复：重新注册所有陪伴角色的闹钟
+                configs.keys.forEach { pid ->
+                    if (pid in runningPersonas) scheduleAlarm(pid)
+                }
+                if (configs.isEmpty()) stopSelf()
+            }
         }
         return START_STICKY
     }
@@ -135,12 +143,18 @@ class ActiveModeService : Service() {
         val cfg = configs[personaId] ?: return
         val am = getSystemService(ALARM_SERVICE) as AlarmManager
         val at = System.currentTimeMillis() + cfg.intervalMin * 60_000L
+        // Android 12+ 精确闹钟可能被用户拒绝，检测后降级为普通闹钟
+        val canExact = android.os.Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
         try {
-            // 精确闹钟，Doze 下也能触发
-            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+            if (canExact) {
+                // 精确闹钟，Doze 下也能触发
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+            } else {
+                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+            }
         } catch (_: Exception) {
-            try { am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
-            catch (_: Exception) { am.set(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
+            try { am.set(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
+            catch (_: Exception) {}
         }
     }
 
@@ -190,6 +204,8 @@ class ActiveModeService : Service() {
         } catch (_: Exception) {}
 
         jobs[personaId]?.cancel()
+        // 先注册下一次闹钟再发请求：即使进程在请求中途被杀，心跳链也不断
+        scheduleAlarm(personaId)
         jobs[personaId] = scope.launch {
             try {
                 if (!isInTimeRange(cfg.startHour, cfg.endHour)) {
@@ -208,7 +224,6 @@ class ActiveModeService : Service() {
                 updateNotification(fgId, fullName, "心跳异常: ${e.message?.take(20) ?: "未知"}")
             } finally {
                 jobs.remove(personaId)
-                scheduleAlarm(personaId)
             }
         }
     }
@@ -325,6 +340,16 @@ class ActiveModeService : Service() {
         val bodyStr = response.body?.string() ?: return ""
         response.close()
         val json = try { gson.fromJson(bodyStr, Map::class.java) as? Map<*, *> } catch (_: Exception) { return "" } ?: return ""
+        // 心跳请求也计入用量
+        try {
+            (json["usage"] as? Map<*, *>)?.let { u ->
+                val toL = { v: Any? -> ((v as? Double) ?: 0.0).toLong() }
+                com.example.aichat.data.UsageMeter.record(
+                    toL(u["prompt_tokens"]), toL(u["completion_tokens"]),
+                    toL(u["prompt_cache_hit_tokens"]), toL(u["prompt_cache_miss_tokens"])
+                )
+            }
+        } catch (_: Exception) {}
         val choices = json["choices"] as? List<*> ?: return ""
         val first = choices.firstOrNull() as? Map<*, *> ?: return ""
         val msg = first["message"] as? Map<*, *> ?: return ""
@@ -392,21 +417,11 @@ class ActiveModeService : Service() {
     private fun saveToConversation(convId: String, persona: Persona, content: String) {
         try {
             if (convId.isBlank()) return
-            val storage = StorageManager(this)
-            val convs = storage.getConversations().toMutableList()
-            val idx = convs.indexOfFirst { it.id == convId }
-            if (idx >= 0) {
-                val target = convs[idx]
-                convs[idx] = target.copy(
-                    messages = target.messages + ChatMessage(
-                        role = "assistant",
-                        content = "[${persona.emoji}${persona.name}] $content",
-                        timestamp = System.currentTimeMillis()
-                    ),
-                    updatedAt = System.currentTimeMillis()
-                )
-                storage.saveConversations(convs)
-            }
+            StorageManager(this).appendMessage(convId, ChatMessage(
+                role = "assistant",
+                content = "[${persona.emoji}${persona.name}] $content",
+                timestamp = System.currentTimeMillis()
+            ))
         } catch (_: Exception) {}
     }
 
@@ -425,8 +440,13 @@ class ActiveModeService : Service() {
     }
 
     private fun isInTimeRange(startHour: Int, endHour: Int): Boolean {
-        val now = java.time.LocalTime.now()
-        return now.hour in startHour until endHour
+        val h = java.time.LocalTime.now().hour
+        return if (startHour < endHour) {
+            h in startHour until endHour
+        } else {
+            // 跨午夜时段（如 22→6）：22-23 或 0-5 都算范围内
+            h >= startHour || h < endHour
+        }
     }
 
     private fun createChannel() {

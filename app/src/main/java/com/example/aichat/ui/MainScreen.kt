@@ -18,6 +18,9 @@ import com.example.aichat.viewmodel.MainViewModel
 import java.text.SimpleDateFormat
 import java.util.*
 
+// 全局单例：避免每条对话各建一个格式化器
+private val DATE_FORMAT = SimpleDateFormat("MM/dd HH:mm", Locale.getDefault())
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
@@ -158,7 +161,6 @@ fun ConversationItem(
     onDelete: () -> Unit,
     onRename: () -> Unit
 ) {
-    val dateFormat = remember { SimpleDateFormat("MM/dd HH:mm", Locale.getDefault()) }
     val lastMessage = conversation.messages.lastOrNull()
     val preview = when {
         lastMessage != null -> lastMessage.content.take(50)
@@ -213,7 +215,7 @@ fun ConversationItem(
 
             if (conversation.messages.isNotEmpty()) {
                 Text(
-                    text = dateFormat.format(Date(conversation.updatedAt)),
+                    text = DATE_FORMAT.format(Date(conversation.updatedAt)),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                 )

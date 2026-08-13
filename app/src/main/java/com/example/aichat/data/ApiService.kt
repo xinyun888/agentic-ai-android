@@ -37,7 +37,15 @@ data class ToolCallFunctionDto(
 // --- Response DTOs ---
 
 data class ChatResponse(
-    val choices: List<Choice> = emptyList()
+    val choices: List<Choice> = emptyList(),
+    val usage: Usage? = null
+)
+
+data class Usage(
+    @SerializedName("prompt_tokens") val promptTokens: Long = 0,
+    @SerializedName("completion_tokens") val completionTokens: Long = 0,
+    @SerializedName("prompt_cache_hit_tokens") val cacheHitTokens: Long = 0,
+    @SerializedName("prompt_cache_miss_tokens") val cacheMissTokens: Long = 0
 )
 
 data class Choice(
@@ -61,11 +69,4 @@ interface ApiService {
         @Header("Authorization") auth: String,
         @Body request: ChatRequest
     ): Response<ChatResponse>
-
-    @POST("v1/chat/completions")
-    @Streaming
-    suspend fun chatCompletionStream(
-        @Header("Authorization") auth: String,
-        @Body request: ChatRequest
-    ): Response<ResponseBody>
 }

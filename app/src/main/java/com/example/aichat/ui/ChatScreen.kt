@@ -58,59 +58,6 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.util.zip.ZipInputStream
 
-// 文件类型辅助函数 —— 从 Office XML 格式提取文本
-fun readZipXmlText(bytes: ByteArray, targetEntry: String): String {
-    val sb = StringBuilder()
-    ZipInputStream(bytes.inputStream()).use { zis ->
-        var entry = zis.nextEntry
-        while (entry != null) {
-            if (entry.name == targetEntry) {
-                val xml = zis.readBytes().toString(Charsets.UTF_8)
-                sb.append(xml.replace(Regex("<[^>]+>"), " ")
-                    .replace(Regex("\\s+"), " ").trim())
-                break
-            }
-            entry = zis.nextEntry
-        }
-    }
-    return sb.toString().ifEmpty { "(空文档)" }
-}
-
-fun readDocxText(bytes: ByteArray): String = readZipXmlText(bytes, "word/document.xml")
-
-fun readPptxText(bytes: ByteArray): String {
-    val sb = StringBuilder()
-    ZipInputStream(bytes.inputStream()).use { zis ->
-        var entry = zis.nextEntry
-        while (entry != null) {
-            if (entry.name.startsWith("ppt/slides/slide") && entry.name.endsWith(".xml")) {
-                val xml = zis.readBytes().toString(Charsets.UTF_8)
-                val text = xml.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
-                if (text.isNotBlank()) sb.appendLine("--- Slide ---\n$text")
-            }
-            entry = zis.nextEntry
-        }
-    }
-    return sb.toString().ifEmpty { "(空演示文稿)" }
-}
-
-fun readXlsxText(bytes: ByteArray): String {
-    val sb = StringBuilder()
-    ZipInputStream(bytes.inputStream()).use { zis ->
-        var entry = zis.nextEntry
-        while (entry != null) {
-            if (entry.name == "xl/sharedStrings.xml") {
-                val xml = zis.readBytes().toString(Charsets.UTF_8)
-                val texts = Regex("""<t[^>]*>(.*?)</t>""").findAll(xml).map { it.groupValues[1] }.joinToString(" ")
-                sb.append(texts)
-                break
-            }
-            entry = zis.nextEntry
-        }
-    }
-    return sb.toString().ifEmpty { "(空表格)" }
-}
-
 // 文本类扩展名：直接按 UTF-8 文本读取
 val TEXT_EXTS = setOf("txt", "md", "csv", "json", "xml", "html", "htm", "css", "js", "ts",
     "py", "java", "kt", "cpp", "c", "h", "rs", "go", "rb", "php", "swift",
@@ -123,6 +70,8 @@ fun ChatScreen(
     profile: ApiProfile,
     onBack: () -> Unit
 ) {
+    // 系统返回键回对话列表，而不是直接退出应用
+    androidx.activity.compose.BackHandler { onBack() }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var inputText by remember { mutableStateOf("") }
@@ -166,13 +115,23 @@ fun ChatScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
-            // 转为 base64 data URI 供 API 使用
-            val base64 = context.contentResolver.openInputStream(it)?.use { stream ->
-                val bytes = stream.readBytes()
-                val mime = context.contentResolver.getType(it) ?: "image/jpeg"
-                "data:$mime;base64,${Base64.encodeToString(bytes, Base64.NO_WRAP)}"
+            // 图片落盘到应用私有目录，消息里只存文件路径（避免 base64 撑爆存储）
+            val mime = context.contentResolver.getType(it) ?: "image/jpeg"
+            val ext = when (mime) {
+                "image/png" -> "png"
+                "image/webp" -> "webp"
+                "image/gif" -> "gif"
+                else -> "jpg"
             }
-            viewModel.pendingImageUri = base64
+            val imgDir = java.io.File(context.filesDir, "images").also { d -> d.mkdirs() }
+            val imgFile = java.io.File(imgDir, "img_${System.currentTimeMillis()}.$ext")
+            val saved = try {
+                context.contentResolver.openInputStream(it)?.use { input ->
+                    imgFile.outputStream().use { out -> input.copyTo(out) }
+                }
+                imgFile.absolutePath
+            } catch (_: Exception) { null }
+            viewModel.pendingImageUri = saved
         }
     }
 
@@ -276,7 +235,7 @@ fun ChatScreen(
                                 DropdownMenuItem(
                                     text = { Text("${p.emoji} ${p.name}") },
                                     onClick = {
-                                        viewModel.activePersonaId = p.id
+                                        viewModel.setActivePersona(p.id)
                                         showPersonaMenu = false
                                     },
                                     leadingIcon = {
@@ -304,7 +263,7 @@ fun ChatScreen(
                                     text = { Text("🗑 删除 ${cp.name}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error) },
                                     onClick = {
                                         Personas.deleteCustom(context, cp.id)
-                                        if (viewModel.activePersonaId == cp.id) viewModel.activePersonaId = "default"
+                                        if (viewModel.activePersonaId == cp.id) viewModel.setActivePersona("default")
                                         showPersonaMenu = false
                                     },
                                     leadingIcon = { Icon(Icons.Filled.Delete, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error) }
@@ -358,7 +317,7 @@ fun ChatScreen(
                     }
                     // 学习模式开关
                     IconButton(
-                        onClick = { viewModel.learningMode = !viewModel.learningMode },
+                        onClick = { viewModel.toggleLearning() },
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
@@ -377,7 +336,7 @@ fun ChatScreen(
         bottomBar = {
             Column {
                 // 图片预览
-                viewModel.pendingImageUri?.let { dataUri ->
+                viewModel.pendingImageUri?.let { path ->
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -390,7 +349,7 @@ fun ChatScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             AsyncImage(
-                                model = ImageRequest.Builder(context).data(dataUri).build(),
+                                model = ImageRequest.Builder(context).data(java.io.File(path)).build(),
                                 contentDescription = "图片预览",
                                 modifier = Modifier
                                     .size(60.dp)
@@ -513,7 +472,7 @@ fun ChatScreen(
                                         if (viewModel.searchEnabled) Text("✓", color = MaterialTheme.colorScheme.primary)
                                     }
                                 },
-                                onClick = { viewModel.searchEnabled = !viewModel.searchEnabled },
+                                onClick = { viewModel.toggleSearch() },
                                 leadingIcon = { Icon(Icons.Filled.TravelExplore, null) }
                             )
                             DropdownMenuItem(
@@ -524,7 +483,7 @@ fun ChatScreen(
                                         if (viewModel.factCheckEnabled) Text("✓", color = MaterialTheme.colorScheme.error)
                                     }
                                 },
-                                onClick = { viewModel.factCheckEnabled = !viewModel.factCheckEnabled },
+                                onClick = { viewModel.toggleFactCheck() },
                                 leadingIcon = { Icon(Icons.Filled.VerifiedUser, null) }
                             )
                         }
@@ -856,7 +815,7 @@ fun ChatScreen(
                 contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                items(viewModel.messages) { message ->
+                items(viewModel.messages, key = { it.id ?: "${it.timestamp}-${it.role}-${it.content.hashCode()}" }) { message ->
                     // 在助手/实时消息之前显示思考过程
                     if (message.thinking.isNotBlank() && (message.role == "assistant" || message.role == "assistant_live")) {
                         ThinkingChainCard(content = message.thinking)
@@ -1009,7 +968,7 @@ fun ChatScreen(
                         fullPrompt + Personas.BASE,
                         pIdentity, pPersonality, pSpeaking, pTaboos, pDetailed
                     ))
-                    viewModel.activePersonaId = id
+                    viewModel.setActivePersona(id)
                     showPersonaEditor = false
                     editingPersona = null
                 }) { Text("保存") }
@@ -1127,6 +1086,8 @@ fun MessageBubble(message: ChatMessage) {
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
+                // 排盘确认卡（只读）
+                message.paipanData?.let { PaipanCard(it) }
                 // 复制按钮
                 val context = LocalContext.current
                 Row(
@@ -1145,6 +1106,41 @@ fun MessageBubble(message: ChatMessage) {
                     }
                 }
             }
+        }
+    }
+}
+
+/** 排盘确认卡（只读）：展示四柱/日主/农历/时辰供用户确认 */
+@Composable
+fun PaipanCard(jsonStr: String) {
+    val data = remember(jsonStr) {
+        try {
+            com.google.gson.Gson().fromJson(jsonStr, Map::class.java)
+        } catch (_: Exception) { null }
+    } ?: return
+    val bazi = data["bazi"] as? String ?: return
+    val dayMaster = data["dayMaster"] as? String ?: ""
+    val lunar = data["lunar"] as? String ?: ""
+    val hour = data["hour"] as? String ?: ""
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(8.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Text("🔮 排盘确认", style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text("八字：$bazi", style = MaterialTheme.typography.bodyMedium)
+            if (dayMaster.isNotBlank()) Text("日主：$dayMaster", style = MaterialTheme.typography.bodySmall)
+            if (lunar.isNotBlank()) Text("农历：$lunar", style = MaterialTheme.typography.bodySmall)
+            if (hour.isNotBlank()) Text("时辰：$hour", style = MaterialTheme.typography.bodySmall)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text("请确认排盘无误；若生辰信息有误，请告诉我更正", style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -1396,6 +1392,7 @@ fun HtmlPreview(filePath: String, modifier: Modifier = Modifier) {
         }
         return
     }
+    val html = remember(filePath) { file.readText() }
     key(filePath) {
         AndroidView(
             factory = { ctx ->
@@ -1406,14 +1403,17 @@ fun HtmlPreview(filePath: String, modifier: Modifier = Modifier) {
                     )
                     webViewClient = WebViewClient()
                     settings.javaScriptEnabled = true
-                    settings.allowFileAccess = true
+                    // 安全：禁止 file:// 访问，防模型生成的 HTML 里 JS 读本地文件（含记忆文件）
+                    settings.allowFileAccess = false
+                    settings.allowFileAccessFromFileURLs = false
+                    settings.allowUniversalAccessFromFileURLs = false
                     settings.loadWithOverviewMode = true
                     settings.useWideViewPort = true
-                    loadUrl("file://$filePath")
+                    loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
                 }
             },
             modifier = modifier,
-            update = { it.loadUrl("file://$filePath") }
+            update = { it.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null) }
         )
     }
 }

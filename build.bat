@@ -64,7 +64,7 @@ if not exist "%ANDROID_HOME%\cmdline-tools\latest\bin\sdkmanager.bat" (
 :: Install SDK components
 echo Installing SDK components...
 set "PATH=%JAVA_HOME%\bin;%PATH%"
-call "%ANDROID_HOME%\cmdline-tools\latest\bin\sdkmanager.bat" --sdk_root="%ANDROID_HOME%" "platform-tools" "build-tools;34.0.0" "platforms;android-34"
+call "%ANDROID_HOME%\cmdline-tools\latest\bin\sdkmanager.bat" --sdk_root="%ANDROID_HOME%" "platform-tools" "build-tools;35.0.0" "platforms;android-35"
 
 :: ---- Step 3: Gradle ----
 echo [3/4] Checking Gradle 8.6...
@@ -91,13 +91,13 @@ set "PATH=%JAVA_HOME%\bin;%GRADLE_HOME%\bin;%ANDROID_HOME%\platform-tools;%PATH%
 ) > "%~dp0local.properties"
 
 cd /d "%~dp0"
-call gradle assembleDebug
+call gradle assembleRelease
 
 if %ERRORLEVEL% EQU 0 (
     echo.
     echo ============================================
     echo   BUILD SUCCESS!
-    echo   APK: app\build\outputs\apk\debug\app-debug.apk
+    echo   APK: app\build\outputs\apk\release\app-release.apk
     echo ============================================
 ) else (
     echo.

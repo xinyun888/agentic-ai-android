@@ -18,7 +18,10 @@ data class PyResult(
 
 class PythonSessionManager(private val context: Context) {
 
+    // 会话上限：超过后淘汰最久未访问的，防止长期运行内存只增不减
+    private val MAX_SESSIONS = 8
     private val sessions = ConcurrentHashMap<String, PyObject>()
+    private val lastAccess = ConcurrentHashMap<String, Long>()
     private val initialized = AtomicBoolean(false)
 
     private fun ensureInitialized() {
@@ -61,8 +64,8 @@ class PythonSessionManager(private val context: Context) {
         // 3. 自动切换到 workspace 目录
         val wsDir = File(context.filesDir, "workspace").also { it.mkdirs() }
 
-        // 4. 记录执行前的文件列表
-        val beforeFiles = wsDir.walkTopDown().filter { it.isFile }.map { it.absolutePath }.toSet()
+        // 4. 记录执行开始时间（轻量，替代执行前全盘扫描）
+        val startTime = System.currentTimeMillis()
 
         // 5. 执行代码
         val outcome = runScript(py, sessionDict, code, wsDir.absolutePath)
@@ -80,10 +83,11 @@ class PythonSessionManager(private val context: Context) {
             }
         }
 
-        // 7. 检查新增文件
-        val afterFiles = wsDir.walkTopDown().filter { it.isFile }.map { it.absolutePath }.toSet()
-        val newFiles = afterFiles - beforeFiles
-        val relativeFiles = newFiles.map { it.removePrefix("${wsDir.absolutePath}/") }
+        // 7. 检查执行期间新增/修改的文件（一次扫描，用时间戳识别）
+        val relativeFiles = wsDir.walkTopDown()
+            .filter { it.isFile && it.lastModified() >= startTime - 1000 }
+            .map { it.absolutePath.removePrefix("${wsDir.absolutePath}/") }
+            .toList()
 
         PyResult(
             output = outcome.output,
@@ -95,12 +99,6 @@ class PythonSessionManager(private val context: Context) {
     suspend fun install(packageName: String): Boolean = withContext(Dispatchers.IO) {
         ensureInitialized()
         pipInstall(Python.getInstance(), packageName)
-    }
-
-    /** 安装并返回错误详情（"" 表示成功），以便模型能报告真实原因。 */
-    suspend fun installVerbose(packageName: String): String = withContext(Dispatchers.IO) {
-        ensureInitialized()
-        pipInstallVerbose(Python.getInstance(), packageName)
     }
 
     fun closeSession(sessionId: String) {
@@ -135,12 +133,6 @@ sys.stderr = _err
 
 try:
     exec(__user_code__)
-    # Also set up matplotlib backend if imported
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-    except:
-        pass
 except Exception as __e__:
     import traceback
     traceback.print_exc(file=_err)
@@ -169,7 +161,9 @@ __result__ = (_out.getvalue(), _err.getvalue())
     }
 
     private fun getOrCreateSession(py: Python, id: String): PyObject {
+        lastAccess[id] = System.currentTimeMillis()
         return sessions.getOrPut(id) {
+            evictIfNeeded(id)
             val wsDir = File(context.filesDir, "workspace").also { it.mkdirs() }
             val wsAbs = wsDir.absolutePath
 
@@ -202,6 +196,18 @@ context = type('_Ctx', (), {
 })()
             """.trimIndent(), ns)
             ns
+        }
+    }
+
+    // 淘汰最久未访问的会话（当前会话除外），保持内存有界
+    private fun evictIfNeeded(currentId: String) {
+        if (sessions.size < MAX_SESSIONS) return
+        val oldest = lastAccess.entries
+            .filter { it.key != currentId }
+            .minByOrNull { it.value }
+        if (oldest != null) {
+            sessions.remove(oldest.key)
+            lastAccess.remove(oldest.key)
         }
     }
 

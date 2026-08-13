@@ -20,6 +20,7 @@ fun ProfileScreen(
     viewModel: MainViewModel,
     onBack: () -> Unit
 ) {
+    androidx.activity.compose.BackHandler { onBack() }
     var profiles by remember { mutableStateOf(viewModel.getProfiles()) }
 
     Scaffold(
@@ -51,6 +52,16 @@ fun ProfileScreen(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            item {
+                val usageText = remember { com.example.aichat.data.UsageMeter.stats() }
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("📊 Token 用量（累计）", style = MaterialTheme.typography.titleSmall)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(usageText, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
             itemsIndexed(profiles, key = { _, p -> p.id }) { index, profile ->
                 ProfileCard(
                     profile = profile,
@@ -98,6 +109,7 @@ fun ProfileCard(
     var apiKey by remember(profile.id) { mutableStateOf(profile.apiKey) }
     var model by remember(profile.id) { mutableStateOf(profile.model) }
     var thinkingEnabled by remember(profile.id) { mutableStateOf(profile.thinkingEnabled) }
+    var reasoningLevel by remember(profile.id) { mutableStateOf(profile.reasoningLevel) }
     var visionModel by remember(profile.id) { mutableStateOf(profile.visionModel) }
     var visionBaseUrl by remember(profile.id) { mutableStateOf(profile.visionBaseUrl) }
     var visionApiKey by remember(profile.id) { mutableStateOf(profile.visionApiKey) }
@@ -201,6 +213,26 @@ fun ProfileCard(
                     )
                 }
 
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // 推理档位（最终回答的 reasoning_effort）
+                Text("推理档位", style = MaterialTheme.typography.bodyMedium)
+                Text("决定最终回答的思考深度，快=省 token，深=分析更细", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(
+                        Triple("fast", "快", "省 token，日常问答"),
+                        Triple("balanced", "平衡", "默认，兼顾质量与成本"),
+                        Triple("deep", "深", "深度分析，消耗更多")
+                    ).forEach { (value, label, desc) ->
+                        FilterChip(
+                            selected = reasoningLevel == value,
+                            onClick = { reasoningLevel = value },
+                            label = { Text(label, style = MaterialTheme.typography.labelSmall) }
+                        )
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(8.dp))
 
                 // 视觉模型配置
@@ -246,7 +278,7 @@ fun ProfileCard(
                     TextButton(onClick = {
                         onUpdate(profile.copy(
                             name = name, baseUrl = baseUrl, apiKey = apiKey, model = model,
-                            thinkingEnabled = thinkingEnabled,
+                            thinkingEnabled = thinkingEnabled, reasoningLevel = reasoningLevel,
                             visionModel = visionModel, visionBaseUrl = visionBaseUrl, visionApiKey = visionApiKey
                         ))
                         editing = false
