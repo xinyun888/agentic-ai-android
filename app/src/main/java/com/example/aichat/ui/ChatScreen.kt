@@ -1088,6 +1088,15 @@ fun MessageBubble(message: ChatMessage) {
                 }
                 // 排盘确认卡（只读）
                 message.paipanData?.let { PaipanCard(it) }
+                // 溯源条：本回复实际调用过的工具（系统起卦/日期注入也计入）
+                message.toolBadges?.takeIf { it.isNotEmpty() }?.let { badges ->
+                    Text(
+                        text = "本回复调用工具：" + badges.joinToString(" / "),
+                        modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 4.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                    )
+                }
                 // 复制按钮
                 val context = LocalContext.current
                 Row(

@@ -45,6 +45,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // 内容先用 gson 验证再进 pendingPaipanJson，防止嵌套 JSON 截断渲染坏卡片。
         private val PAIPAN_REGEX = Regex("""<PAIPAN_JSON>(.*?)</PAIPAN_JSON>""", RegexOption.DOT_MATCHES_ALL)
         private val PREVIEW_REGEX = Regex("""[{]"type":"preview","file":"([^"]+)","title":"([^"]*)"[}]""")
+
+        // 问卦意图关键词：命理师角色下命中即由系统自动起卦（模型只解读，不掌握执行权）
+        private val GUA_INTENT_KEYWORDS = listOf(
+            "问卦", "算一卦", "算卦", "起卦", "起一卦", "摇一卦", "摇卦", "占一卦", "占卦", "占卜", "测一卦",
+            "六爻", "梅花", "小六壬", "卦",
+            "吉凶", "这事怎么样", "该不该", "能不能成", "成不成"
+        )
     }
 
     val storage = StorageManager(application)
@@ -283,6 +290,91 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ===== 系统自动起卦（第一层治本）=====
+
+    /** 时辰地支：23-1子、1-3丑 … 21-23亥 */
+    private fun shichenZhi(hour: Int): String {
+        val zhis = listOf("子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥")
+        return zhis[(hour + 1) / 2 % 12]
+    }
+
+    /**
+     * 命理师问卦时系统直接起卦注入（不依赖模型调工具）——执行权在系统手里，
+     * 模型手里只有"已算好的结果"，没有"自己编"的空间。
+     * 注入标准 assistant tool_call + tool 消息对，并同步记录 agentSteps。
+     */
+    private suspend fun injectSystemGua(
+        content: String, myConvId: String,
+        conversationDtos: MutableList<ChatMessageDto>, lunarInfo: String
+    ) {
+        if (activePersonaId != "fortune") return
+        if (!GUA_INTENT_KEYWORDS.any { content.contains(it) }) return
+        // 排盘类问题不起卦：用户给出生辰要排八字时，卦不是他问的
+        if (Regex("""(八字|排盘|大运|流年|出生|生辰|命盘)""").containsMatchIn(content)
+            && !Regex("""(卦|占|吉凶|该不该)""").containsMatchIn(content)) return
+
+        // 方法选择：用户点名优先，否则默认六爻（真随机，不依赖农历时刻）
+        val method = when {
+            content.contains("小六壬") -> "xiaoliuren"
+            content.contains("梅花") -> "meihua"
+            else -> "liuyao"
+        }
+        val args = mutableMapOf("method" to method, "question" to content.take(100))
+        if (method != "liuyao") {
+            // 梅花/小六壬按当前农历时刻起：从已注入的 date_info 输出解析月日时
+            val m = Regex("""农历: ([^年]+)年([^\s]+)月(\S+)""").find(lunarInfo)
+            if (m != null) {
+                args["year"] = m.groupValues[1]
+                args["month"] = m.groupValues[2]
+                args["day"] = m.groupValues[3]
+                args["hour"] = shichenZhi(java.time.LocalTime.now().hour)
+            }
+        }
+
+        var result = ToolRegistry.execute(
+            ToolCall(id = "sys_gua", name = "gua_yao", arguments = args), getApplication(), myConvId
+        )
+        // 梅花/小六壬参数解析失败时降级六爻（真随机，不依赖农历）
+        if (!result.success && method != "liuyao") {
+            result = ToolRegistry.execute(
+                ToolCall(id = "sys_gua", name = "gua_yao",
+                    arguments = mapOf("method" to "liuyao", "question" to content.take(100))),
+                getApplication(), myConvId
+            )
+        }
+        if (!result.success) return  // 起卦本身失败就不注入，宁可没有
+
+        val callId = "sys_gua_${System.currentTimeMillis()}"
+        conversationDtos.add(ChatMessageDto(role = "assistant", content = null,
+            toolCalls = listOf(ToolCallDto(id = callId, type = "function",
+                function = ToolCallFunctionDto(name = "gua_yao", arguments = gson.toJson(args))))))
+        conversationDtos.add(ChatMessageDto(role = "tool", toolCallId = callId,
+            content = "以下卦象已由系统起好，你只能解读，禁止另起卦或改写卦象。\n\n${result.content}"))
+        withContext(Dispatchers.Main) {
+            appendAgentStep(AgentStep(type = "tool_call", toolName = "gua_yao", toolArgs = gson.toJson(args)))
+            appendAgentStep(AgentStep(type = "tool_result", toolName = "gua_yao", content = result.content.take(300)))
+        }
+    }
+
+    /** 溯源条：本轮用过的工具 → 展示标签（空返回 null 不显示） */
+    private fun buildToolBadges(steps: List<AgentStep>): List<String>? {
+        val names = steps.map { it.toolName }.filter { it.isNotBlank() }.toSet()
+        if (names.isEmpty()) return null
+        val badges = mutableListOf<String>()
+        if ("gua_yao" in names) badges.add("🏷 起卦")
+        if ("date_convert" in names || "bazi_paipan" in names) badges.add("📅 日期")
+        return if (badges.isEmpty()) null else badges
+    }
+
+    /** 审计 + 溯源：最终答案落盘前调用，返回 (带标注的最终文本, 溯源标签) */
+    private fun finalizeAnswer(text: String, stepBaseline: Int): Pair<String, List<String>?> {
+        val roundSteps = agentSteps.drop(stepBaseline)
+        val warnings = AnswerAuditor.check(text, roundSteps, activePersonaId)
+        val finalText = if (warnings.isEmpty()) text
+            else text + "\n\n" + warnings.joinToString("\n")
+        return finalText to buildToolBadges(roundSteps)
+    }
+
     fun currentConversationId(): String = currentConvId
 
     /** 写消息到指定对话，正在查看时才同步 UI */
@@ -332,6 +424,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // 只挡当前对话，其他对话并行不受影响
         val myConvId = currentConvId
         if (myConvId in loadingConvs) return
+        // 本轮 agentSteps 基线：审计器只检查本次消息以来新增的步骤（Main 线程调用，读安全）
+        val stepBaseline = agentSteps.size
 
         // 构建 API 内容（如适用则附带文件文本）
         var apiContent = content.ifBlank {
@@ -397,8 +491,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // 实时时间，供模型判断时效
                 val now = java.time.LocalDateTime.now()
                 val nowStr = "${now.year}年${now.monthValue}月${now.dayOfMonth}日 ${now.hour}:${String.format("%02d", now.minute)}"
-                dynamicSystemMsgs.add(ChatMessageDto(role = "system",
-                    content = "## 当前时间\n\n现在是 $nowStr。判断约定/待办/时效性话题时以此为准。"))
+
+                // 命理师角色：额外注入农历+干支（系统算好，模型只引用不推算）。
+                // 同时把结果记进 agentSteps，让审计器知道"日期已由系统提供"。
+                var lunarInfo = ""
+                if (activePersonaId == "fortune") {
+                    try {
+                        val dateResult = ToolRegistry.execute(
+                            ToolCall(id = "sys_date", name = "date_convert",
+                                arguments = mapOf("date" to "${now.year}-${now.monthValue}-${now.dayOfMonth}", "hour" to now.hour.toString())),
+                            getApplication(), myConvId
+                        )
+                        if (dateResult.success) {
+                            lunarInfo = dateResult.content
+                            withContext(Dispatchers.Main) {
+                                appendAgentStep(AgentStep(type = "tool_result", toolName = "date_convert",
+                                    content = lunarInfo.take(200)))
+                            }
+                        }
+                    } catch (_: Exception) { /* Python 失败则降级：只注入公历 */ }
+                }
+                val timeContent = if (lunarInfo.isNotBlank()) {
+                    "## 当前时间\n\n现在是 $nowStr。\n\n$lunarInfo\n\n以上农历与干支已由系统换算，引用时直接使用，禁止自行推算。"
+                } else {
+                    "## 当前时间\n\n现在是 $nowStr。判断约定/待办/时效性话题时以此为准。"
+                }
+                dynamicSystemMsgs.add(ChatMessageDto(role = "system", content = timeContent))
 
                 // 添加搜索/核验上下文（在 IO 上运行）
                 val effectiveSearch = searchEnabled || factCheckEnabled
@@ -495,6 +613,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 // 将动态系统消息追加到历史之后（位于静态前缀之后以利于缓存）
                 conversationDtos.addAll(dynamicSystemMsgs)
+
+                // 系统自动起卦：问卦意图命中时 Kotlin 侧直接起卦注入（执行权在系统）
+                injectSystemGua(content, myConvId, conversationDtos, lunarInfo)
 
                 // Agent 循环：不设硬性轮数上限，由模型决定何时停止
                 var finishReason: String? = null
@@ -831,14 +952,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             val finalThink = thinkBuf.toString()
                             val paipan = pendingPaipanJson
                             pendingPaipanJson = null
+                            // 审计 + 溯源：伪造卦象/日期会被打标；溯源标签随消息落盘
+                            val (auditedText, badges) = finalizeAnswer(finalText, stepBaseline)
                             myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                 role = "assistant",
-                                content = finalText,
+                                content = auditedText,
                                 thinking = finalThink,
-                                paipanData = paipan
+                                paipanData = paipan,
+                                toolBadges = badges
                             )
                             commitMessages(myConvId, myMsgs)
                         }
+                        // API 上下文里保持原文（审计标注只给用户看，不进上下文）
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = textBuf.toString()))
                         finishReason = "stop"
 
@@ -1217,6 +1342,8 @@ ${PlanParser.planInstruction()}
         try {
             val state = gson.fromJson(f.readText(Charsets.UTF_8), AgentState::class.java)
             if (state.conversationDtos.isNullOrEmpty()) return
+            // 恢复轮的 agentSteps 基线：审计只检查恢复以来新增的步骤
+            val resumeBaseline = agentSteps.size
 
             // 恢复计划状态（按对话隔离）
             val restoredPlan = if (state.planJson.isNotBlank()) {
@@ -1282,7 +1409,8 @@ ${PlanParser.planInstruction()}
                     val respBody = chatCompletion(profile, request)
                     val reply = respBody.choices.firstOrNull()?.message?.content ?: ""
                     withContext(Dispatchers.Main) {
-                        myMsgs = myMsgs + ChatMessage(role = "assistant", content = reply)
+                        val (auditedText, badges) = finalizeAnswer(reply, resumeBaseline)
+                        myMsgs = myMsgs + ChatMessage(role = "assistant", content = auditedText, toolBadges = badges)
                         commitMessages(myConvId, myMsgs)
                     }
                 } catch (e: Exception) {
