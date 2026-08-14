@@ -38,6 +38,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         // Agent 循环轮数上限：防止模型陷入工具循环无限烧 token
         private const val MAX_AGENT_ROUNDS = 30
+
+        // 花括号一律用字符类 [{]/[}]：Android ICU 正则引擎不认反斜杠转义的花括号，
+        // 真机上会直接 PatternSyntaxException（JVM 单测通过 ≠ 真机通过）。
+        // 排盘 JSON 只取标签间内容，两侧有专属标签，不需要花括号锚定；
+        // 内容先用 gson 验证再进 pendingPaipanJson，防止嵌套 JSON 截断渲染坏卡片。
+        private val PAIPAN_REGEX = Regex("""<PAIPAN_JSON>(.*?)</PAIPAN_JSON>""", RegexOption.DOT_MATCHES_ALL)
+        private val PREVIEW_REGEX = Regex("""[{]"type":"preview","file":"([^"]+)","title":"([^"]*)"[}]""")
     }
 
     val storage = StorageManager(application)
@@ -245,6 +252,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private var currentConvId: String = ""
     private val gson = Gson()
+
+    /** 提取排盘确认卡 JSON：先 gson 验证再挂载，坏数据直接丢弃 */
+    private fun extractPaipanJson(content: String) {
+        val m = PAIPAN_REGEX.find(content) ?: return
+        val captured = m.groupValues[1].trim()
+        if (captured.isBlank()) return
+        try {
+            gson.fromJson(captured, Map::class.java)
+            pendingPaipanJson = captured
+        } catch (e: Exception) {
+            // 残缺/非 JSON 内容：丢弃，防止展示坏卡片
+        }
+    }
+
+    /** 预览检测：build_html 输出带 preview 标记时更新预览面板 */
+    private suspend fun handlePreviewIfAny(content: String, isBuildHtml: Boolean, myConvId: String) {
+        if (!isBuildHtml) return
+        val m = PREVIEW_REGEX.find(content) ?: return
+        val f = m.groupValues[1]
+        val t = m.groupValues[2].ifBlank { f }
+        // 只在生成 HTML 的对话正被查看时才更新预览面板
+        if (myConvId == currentConvId) {
+            withContext(Dispatchers.Main) {
+                // 按文件名去重
+                previewItems = previewItems.filter { it.file != f } + PreviewItem(f, t)
+                activePreviewIndex = previewItems.lastIndex
+                previewMode = PreviewMode.HALF
+            }
+        }
+    }
 
     fun currentConversationId(): String = currentConvId
 
@@ -576,27 +613,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             }
                             val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication(), myConvId)
                             // 排盘确认卡：提取 bazi_paipan 结果中的 JSON
-                            if (tc.function.name == "bazi_paipan") {
-                                Regex("""<PAIPAN_JSON>(\{.*?})</PAIPAN_JSON>""", RegexOption.DOT_MATCHES_ALL)
-                                    .find(result.content)?.let { m ->
-                                        pendingPaipanJson = m.groupValues[1]
-                                    }
-                            }
+                            if (tc.function.name == "bazi_paipan") extractPaipanJson(result.content)
                             // 预览检测：build_html 输出
-                            val previewJson = Regex("""\{"type":"preview","file":"([^"]+)","title":"([^"]*)"\}""").find(result.content)
-                            if (previewJson != null && tc.function.name == "build_html") {
-                                val f = previewJson.groupValues[1]
-                                val t = previewJson.groupValues[2].ifBlank { f }
-                                // 只在生成 HTML 的对话正被查看时才更新预览面板
-                                if (myConvId == currentConvId) {
-                                    withContext(Dispatchers.Main) {
-                                        // 按文件名去重
-                                        previewItems = previewItems.filter { it.file != f } + PreviewItem(f, t)
-                                        activePreviewIndex = previewItems.lastIndex
-                                        previewMode = PreviewMode.HALF
-                                    }
-                                }
-                            }
+                            handlePreviewIfAny(result.content, tc.function.name == "build_html", myConvId)
                             // 错误追踪
                             val errKey = if (!result.success) "${tc.function.name}:${result.content.take(60)}" else ""
                             if (errKey.isNotBlank()) {
@@ -795,25 +814,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                                     appendAgentStep(AgentStep(type = "tool_call", toolName = tc.name, toolArgs = gson.toJson(tc.arguments)))
                                 }
                                 val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.name, arguments = tc.arguments), getApplication(), myConvId)
-                                if (tc.name == "bazi_paipan") {
-                                    Regex("""<PAIPAN_JSON>(\{.*?})</PAIPAN_JSON>""", RegexOption.DOT_MATCHES_ALL)
-                                        .find(result.content)?.let { m ->
-                                            pendingPaipanJson = m.groupValues[1]
-                                        }
-                                }
-                                val previewJson = Regex("""\{"type":"preview","file":"([^"]+)","title":"([^"]*)"\}""").find(result.content)
-                                if (previewJson != null && tc.name == "build_html") {
-                                    val f = previewJson.groupValues[1]
-                                    val t = previewJson.groupValues[2].ifBlank { f }
-                                    // 只在生成 HTML 的对话正被查看时才更新预览面板
-                                    if (myConvId == currentConvId) {
-                                        withContext(Dispatchers.Main) {
-                                            previewItems = previewItems.filter { it.file != f } + PreviewItem(f, t)
-                                            activePreviewIndex = previewItems.lastIndex
-                                            previewMode = PreviewMode.HALF
-                                        }
-                                    }
-                                }
+                                if (tc.name == "bazi_paipan") extractPaipanJson(result.content)
+                                handlePreviewIfAny(result.content, tc.name == "build_html", myConvId)
                                 withContext(Dispatchers.Main) {
                                     appendAgentStep(AgentStep(type = "tool_result", toolName = tc.name, content = result.content))
                                 }
