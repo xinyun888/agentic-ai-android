@@ -14,6 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -47,12 +48,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.aichat.R
+import com.example.aichat.data.AgentStep
 import com.example.aichat.data.ApiProfile
 import com.example.aichat.data.ChatMessage
 import com.example.aichat.data.Persona
 import com.example.aichat.data.Personas
 import com.example.aichat.data.TaskPlan
-import com.example.aichat.viewmodel.AgentStep
 import com.example.aichat.viewmodel.ChatViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -87,6 +88,8 @@ fun ChatScreen(
     var pmHideThink by remember { mutableStateOf(true) }
     val frequencyOptions = remember { listOf(5, 15, 30, 60, 120, 240) }
     val frequencyLabels = remember { listOf("5分钟", "15分钟", "30分钟", "1小时", "2小时", "4小时") }
+    // 长按消息"删除此条及之后"：保存保留条数（截断点）
+    var truncateKeep by remember { mutableStateOf<Int?>(null) }
 
     val startNow: () -> Unit = {
         val i = Intent(context, com.example.aichat.service.ActiveModeService::class.java).apply {
@@ -821,19 +824,35 @@ fun ChatScreen(
                     if (message.thinking.isNotBlank() && (message.role == "assistant" || message.role == "assistant_live")) {
                         ThinkingChainCard(content = message.thinking)
                     }
-                    // 用户消息的工具步骤（视觉预处理）
-                    if (message.role == "user" && message.imageUri != null) {
-                        viewModel.agentSteps.filter { it.toolName.isNotBlank() }.forEach { step ->
-                            when (step.type) {
-                                "tool_call" -> AgentToolCard(Icons.Filled.Build, "视觉识别", step.toolName, MaterialTheme.colorScheme.tertiaryContainer)
-                                "tool_result" -> AgentToolCard(Icons.Filled.CheckCircle, "识别结果", step.content.take(200), MaterialTheme.colorScheme.secondaryContainer)
-                            }
+                    // 工具步骤卡：本回复实际执行的工具（系统注入标"系统"，模型调用标"调用"）
+                    message.toolSteps?.forEach { step ->
+                        when (step.type) {
+                            "tool_call" -> AgentToolCard(
+                                Icons.Filled.Build,
+                                (if (step.auto) "系统 · " else "调用 · ") + step.toolName,
+                                step.toolArgs.take(120),
+                                MaterialTheme.colorScheme.tertiaryContainer
+                            )
+                            "tool_result" -> AgentToolCard(
+                                Icons.Filled.CheckCircle,
+                                step.toolName + " · 结果",
+                                step.content.take(300) + if (step.content.length > 300) "…" else "",
+                                MaterialTheme.colorScheme.secondaryContainer
+                            )
                         }
                     }
                     // 最后一条助手消息：客户端打字机（最终回答已改非流式，观感由这里模拟）
                     val isLastAssistant = message.role == "assistant" &&
                         viewModel.messages.lastOrNull { it.role == "assistant" } === message
-                    MessageBubble(message = message, typewriter = isLastAssistant)
+                    MessageBubble(
+                        message = message,
+                        typewriter = isLastAssistant,
+                        onLongClick = {
+                            // 引用相等定位（同内容消息不能靠 indexOf）
+                            val idx = viewModel.messages.indexOfFirst { it === message }
+                            if (idx >= 0) truncateKeep = idx
+                        }
+                    )
                 }
 
                 if (viewModel.isLoading) {
@@ -855,6 +874,22 @@ fun ChatScreen(
                         }
                     }
                 }
+            }
+
+            // === 长按消息：删除此条及之后（重开被污染对话）===
+            truncateKeep?.let { keep ->
+                AlertDialog(
+                    onDismissRequest = { truncateKeep = null },
+                    title = { Text("删除此条及之后？") },
+                    text = { Text("将删除这条消息及其后的所有消息（保留前 $keep 条）。用于重开被污染的历史对话。此操作不可撤销。") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            viewModel.truncateFrom(viewModel.currentConversationId(), keep)
+                            truncateKeep = null
+                        }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = { TextButton(onClick = { truncateKeep = null }) { Text("取消") } }
+                )
             }
 
             // === 全屏预览浮层（覆盖整个 Box）===
@@ -1043,8 +1078,9 @@ fun ChatScreen(
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun MessageBubble(message: ChatMessage, typewriter: Boolean = false) {
+fun MessageBubble(message: ChatMessage, typewriter: Boolean = false, onLongClick: (() -> Unit)? = null) {
     val isUser = message.role == "user"
     val bubbleColor = if (isUser) {
         MaterialTheme.colorScheme.primaryContainer
@@ -1073,7 +1109,9 @@ fun MessageBubble(message: ChatMessage, typewriter: Boolean = false) {
         horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
     ) {
         Surface(
-            modifier = Modifier.widthIn(max = 300.dp),
+            modifier = Modifier
+                .widthIn(max = 300.dp)
+                .combinedClickable(onClick = {}, onLongClick = onLongClick),
             shape = RoundedCornerShape(
                 topStart = 16.dp,
                 topEnd = 16.dp,

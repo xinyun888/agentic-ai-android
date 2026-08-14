@@ -24,13 +24,6 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
-data class AgentStep(
-    val type: String,        // "tool_call" | "tool_result" | "thinking" | "final"
-    val toolName: String = "",
-    val toolArgs: String = "",
-    val content: String = ""
-)
-
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     companion object {
@@ -347,19 +340,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * 命理师问卦时系统直接起卦注入（不依赖模型调工具）——执行权在系统手里，
-     * 模型手里只有"已算好的结果"，没有"自己编"的空间。
-     * 注入标准 assistant tool_call + tool 消息对，并同步记录 agentSteps。
+     * 命理师问卦时系统执行起卦（只执行不注入）。返回 (参数, 卦象文本)；
+     * null = 本消息不需要起卦 / 起卦失败（宁可没有，不让模型自己编）。
      */
-    private suspend fun injectSystemGua(
-        content: String, myConvId: String,
-        conversationDtos: MutableList<ChatMessageDto>, lunarInfo: String
-    ) {
-        if (activePersonaId != "fortune") return
-        if (!GUA_INTENT_KEYWORDS.any { content.contains(it) }) return
+    private suspend fun executeSystemGua(
+        content: String, myConvId: String, lunarInfo: String
+    ): Pair<Map<String, String>, String>? {
+        if (activePersonaId != "fortune") return null
+        if (!GUA_INTENT_KEYWORDS.any { content.contains(it) }) return null
         // 排盘类问题不起卦：用户给出生辰要排八字时，卦不是他问的
         if (Regex("""(八字|排盘|大运|流年|出生|生辰|命盘)""").containsMatchIn(content)
-            && !Regex("""(卦|占|吉凶|该不该)""").containsMatchIn(content)) return
+            && !Regex("""(卦|占|吉凶|该不该)""").containsMatchIn(content)) return null
 
         // 方法选择：用户点名优先，否则默认六爻（真随机，不依赖农历时刻）
         val method = when {
@@ -390,45 +381,71 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 getApplication(), myConvId
             )
         }
-        if (!result.success) return  // 起卦本身失败就不注入，宁可没有
+        if (!result.success) return null
+        return args.toMap() to result.content
+    }
 
+    /** 把系统起好的卦象以 assistant tool_call + tool 消息对注入上下文（步骤标 auto=true） */
+    private suspend fun appendSystemGua(
+        args: Map<String, String>, guaText: String, conversationDtos: MutableList<ChatMessageDto>
+    ) {
         val callId = "sys_gua_${System.currentTimeMillis()}"
         conversationDtos.add(ChatMessageDto(role = "assistant", content = null,
             toolCalls = listOf(ToolCallDto(id = callId, type = "function",
                 function = ToolCallFunctionDto(name = "gua_yao", arguments = gson.toJson(args))))))
         conversationDtos.add(ChatMessageDto(role = "tool", toolCallId = callId,
-            content = "以下卦象已由系统起好，你只能解读，禁止另起卦或改写卦象。\n\n${result.content}"))
+            content = "以下卦象已由系统起好，你只能解读，禁止另起卦或改写卦象。直接解读，不要说明卦象由谁生成、是否调用过工具。\n\n$guaText"))
         withContext(Dispatchers.Main) {
-            appendAgentStep(AgentStep(type = "tool_call", toolName = "gua_yao", toolArgs = gson.toJson(args)))
-            appendAgentStep(AgentStep(type = "tool_result", toolName = "gua_yao", content = result.content.take(300)))
+            appendAgentStep(AgentStep(type = "tool_call", toolName = "gua_yao", toolArgs = gson.toJson(args), auto = true))
+            appendAgentStep(AgentStep(type = "tool_result", toolName = "gua_yao", content = guaText.take(300), auto = true))
         }
     }
 
-    /** 溯源条：本轮用过的工具 → 展示标签（空返回 null 不显示） */
+    /** 溯源条：本轮用过的工具 → 展示标签（空返回 null 不显示）；区分系统注入与模型调用 */
     private fun buildToolBadges(steps: List<AgentStep>): List<String>? {
         val names = steps.map { it.toolName }.filter { it.isNotBlank() }.toSet()
         if (names.isEmpty()) return null
         val badges = mutableListOf<String>()
-        if ("gua_yao" in names) badges.add("🏷 起卦")
+        if ("gua_yao" in names) {
+            // 只要存在非 auto 的 gua_yao 步骤 → 模型自己调的；全 auto → 系统起卦
+            val hasModelGua = steps.any { it.toolName == "gua_yao" && !it.auto }
+            badges.add(if (hasModelGua) "🏷 起卦" else "🏷 系统起卦")
+        }
         if ("date_convert" in names || "bazi_paipan" in names) badges.add("📅 日期")
         return if (badges.isEmpty()) null else badges
     }
 
-    /** 审计 + 溯源：最终答案落盘前调用，返回 (带标注的最终文本, 溯源标签) */
-    private fun finalizeAnswer(text: String, stepBaseline: Int): Pair<String, List<String>?> {
+    /** 审计 + 溯源：最终答案落盘前调用，返回 (带标注的最终文本, 溯源标签, 工具步骤快照) */
+    private fun finalizeAnswer(text: String, stepBaseline: Int): Triple<String, List<String>?, List<AgentStep>?> {
         val roundSteps = agentSteps.drop(stepBaseline)
         val warnings = AnswerAuditor.check(text, roundSteps, activePersonaId)
         val finalText = if (warnings.isEmpty()) text
             else text + "\n\n" + warnings.joinToString("\n")
-        return finalText to buildToolBadges(roundSteps)
+        val toolSteps = roundSteps.filter { it.type == "tool_call" || it.type == "tool_result" }
+            .takeIf { it.isNotEmpty() }
+        return Triple(finalText, buildToolBadges(roundSteps), toolSteps)
     }
 
     fun currentConversationId(): String = currentConvId
 
-    /** 写消息到指定对话，正在查看时才同步 UI */
+    /** 删除指定消息及之后的所有消息（重开被污染的对话：旧"伪卦"记录会诱导模型继续编） */
+    fun truncateFrom(convId: String, keepCount: Int) {
+        val conv = storage.getConversation(convId) ?: return
+        if (keepCount <= 0 || keepCount >= conv.messages.size) return
+        val msgs = conv.messages.take(keepCount)
+        commitMessages(convId, msgs)
+    }
+
+    /** 写消息到指定对话，正在查看时才同步 UI。
+     *  合并而非覆盖：快照若是存储的前缀，把回合期间被并发追加的尾部消息
+     *  （主动模式心跳的 appendMessage 等）补回来，防止覆盖写丢。 */
     private fun commitMessages(convId: String, msgs: List<ChatMessage>) {
-        storage.updateMessages(convId, msgs)
-        if (convId == currentConvId) messages = msgs
+        val stored = storage.getConversation(convId)?.messages ?: emptyList()
+        // data class 相等校验快照确实是前缀，是才合并；不是（中间被人改过）退回原行为
+        val merged = if (stored.size > msgs.size && stored.take(msgs.size) == msgs)
+            msgs + stored.drop(msgs.size) else msgs
+        storage.updateMessages(convId, merged)
+        if (convId == currentConvId) messages = merged
     }
 
     /** 追加用户消息到指定对话（原子，避免与心跳竞态导致覆盖） */
@@ -440,23 +457,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadConversation(convId: String) {
-        if (convId == currentConvId && messages.isNotEmpty()) return
-        // 保存当前对话的计划状态，加载目标对话的（并行对话互不干扰）
-        planStates[currentConvId] = PlanState(currentPlan, planPhase, completedTaskIds)
-        currentConvId = convId
+        val sameConv = convId == currentConvId
+        if (!sameConv) {
+            // 保存当前对话的计划状态，加载目标对话的（并行对话互不干扰）
+            planStates[currentConvId] = PlanState(currentPlan, planPhase, completedTaskIds)
+            currentConvId = convId
+            errorMessage = null
+            agentSteps = emptyList()
+            val saved = planStates[convId]
+            currentPlan = saved?.plan
+            planPhase = saved?.phase ?: PlanPhase.IDLE
+            completedTaskIds = saved?.completed ?: emptySet()
+            // 切对话时同步该对话的加载状态
+            isLoading = convId in loadingConvs
+            // 检查断点
+            restoreState()
+        }
+        // 无论是否同对话，都以存储为准重载——丢弃任何残留的 live/过期状态（存储是唯一真值）
         val conv = storage.getConversation(convId)
         messages = conv?.messages ?: emptyList()
         conversationTitle = conv?.title ?: ""
-        errorMessage = null
-        agentSteps = emptyList()
-        val saved = planStates[convId]
-        currentPlan = saved?.plan
-        planPhase = saved?.phase ?: PlanPhase.IDLE
-        completedTaskIds = saved?.completed ?: emptySet()
-        // 切对话时同步该对话的加载状态
-        isLoading = convId in loadingConvs
-        // 检查断点
-        restoreState()
     }
 
     fun clearError() {
@@ -554,17 +574,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             lunarInfo = dateResult.content
                             withContext(Dispatchers.Main) {
                                 appendAgentStep(AgentStep(type = "tool_result", toolName = "date_convert",
-                                    content = lunarInfo.take(200)))
+                                    content = lunarInfo.take(200), auto = true))
                             }
                         }
                     } catch (_: Exception) { /* Python 失败则降级：只注入公历 */ }
                 }
+
+                // 系统起卦：先执行（结果供状态行与注入使用）
+                val sysGua = executeSystemGua(content, myConvId, lunarInfo)
+
                 val timeContent = if (lunarInfo.isNotBlank()) {
                     "## 当前时间\n\n现在是 $nowStr。\n\n$lunarInfo\n\n以上农历与干支已由系统换算，引用时直接使用，禁止自行推算。"
                 } else {
                     "## 当前时间\n\n现在是 $nowStr。判断约定/待办/时效性话题时以此为准。"
                 }
                 dynamicSystemMsgs.add(ChatMessageDto(role = "system", content = timeContent))
+
+                // 注入状态行：模型一眼知道卦象/农历是否已由系统提供，按状态决定解读还是自调
+                if (activePersonaId == "fortune") {
+                    val methodLabel = mapOf("liuyao" to "六爻", "meihua" to "梅花", "xiaoliuren" to "小六壬")
+                        .getOrDefault(sysGua?.first?.get("method") ?: "", "")
+                    val guaStatus = if (sysGua != null) "✅ 系统已起卦（$methodLabel），直接解读，禁止重复调用" else "❌ 未注入"
+                    val lunarStatus = if (lunarInfo.isNotBlank()) "✅ 已注入（见上方当前时间）" else "❌ 未注入"
+                    dynamicSystemMsgs.add(ChatMessageDto(role = "system",
+                        content = "## 注入状态\n- 卦象：$guaStatus\n- 农历：$lunarStatus"))
+                }
 
                 // 添加搜索/核验上下文（在 IO 上运行）
                 val effectiveSearch = searchEnabled || factCheckEnabled
@@ -662,8 +696,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // 将动态系统消息追加到历史之后（位于静态前缀之后以利于缓存）
                 conversationDtos.addAll(dynamicSystemMsgs)
 
-                // 系统自动起卦：问卦意图命中时 Kotlin 侧直接起卦注入（执行权在系统）
-                injectSystemGua(content, myConvId, conversationDtos, lunarInfo)
+                // 系统自动起卦注入：卦象消息对放在状态行之后（模型先读状态行再读卦象）
+                if (sysGua != null) {
+                    appendSystemGua(sysGua.first, sysGua.second, conversationDtos)
+                }
 
                 // Agent 循环：不设硬性轮数上限，由模型决定何时停止
                 var finishReason: String? = null
@@ -853,14 +889,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         withContext(NonCancellable + Dispatchers.Main) {
                             val paipan = pendingPaipanJson
                             pendingPaipanJson = null
-                            // 审计 + 溯源：伪造卦象/日期会被打标；溯源标签随消息落盘
-                            val (auditedText, badges) = finalizeAnswer(display, stepBaseline)
+                            // 审计 + 溯源：伪造卦象/日期会被打标；溯源标签与工具步骤快照随消息落盘
+                            val (auditedText, badges, toolSteps) = finalizeAnswer(display, stepBaseline)
                             myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                 role = "assistant",
                                 content = auditedText,
                                 thinking = finalThink,
                                 paipanData = paipan,
-                                toolBadges = badges
+                                toolBadges = badges,
+                                toolSteps = toolSteps
                             )
                             commitMessages(myConvId, myMsgs)
                         }
@@ -906,6 +943,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } finally {
                 withContext(NonCancellable + Dispatchers.Main) {
+                    // 清理残留 live：取消路径会走到这里（正常完成时 live 已被 finalize 替换、
+                    // 异常路径 catch 已转"连接中断"，均不会重复提交），把半截消息转正落盘，
+                    // 保证回合结束 UI == 存储
+                    val liveMsg = myMsgs.find { it.role == "assistant_live" }
+                    if (liveMsg != null && liveMsg.content.isNotBlank()) {
+                        myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
+                            role = "assistant",
+                            content = liveMsg.content + "\n\n⚠️ [已停止生成]",
+                            thinking = liveMsg.thinking
+                        )
+                        commitMessages(myConvId, myMsgs)
+                    }
                     currentJobs.remove(myConvId)
                     loadingConvs.remove(myConvId)
                     isLoading = myConvId in loadingConvs
@@ -1288,8 +1337,8 @@ ${PlanParser.planInstruction()}
                     val respBody = chatCompletion(profile, request)
                     val reply = respBody.choices.firstOrNull()?.message?.content ?: ""
                     withContext(Dispatchers.Main) {
-                        val (auditedText, badges) = finalizeAnswer(reply, resumeBaseline)
-                        myMsgs = myMsgs + ChatMessage(role = "assistant", content = auditedText, toolBadges = badges)
+                        val (auditedText, badges, toolSteps) = finalizeAnswer(reply, resumeBaseline)
+                        myMsgs = myMsgs + ChatMessage(role = "assistant", content = auditedText, toolBadges = badges, toolSteps = toolSteps)
                         commitMessages(myConvId, myMsgs)
                     }
                 } catch (e: Exception) {

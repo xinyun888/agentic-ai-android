@@ -724,10 +724,10 @@ class GuaYaoTool : Tool {
             val question = args["question"]?.trim().orEmpty()
             val q = if (question.isNotBlank()) "问：$question\n" else ""
             when (method) {
-                "liuyao" -> ToolResult("", true, q + liuyao())
-                "meihua" -> ToolResult("", true, q + meihua(args))
+                "liuyao", "六爻" -> ToolResult("", true, q + liuyao())
+                "meihua", "梅花", "梅花易数" -> ToolResult("", true, q + meihua(args))
                 "xiaoliuren", "小六壬" -> ToolResult("", true, q + xiaoliuren(args))
-                else -> ToolResult("", false, "未知起卦方法: $method（可选 liuyao/meihua/xiaoliuren）")
+                else -> ToolResult("", false, "未知起卦方法: $method（可选 liuyao/六爻、meihua/梅花易数、xiaoliuren/小六壬）")
             }
         } catch (e: Exception) {
             ToolResult("", false, "起卦失败: ${e.message}")
