@@ -4,13 +4,17 @@
 -keep class com.example.aichat.viewmodel.ChatViewModel$AgentState { *; }
 -keep class com.example.aichat.viewmodel.ChatViewModel$PreviewItem { *; }
 
-# Gson 泛型签名（TypeToken 依赖）与注解
--keepattributes Signature
+# Gson 泛型签名（TypeToken 依赖）与注解。
+# InnerClasses/EnclosingMethod 是 Signature 生效的前提
+-keepattributes Signature, InnerClasses, EnclosingMethod
+-keepattributes RuntimeVisibleAnnotations, RuntimeVisibleParameterAnnotations
 -keepattributes *Annotation*
+-keep class com.google.gson.reflect.TypeToken { *; }
 -keep class * extends com.google.gson.reflect.TypeToken { *; }
-
-# Retrofit 接口（动态代理）
--keep interface com.example.aichat.data.ApiService { *; }
+# 防 R8 剥离 @SerializedName 字段
+-keepclassmembers,allowobfuscation class * {
+    @com.google.gson.annotations.SerializedName <fields>;
+}
 
 # ===== 四大组件（Manifest 注册，防 R8 误删）=====
 -keep class com.example.aichat.MainActivity { *; }

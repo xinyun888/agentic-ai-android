@@ -12,7 +12,6 @@ import com.example.aichat.python.PythonSessionManager
 import com.example.aichat.service.ActiveModeService
 import com.example.aichat.service.ScreenControlService
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -22,8 +21,6 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.URLEncoder
@@ -247,8 +244,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private var currentConvId: String = ""
-    private var apiService: ApiService? = null
-    private var lastBaseUrl: String = ""
     private val gson = Gson()
 
     fun currentConversationId(): String = currentConvId
@@ -341,11 +336,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         errorMessage = null
         // 保留之前的 agent 步骤，不清空
         // agentSteps = emptyList() — 已移除，以保留历史
-
-        if (lastBaseUrl != profile.baseUrl) {
-            apiService = null
-            lastBaseUrl = profile.baseUrl
-        }
 
         // 在 IO 线程运行，避免退到后台时取消网络请求
         currentJobs[myConvId] = viewModelScope.launch(Dispatchers.IO) {
@@ -546,24 +536,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(
                             ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
-                            object : TypeToken<List<Map<String, Any>>>() {}.type
+                            GsonTypes.list(GsonTypes.stringAnyMap)
                         ),
                         stream = false
                     )
 
-                    val response = getApiService(profile).chatCompletion(
-                        auth = "Bearer ${profile.apiKey}",
-                        request = request
-                    )
-                    if (!response.isSuccessful) {
-                        val errorBody = response.errorBody()?.string() ?: ""
+                    // 原生 OkHttp + 具体类解析（Retrofit 的 suspend 泛型签名会被 R8 剥离导致崩溃）
+                    val body = try {
+                        chatCompletion(profile, request)
+                    } catch (e: ApiHttpException) {
                         withContext(Dispatchers.Main) {
-                            errorMessage = "API 错误 ${response.code()}: ${response.message()}\n${errorBody.take(200)}"
+                            errorMessage = "API 错误 ${e.code}: ${e.message}\n${e.errorBody}"
                         }
                         return@launch
                     }
-                    val choice = response.body()?.choices?.firstOrNull()
-                    response.body()?.usage?.let { u ->
+                    val choice = body.choices.firstOrNull()
+                    body.usage?.let { u ->
                         UsageMeter.record(u.promptTokens, u.completionTokens, u.cacheHitTokens, u.cacheMissTokens)
                     }
                     finishReason = choice?.finishReason
@@ -581,7 +569,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = null, toolCalls = msg.toolCalls))
                         for (tc in msg.toolCalls) {
                             val args: Map<String, String> = try {
-                                gson.fromJson(tc.function.arguments, object : TypeToken<Map<String, String>>() {}.type)
+                                gson.fromJson(tc.function.arguments, GsonTypes.stringStringMap)
                             } catch (e: Exception) { mapOf("_raw" to tc.function.arguments) }
                             withContext(Dispatchers.Main) {
                                 appendAgentStep(AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments))
@@ -786,7 +774,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             val calls = streamToolCalls.entries.sortedBy { it.key }.mapIndexed { i, (_, m) ->
                                 val rawArgs = m["arguments"] ?: "{}"
                                 val parsedArgs: Map<String, String> = try {
-                                    gson.fromJson(rawArgs, object : TypeToken<Map<String, String>>() {}.type)
+                                    gson.fromJson(rawArgs, GsonTypes.stringStringMap)
                                 } catch (e: Exception) { mapOf("_raw" to rawArgs) }
                                 com.example.aichat.data.tools.ToolCall(
                                     id = "stream_${System.currentTimeMillis()}_$i",
@@ -890,7 +878,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         commitMessages(myConvId, myMsgs)
                     }
-                    errorMessage = "请求失败: ${e.localizedMessage ?: "未知错误"}"
+                    // 带异常类名+堆栈前3行，便于定位 release 版混淆相关崩溃
+                    val trace = e.stackTrace.take(3).joinToString("\n") { "  at $it" }
+                    errorMessage = "请求失败: ${e.javaClass.name}: ${e.message}\n$trace"
                 }
             } finally {
                 withContext(NonCancellable + Dispatchers.Main) {
@@ -919,21 +909,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) { input }
     }
 
-    private fun getApiService(profile: ApiProfile): ApiService {
-        val current = apiService
-        if (current != null) return current
+    /** 非流式对话请求：直接 OkHttp + Gson 具体类解析。
+     *  不用 Retrofit——R8 会剥离接口方法的泛型签名（Continuation<ChatResponse>），
+     *  Retrofit 的 suspend 处理强转 ParameterizedType 必炸（Missing type parameter / ClassCastException）。 */
+    private class ApiHttpException(val code: Int, msg: String, val errorBody: String) : Exception("HTTP $code $msg")
 
-        val baseUrl = profile.baseUrl.trimEnd('/') + "/"
-
-        val retrofit = Retrofit.Builder()
-            .baseUrl(baseUrl)
-            .client(HttpClient.instance)
-            .addConverterFactory(GsonConverterFactory.create())
+    private suspend fun chatCompletion(profile: ApiProfile, request: ChatRequest): ChatResponse {
+        val bodyJson = gson.toJson(request)
+        val req = Request.Builder()
+            .url("${profile.baseUrl.trimEnd('/')}/chat/completions")
+            .addHeader("Authorization", "Bearer ${profile.apiKey}")
+            .addHeader("Content-Type", "application/json")
+            .post(bodyJson.toRequestBody("application/json".toMediaType()))
             .build()
-
-        val service = retrofit.create(ApiService::class.java)
-        apiService = service
-        return service
+        return withContext(Dispatchers.IO) {
+            val resp = HttpClient.instance.newCall(req).execute()
+            if (!resp.isSuccessful) {
+                val errBody = resp.body?.string()?.take(200) ?: ""
+                resp.close()
+                throw ApiHttpException(resp.code, resp.message, errBody)
+            }
+            val json = resp.body?.string() ?: "{}"
+            resp.close()
+            gson.fromJson(json, ChatResponse::class.java)
+        }
     }
 
     // --- 网络搜索（多源 OkHttp，国内可用）---
@@ -1259,7 +1258,7 @@ ${PlanParser.planInstruction()}
                             content = dto["content"] ?: "",
                             toolCallId = (dto["tool_call_id"] as? String)?.ifBlank { null },
                             toolCalls = (dto["tool_calls"] as? String)?.takeIf { it.isNotBlank() }?.let {
-                                gson.fromJson(it, object : TypeToken<List<ToolCallDto>>() {}.type)
+                                gson.fromJson(it, GsonTypes.list(ToolCallDto::class.java))
                             }
                         )
                     }.toMutableList()
@@ -1273,18 +1272,16 @@ ${PlanParser.planInstruction()}
                         reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "max" else null,
                         thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
-                            object : TypeToken<List<Map<String, Any>>>() {}.type),
+                            GsonTypes.list(GsonTypes.stringAnyMap)),
                         stream = false
                     )
 
-                    // 简单的非流式恢复调用
-                    val resp = getApiService(profile).chatCompletion("Bearer ${profile.apiKey}", request)
-                    if (resp.isSuccessful) {
-                        val reply = resp.body()?.choices?.firstOrNull()?.message?.content ?: ""
-                        withContext(Dispatchers.Main) {
-                            myMsgs = myMsgs + ChatMessage(role = "assistant", content = reply)
-                            commitMessages(myConvId, myMsgs)
-                        }
+                    // 简单的非流式恢复调用（原生 OkHttp，ApiHttpException 由外层 catch 兜底）
+                    val respBody = chatCompletion(profile, request)
+                    val reply = respBody.choices.firstOrNull()?.message?.content ?: ""
+                    withContext(Dispatchers.Main) {
+                        myMsgs = myMsgs + ChatMessage(role = "assistant", content = reply)
+                        commitMessages(myConvId, myMsgs)
                     }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {

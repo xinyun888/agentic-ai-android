@@ -1,9 +1,6 @@
 package com.example.aichat.data
 
 import com.google.gson.annotations.SerializedName
-import retrofit2.Response
-import retrofit2.http.*
-import okhttp3.ResponseBody
 
 // --- Request DTOs ---
 
@@ -60,13 +57,3 @@ data class Message(
     @SerializedName("tool_calls") val toolCalls: List<ToolCallDto>? = null,
     @SerializedName("reasoning_content") val reasoningContent: String? = null
 )
-
-// --- Retrofit Interface ---
-
-interface ApiService {
-    @POST("v1/chat/completions")
-    suspend fun chatCompletion(
-        @Header("Authorization") auth: String,
-        @Body request: ChatRequest
-    ): Response<ChatResponse>
-}

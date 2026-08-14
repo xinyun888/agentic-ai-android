@@ -69,7 +69,8 @@ class ActiveModeService : Service() {
     private fun loadConfigsFromPrefs() {
         try {
             val json = prefs().getString("configs", null) ?: return
-            val type = object : com.google.gson.reflect.TypeToken<Map<String, ActiveConfig>>() {}.type
+            // getParameterized 显式构造泛型，绕开 R8 剥离签名导致的 Missing type parameter
+            val type = com.example.aichat.data.GsonTypes.map(String::class.java, ActiveConfig::class.java)
             val map: Map<String, ActiveConfig> = gson.fromJson(json, type) ?: return
             configs.putAll(map)
             runningPersonas.addAll(map.keys)

@@ -10,6 +10,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.example.aichat.data.ApiProfile
 import com.example.aichat.viewmodel.MainViewModel
@@ -21,7 +22,12 @@ fun ProfileScreen(
     onBack: () -> Unit
 ) {
     androidx.activity.compose.BackHandler { onBack() }
+    val appCtx = LocalContext.current.applicationContext
     var profiles by remember { mutableStateOf(viewModel.getProfiles()) }
+    // 每次进入页面都强制从存储刷新（不依赖 remember 初始化语义）
+    LaunchedEffect(Unit) {
+        profiles = viewModel.getProfiles()
+    }
 
     Scaffold(
         topBar = {
@@ -74,6 +80,14 @@ fun ProfileScreen(
                         newList[index] = updated
                         profiles = newList
                         viewModel.saveProfiles(newList)
+                        // 立即读回验证：读不到刚保存的内容说明存储层有问题
+                        val back = viewModel.getProfiles()
+                        if (back.none { it.id == updated.id && it.apiKey == updated.apiKey }) {
+                            android.widget.Toast.makeText(
+                                appCtx, "⚠️ 保存验证失败，配置未落盘，请重试",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
+                        }
                     },
                     onDelete = {
                         if (profiles.size > 1) {
@@ -113,6 +127,18 @@ fun ProfileCard(
     var visionModel by remember(profile.id) { mutableStateOf(profile.visionModel) }
     var visionBaseUrl by remember(profile.id) { mutableStateOf(profile.visionBaseUrl) }
     var visionApiKey by remember(profile.id) { mutableStateOf(profile.visionApiKey) }
+
+    // 编辑态按返回键 = 自动保存（防止"填完没点保存就退出导致配置丢失"）
+    if (editing) {
+        androidx.activity.compose.BackHandler {
+            onUpdate(profile.copy(
+                name = name, baseUrl = baseUrl, apiKey = apiKey, model = model,
+                thinkingEnabled = thinkingEnabled, reasoningLevel = reasoningLevel,
+                visionModel = visionModel, visionBaseUrl = visionBaseUrl, visionApiKey = visionApiKey
+            ))
+            editing = false
+        }
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -275,6 +301,7 @@ fun ProfileCard(
                 }
 
                 if (editing) {
+                    val ctx = LocalContext.current
                     TextButton(onClick = {
                         onUpdate(profile.copy(
                             name = name, baseUrl = baseUrl, apiKey = apiKey, model = model,
@@ -282,6 +309,7 @@ fun ProfileCard(
                             visionModel = visionModel, visionBaseUrl = visionBaseUrl, visionApiKey = visionApiKey
                         ))
                         editing = false
+                        android.widget.Toast.makeText(ctx, "配置已保存", android.widget.Toast.LENGTH_SHORT).show()
                     }) {
                         Text("保存")
                     }

@@ -63,9 +63,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun getActiveProfile(): ApiProfile? = storage.getActiveProfile()
 
-    fun saveProfiles(profiles: List<ApiProfile>) {
-        storage.saveProfiles(profiles)
-    }
+    fun saveProfiles(profiles: List<ApiProfile>): Boolean = storage.saveProfiles(profiles)
 
     fun setActiveProfileId(id: String) {
         storage.setActiveProfileId(id)

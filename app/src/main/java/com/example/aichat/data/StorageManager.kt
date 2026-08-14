@@ -3,7 +3,6 @@ package com.example.aichat.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 import java.io.File
 
 // --- 数据模型 ---
@@ -42,6 +41,10 @@ class StorageManager(context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("moyu_storage", Context.MODE_PRIVATE)
     private val gson = Gson()
+    private val appContext: Context = context.applicationContext
+
+    // profiles 主存储改为文件（绕开 SharedPreferences 的一切可能问题），SP 双写做备份
+    private val profilesFile: File = File(appContext.filesDir, "profiles.json")
 
     // 会话分文件存储：每个对话一个 JSON 文件；index 只存元数据（含最后一条消息供列表预览）
     private val convDir: File = File(context.filesDir, "conversations").also { it.mkdirs() }
@@ -50,16 +53,43 @@ class StorageManager(context: Context) {
     // ===== API 配置 =====
 
     fun getProfiles(): List<ApiProfile> {
-        val json = prefs.getString("profiles", null) ?: return listOf(ApiProfile(name = "Default"))
+        // 读文件；文件不存在时从 SP 迁移旧数据
+        val json: String? = if (profilesFile.exists()) {
+            try { profilesFile.readText(Charsets.UTF_8) } catch (_: Exception) { null }
+        } else {
+            val legacy = prefs.getString("profiles", null)
+            if (legacy != null) {
+                try { profilesFile.writeText(legacy, Charsets.UTF_8) } catch (_: Exception) {}
+            }
+            legacy
+        }
+        if (json.isNullOrBlank()) return listOf(ApiProfile(name = "Default"))
         return try {
-            gson.fromJson(json, object : TypeToken<List<ApiProfile>>() {}.type)
+            // 用 Array 反序列化（不依赖 TypeToken 泛型签名，R8 混淆下更稳）
+            val arr: Array<ApiProfile> = gson.fromJson(json, Array<ApiProfile>::class.java)
+                ?: return listOf(ApiProfile(name = "Default"))
+            arr.map { p -> if (p.reasoningLevel == null) p.copy(reasoningLevel = "balanced") else p }
         } catch (e: Exception) {
-            listOf(ApiProfile(name = "Default"))
+            android.util.Log.e("StorageManager", "profiles 反序列化失败", e)
+            listOf(ApiProfile(name = "Default(读取出错: ${e.message?.take(60)})"))
         }
     }
 
-    fun saveProfiles(profiles: List<ApiProfile>) {
-        prefs.edit().putString("profiles", gson.toJson(profiles)).apply()
+    /** 保存配置：文件为主（原子写），SP 双写备份。返回是否成功。 */
+    fun saveProfiles(profiles: List<ApiProfile>): Boolean {
+        val json = gson.toJson(profiles)
+        var ok = true
+        try {
+            val tmp = File(appContext.filesDir, "profiles.json.tmp")
+            tmp.writeText(json, Charsets.UTF_8)
+            if (profilesFile.exists()) profilesFile.delete()
+            ok = tmp.renameTo(profilesFile)
+        } catch (e: Exception) {
+            android.util.Log.e("StorageManager", "profiles 写文件失败", e)
+            ok = false
+        }
+        prefs.edit().putString("profiles", json).commit()
+        return ok
     }
 
     fun getActiveProfileId(): String {
@@ -67,7 +97,7 @@ class StorageManager(context: Context) {
     }
 
     fun setActiveProfileId(id: String) {
-        prefs.edit().putString("active_profile_id", id).apply()
+        prefs.edit().putString("active_profile_id", id).commit()
     }
 
     fun getActiveProfile(): ApiProfile? {
@@ -84,12 +114,12 @@ class StorageManager(context: Context) {
     private fun migrateIfNeeded() {
         val legacyJson = prefs.getString("conversations", null) ?: return
         try {
-            val legacy: List<Conversation> = gson.fromJson(legacyJson, object : TypeToken<List<Conversation>>() {}.type) ?: return
+            val legacy: Array<Conversation> = gson.fromJson(legacyJson, Array<Conversation>::class.java) ?: return
             for (conv in legacy) {
                 convFile(conv.id).writeText(gson.toJson(conv), Charsets.UTF_8)
             }
-            writeIndex(legacy)
-            prefs.edit().remove("conversations").apply()
+            writeIndex(legacy.toList())
+            prefs.edit().remove("conversations").commit()
         } catch (_: Exception) {}
     }
 
@@ -102,7 +132,9 @@ class StorageManager(context: Context) {
     private fun readIndex(): List<Conversation> {
         if (!indexFile.exists()) return emptyList()
         return try {
-            gson.fromJson(indexFile.readText(Charsets.UTF_8), object : TypeToken<List<Conversation>>() {}.type)
+            // Array 反序列化，不依赖 TypeToken 泛型签名（R8 混淆下 TypeToken 会抛 Missing type parameter）
+            gson.fromJson(indexFile.readText(Charsets.UTF_8), Array<Conversation>::class.java)?.toList()
+                ?: emptyList()
         } catch (_: Exception) { emptyList() }
     }
 
@@ -161,20 +193,20 @@ class StorageManager(context: Context) {
     }
 
     fun setActiveConversationId(id: String) {
-        prefs.edit().putString("active_conv_id", id).apply()
+        prefs.edit().putString("active_conv_id", id).commit()
     }
 
     // 通用偏好（角色选择、开关等 UI 状态持久化）
     fun getStringPref(key: String, default: String): String = prefs.getString(key, default) ?: default
 
     fun setStringPref(key: String, value: String) {
-        prefs.edit().putString(key, value).apply()
+        prefs.edit().putString(key, value).commit()
     }
 
     fun getBoolPref(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
 
     fun setBoolPref(key: String, value: Boolean) {
-        prefs.edit().putBoolean(key, value).apply()
+        prefs.edit().putBoolean(key, value).commit()
     }
 
     // ===== 消息便捷方法 =====
