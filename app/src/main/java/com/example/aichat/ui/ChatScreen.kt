@@ -54,6 +54,7 @@ import com.example.aichat.data.Personas
 import com.example.aichat.data.TaskPlan
 import com.example.aichat.viewmodel.AgentStep
 import com.example.aichat.viewmodel.ChatViewModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.zip.ZipInputStream
@@ -829,7 +830,10 @@ fun ChatScreen(
                             }
                         }
                     }
-                    MessageBubble(message = message)
+                    // 最后一条助手消息：客户端打字机（最终回答已改非流式，观感由这里模拟）
+                    val isLastAssistant = message.role == "assistant" &&
+                        viewModel.messages.lastOrNull { it.role == "assistant" } === message
+                    MessageBubble(message = message, typewriter = isLastAssistant)
                 }
 
                 if (viewModel.isLoading) {
@@ -1040,13 +1044,29 @@ fun ChatScreen(
 }
 
 @Composable
-fun MessageBubble(message: ChatMessage) {
+fun MessageBubble(message: ChatMessage, typewriter: Boolean = false) {
     val isUser = message.role == "user"
     val bubbleColor = if (isUser) {
         MaterialTheme.colorScheme.primaryContainer
     } else {
         MaterialTheme.colorScheme.surfaceVariant
     }
+
+    // 客户端打字机：最终回答是非流式整包返回的，这里按 3 字/帧分批显示模拟流式观感
+    var shownChars by remember(message.timestamp, message.id) {
+        mutableStateOf(if (typewriter) 0 else message.content.length)
+    }
+    LaunchedEffect(message.timestamp, message.id) {
+        if (typewriter && shownChars < message.content.length) {
+            var i = shownChars
+            while (i < message.content.length) {
+                i = minOf(i + 3, message.content.length)
+                shownChars = i
+                delay(16)
+            }
+        }
+    }
+    val displayContent = if (typewriter) message.content.take(shownChars) else message.content
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1079,9 +1099,9 @@ fun MessageBubble(message: ChatMessage) {
                     )
                 }
                 // 文本
-                if (message.content.isNotBlank()) {
+                if (displayContent.isNotBlank()) {
                     Text(
-                        text = message.content,
+                        text = displayContent,
                         modifier = Modifier.padding(12.dp),
                         style = MaterialTheme.typography.bodyMedium
                     )

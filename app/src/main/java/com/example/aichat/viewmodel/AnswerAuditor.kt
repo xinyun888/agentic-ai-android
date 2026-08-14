@@ -28,6 +28,9 @@ object AnswerAuditor {
     private val LUNAR_PATTERN = Regex("""(农历|阴历|腊月|正月|冬月)[^。，,\n]{0,10}(月|日)""")
     private val GANZHI_PATTERN = Regex("""[甲乙丙丁戊己庚辛壬癸][子丑寅卯辰巳午未申酉戌亥]""")
 
+    // 模型声称工具没结果的说法（"工具返回空""无结果"）——上下文缺 tool_result 时模型的典型幻觉借口
+    private val EMPTY_CLAIM_PATTERN = Regex("""(返回空|无结果|空结果|没有返回|没有结果|没结果|返回.*为空)""")
+
     /**
      * @param text 最终答案全文
      * @param steps 本轮（本次 sendMessage 以来）的 AgentStep
@@ -49,6 +52,10 @@ object AnswerAuditor {
         }
         if (!hasDate && (LUNAR_PATTERN.containsMatchIn(text) || GANZHI_PATTERN.containsMatchIn(text))) {
             warnings.add("⚠️ 系统检测：以上日期/干支未经换算工具验证，可能不准确。")
+        }
+        // 模型声称"工具返回空/无结果"，但本轮实际有起卦工具的执行记录 → 描述与事实不符
+        if (hasGua && EMPTY_CLAIM_PATTERN.containsMatchIn(text)) {
+            warnings.add("⚠️ 系统检测：本轮起卦工具实际已返回完整卦象，上述\"返回空/无结果\"的说法与工具实际输出不符。")
         }
 
         return warnings

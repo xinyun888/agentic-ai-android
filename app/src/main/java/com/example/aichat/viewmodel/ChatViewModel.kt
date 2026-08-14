@@ -21,8 +21,6 @@ import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -291,6 +289,56 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ===== 系统自动起卦（第一层治本）=====
+
+    /**
+     * 执行一条 assistant 消息携带的工具调用（循环轮/最终轮共用）：
+     * 保存随调用输出的文本 → 追加 assistant tool_calls → 逐个执行
+     * （含排盘卡/预览/错误追踪/审计步骤记录）→ 追加 tool 结果。
+     * 返回更新后的消息列表。
+     */
+    private suspend fun runToolCalls(
+        msg: Message, myConvId: String, myMsgs: List<ChatMessage>,
+        conversationDtos: MutableList<ChatMessageDto>, consecutiveErrors: MutableMap<String, Int>, round: Int
+    ): List<ChatMessage> {
+        var msgs = myMsgs
+        // 保留模型随工具调用输出的文本
+        if (!msg.content.isNullOrBlank()) {
+            msgs = msgs + ChatMessage(role = "assistant", content = msg.content)
+            commitMessages(myConvId, msgs)
+            conversationDtos.add(ChatMessageDto(role = "assistant", content = msg.content))
+        }
+        // 不要把模型"我来搜索..."之类的闲聊传给 API — 那是噪音
+        conversationDtos.add(ChatMessageDto(role = "assistant", content = null, toolCalls = msg.toolCalls))
+        for (tc in msg.toolCalls.orEmpty()) {
+            val args: Map<String, String> = try {
+                gson.fromJson(tc.function.arguments, GsonTypes.stringStringMap)
+            } catch (e: Exception) { mapOf("_raw" to tc.function.arguments) }
+            withContext(Dispatchers.Main) {
+                appendAgentStep(AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments))
+            }
+            val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication(), myConvId)
+            // 排盘确认卡：提取 bazi_paipan 结果中的 JSON
+            if (tc.function.name == "bazi_paipan") extractPaipanJson(result.content)
+            // 预览检测：build_html 输出
+            handlePreviewIfAny(result.content, tc.function.name == "build_html", myConvId)
+            // 错误追踪
+            val errKey = if (!result.success) "${tc.function.name}:${result.content.take(60)}" else ""
+            if (errKey.isNotBlank()) {
+                consecutiveErrors[errKey] = (consecutiveErrors[errKey] ?: 0) + 1
+            } else {
+                consecutiveErrors.clear()
+            }
+            withContext(Dispatchers.Main) {
+                appendAgentStep(AgentStep(type = "tool_result", toolName = tc.function.name, content = result.content))
+            }
+            conversationDtos.add(ChatMessageDto(role = "tool", content = result.content, toolCallId = tc.id))
+        }
+        // 每轮工具调用后保存断点
+        if (planStateOf(myConvId).phase == PlanPhase.EXECUTING) {
+            saveState(conversationDtos, round, myConvId)
+        }
+        return msgs
+    }
 
     /** 时辰地支：23-1子、1-3丑 … 21-23亥 */
     private fun shichenZhi(hour: Int): String {
@@ -688,7 +736,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         messages = conversationDtos,
                         // Agent 循环：使用 "low" 推理而非 "max" — 对工具决策足够快，
                         // 但仍给模型在行动前思考的机会。
-                        // 最终 SSE 流式回答仍使用 "max" 进行深度推理。
+                        // 最终回答（非流式）仍使用 "max" 进行深度推理。
                         // 陪伴对话不显示思维链
                         reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "low" else null,
                         thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
@@ -717,45 +765,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                     // 只要存在工具调用就必须处理，无论 finishReason 为何
                     if (!msg.toolCalls.isNullOrEmpty()) {
-                        // 保留模型随工具调用输出的文本
-                        if (!msg.content.isNullOrBlank()) {
-                            myMsgs = myMsgs + ChatMessage(role = "assistant", content = msg.content)
-                            commitMessages(myConvId, myMsgs)
-                            conversationDtos.add(ChatMessageDto(role = "assistant", content = msg.content))
-                        }
-                        // 不要把模型"我来搜索..."之类的闲聊传给 API — 那是噪音
-                        conversationDtos.add(ChatMessageDto(role = "assistant", content = null, toolCalls = msg.toolCalls))
-                        for (tc in msg.toolCalls) {
-                            val args: Map<String, String> = try {
-                                gson.fromJson(tc.function.arguments, GsonTypes.stringStringMap)
-                            } catch (e: Exception) { mapOf("_raw" to tc.function.arguments) }
-                            withContext(Dispatchers.Main) {
-                                appendAgentStep(AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments))
-                            }
-                            val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication(), myConvId)
-                            // 排盘确认卡：提取 bazi_paipan 结果中的 JSON
-                            if (tc.function.name == "bazi_paipan") extractPaipanJson(result.content)
-                            // 预览检测：build_html 输出
-                            handlePreviewIfAny(result.content, tc.function.name == "build_html", myConvId)
-                            // 错误追踪
-                            val errKey = if (!result.success) "${tc.function.name}:${result.content.take(60)}" else ""
-                            if (errKey.isNotBlank()) {
-                                consecutiveErrors[errKey] = (consecutiveErrors[errKey] ?: 0) + 1
-                            } else {
-                                consecutiveErrors.clear()
-                            }
-                            withContext(Dispatchers.Main) {
-                                appendAgentStep(AgentStep(type = "tool_result", toolName = tc.function.name, content = result.content))
-                            }
-                            conversationDtos.add(ChatMessageDto(role = "tool", content = result.content, toolCallId = tc.id))
-                        }
-                        // 每轮工具调用后保存断点
-                        if (planStateOf(myConvId).phase == PlanPhase.EXECUTING) {
-                            saveState(conversationDtos, round, myConvId)
-                        }
+                        myMsgs = runToolCalls(msg, myConvId, myMsgs, conversationDtos, consecutiveErrors, round)
                     } else {
-                        // 计划检测：检查模型输出是否包含计划 JSON
                         val textContent = msg.content ?: ""
+                        // 计划检测：检查模型输出是否包含计划 JSON
                         if (planStateOf(myConvId).phase != PlanPhase.EXECUTING && textContent.contains("\"tasks\"")) {
                             val parsed = PlanParser.tryParse(textContent)
                             if (parsed != null) {
@@ -795,165 +808,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         }
 
-                        // 最终答案流式输出
-                        // messages 用 gson.toJsonTree(DTO列表) 与循环请求同一序列化路径，
-                        // 保证两边 JSON 字节一致 → 前缀缓存命中
-                        val streamRequest = mapOf(
-                            "model" to profile.model,
-                            "messages" to gson.toJsonTree(conversationDtos),
-                            // 答案轮不给 tools，工具已在上一轮调完，避免边答边调工具导致截断
-                            "stream" to true
-                        ).let { base ->
-                            val full = base.toMutableMap()
-                            if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) {
-                                full["reasoning_effort"] = if (profile.reasoningLevel == "fast") "low" else "max"
-                                full["thinking"] = mapOf("type" to "enabled")
-                            }
-                            full
-                        }
-
-                        val bodyJson = gson.toJson(streamRequest)
-                        val client = HttpClient.instance
-                        val req = Request.Builder()
-                            .url("${profile.baseUrl.trimEnd('/')}/chat/completions")
-                            .addHeader("Authorization", "Bearer ${profile.apiKey}")
-                            .addHeader("Content-Type", "application/json")
-                            .post(bodyJson.toRequestBody("application/json".toMediaType()))
-                            .build()
-
-                        val streamResp = client.newCall(req).execute()
-                        if (!streamResp.isSuccessful) {
-                            val err = streamResp.body?.string()?.take(200) ?: ""
-                            streamResp.close()
+                        // 最终回答：非流式（"流式+推理+工具"三件套的衔接会丢工具调用，
+                        // 是预告句截断/空包等问题的根源；非流式响应原子返回，彻底规避。
+                        // 打字机观感由 ChatScreen 客户端模拟）
+                        val finalRequest = ChatRequest(
+                            model = profile.model,
+                            messages = conversationDtos,
+                            reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
+                                (if (profile.reasoningLevel == "fast") "low" else "max") else null,
+                            thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
+                                mapOf("type" to "enabled") else null,
+                            tools = gson.fromJson(
+                                ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
+                                GsonTypes.list(GsonTypes.stringAnyMap)
+                            ),
+                            stream = false
+                        )
+                        val fbody = try {
+                            chatCompletion(profile, finalRequest)
+                        } catch (e: ApiHttpException) {
                             withContext(Dispatchers.Main) {
-                                errorMessage = "流式请求失败 ${streamResp.code}: $err"
+                                errorMessage = "API 错误 ${e.code}: ${e.message}\n${e.errorBody}"
                             }
                             return@launch
                         }
-
-                        val reader = BufferedReader(InputStreamReader(streamResp.body!!.byteStream()), 65536)
-                        val textBuf = StringBuilder()
-                        val thinkBuf = StringBuilder()
-                        // 收集流式 tool_calls
-                        val streamToolCalls = mutableMapOf<Int, MutableMap<String, String>>()
-                        // 节流刷新 UI，避免 token 过快导致主线程卡顿（数据不丢，缓冲全量累积）
-                        var lastUiUpdate = 0L
-                        // 流式 finish_reason，检测 length 截断
-                        var streamFinishReason: String? = null
-
-                        reader.useLines { lines ->
-                            lines.forEach { line ->
-                                if (!isActive) return@forEach
-                                if (line.startsWith("data: ") && line.length > 6) {
-                                    val data = line.substring(6).trim()
-                                    if (data == "[DONE]") return@forEach
-                                    try {
-                                        val json = gson.fromJson(data, Map::class.java)
-                                        val choices = json["choices"] as? List<Map<String, Any>>
-                                        val delta = choices?.firstOrNull()?.get("delta") as? Map<String, Any>
-                                        (choices?.firstOrNull()?.get("finish_reason") as? String)?.let {
-                                            if (it.isNotBlank() && it != "null") streamFinishReason = it
-                                        }
-                                        // 最后一条 data 带 usage（DeepSeek 流式）
-                                        (json["usage"] as? Map<String, Any>)?.let { u ->
-                                            val p = (u["prompt_tokens"] as? Double)?.toLong() ?: 0
-                                            val c = (u["completion_tokens"] as? Double)?.toLong() ?: 0
-                                            val h = (u["prompt_cache_hit_tokens"] as? Double)?.toLong() ?: 0
-                                            val m = (u["prompt_cache_miss_tokens"] as? Double)?.toLong() ?: 0
-                                            UsageMeter.record(p, c, h, m)
-                                        }
-                                        val rc = delta?.get("reasoning_content") as? String
-                                        val tc = unescapeUnicode(delta?.get("content") as? String)
-                                        if (!rc.isNullOrBlank()) thinkBuf.append(rc)
-                                        if (!tc.isNullOrBlank()) textBuf.append(tc)
-                                        // 流式工具调用
-                                        val tcs = delta?.get("tool_calls") as? List<Map<String, Any>>
-                                        if (!tcs.isNullOrEmpty()) {
-                                            for (t in tcs) {
-                                                val idx = (t["index"] as? Double)?.toInt() ?: 0
-                                                val fn = t["function"] as? Map<String, Any> ?: continue
-                                                val entry = streamToolCalls.getOrPut(idx) { mutableMapOf("name" to "", "arguments" to "") }
-                                                (fn["name"] as? String)?.let { entry["name"] = entry["name"] + it }
-                                                (fn["arguments"] as? String)?.let { entry["arguments"] = entry["arguments"] + it }
-                                            }
-                                        }
-                                        // 节流刷新 UI，避免主线程被淹没
-                                        val nowMs = System.currentTimeMillis()
-                                        if (nowMs - lastUiUpdate >= 80) {
-                                            lastUiUpdate = nowMs
-                                            myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
-                                                id = "live",
-                                                role = "assistant_live",
-                                                content = textBuf.toString(),
-                                                thinking = thinkBuf.toString()
-                                            )
-                                            if (myConvId == currentConvId) {
-                                                withContext(Dispatchers.Main) { messages = myMsgs }
-                                            }
-                                        }
-                                    } catch (_: Exception) {}
-                                }
-                            }
+                        fbody.usage?.let { u ->
+                            UsageMeter.record(u.promptTokens, u.completionTokens, u.cacheHitTokens, u.cacheMissTokens)
                         }
-                        streamResp.close()
+                        val fmsg = fbody.choices.firstOrNull()?.message ?: continue
 
-                        // 流式返回工具调用则执行并继续
-                        if (streamToolCalls.isNotEmpty()) {
-                            // 先保存本轮已输出的文本/思考，否则会被吞掉
-                            val partialText = textBuf.toString()
-                            val partialThink = thinkBuf.toString()
-                            if (partialText.isNotBlank() || partialThink.isNotBlank()) {
-                                myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
-                                    role = "assistant",
-                                    content = partialText,
-                                    thinking = partialThink
-                                )
-                                commitMessages(myConvId, myMsgs)
-                                conversationDtos.add(ChatMessageDto(role = "assistant", content = partialText))
-                            }
-                            val calls = streamToolCalls.entries.sortedBy { it.key }.mapIndexed { i, (_, m) ->
-                                val rawArgs = m["arguments"] ?: "{}"
-                                val parsedArgs: Map<String, String> = try {
-                                    gson.fromJson(rawArgs, GsonTypes.stringStringMap)
-                                } catch (e: Exception) { mapOf("_raw" to rawArgs) }
-                                com.example.aichat.data.tools.ToolCall(
-                                    id = "stream_${System.currentTimeMillis()}_$i",
-                                    name = m["name"] ?: "",
-                                    arguments = parsedArgs
-                                )
-                            }
-                            // 工具运行期间保持消息显示
-                            conversationDtos.add(ChatMessageDto(
-                                role = "assistant", content = null,
-                                toolCalls = calls.map { ToolCallDto(
-                                    id = it.id, type = "function",
-                                    function = ToolCallFunctionDto(name = it.name, arguments = gson.toJson(it.arguments))
-                                )}
-                            ))
-                            for (tc in calls) {
-                                withContext(Dispatchers.Main) {
-                                    appendAgentStep(AgentStep(type = "tool_call", toolName = tc.name, toolArgs = gson.toJson(tc.arguments)))
-                                }
-                                val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.name, arguments = tc.arguments), getApplication(), myConvId)
-                                if (tc.name == "bazi_paipan") extractPaipanJson(result.content)
-                                handlePreviewIfAny(result.content, tc.name == "build_html", myConvId)
-                                withContext(Dispatchers.Main) {
-                                    appendAgentStep(AgentStep(type = "tool_result", toolName = tc.name, content = result.content))
-                                }
-                                conversationDtos.add(ChatMessageDto(role = "tool", content = result.content, toolCallId = tc.id))
-                            }
-                            if (planPhase == PlanPhase.EXECUTING) saveState(conversationDtos, round, myConvId)
+                        // 最终轮模型仍想调工具 → 走与循环轮完全相同的执行路径
+                        if (!fmsg.toolCalls.isNullOrEmpty()) {
+                            myMsgs = runToolCalls(fmsg, myConvId, myMsgs, conversationDtos, consecutiveErrors, round)
+                            finishReason = null
                             continue
                         }
 
+                        val finalText = fmsg.content ?: ""
+                        val finalThink = fmsg.reasoningContent ?: ""
+                        // 空答案保护：任何情况下都不落盘空消息（服务端出幺蛾子时兜底）
+                        val display = if (finalText.isBlank()) "⚠️ 本轮未生成回答，请重试。" else finalText
+
                         // 用 NonCancellable 收尾，避免退到后台时丢失消息
                         withContext(NonCancellable + Dispatchers.Main) {
-                            val finalText = textBuf.toString()
-                            val finalThink = thinkBuf.toString()
                             val paipan = pendingPaipanJson
                             pendingPaipanJson = null
                             // 审计 + 溯源：伪造卦象/日期会被打标；溯源标签随消息落盘
-                            val (auditedText, badges) = finalizeAnswer(finalText, stepBaseline)
+                            val (auditedText, badges) = finalizeAnswer(display, stepBaseline)
                             myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                 role = "assistant",
                                 content = auditedText,
@@ -964,18 +865,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             commitMessages(myConvId, myMsgs)
                         }
                         // API 上下文里保持原文（审计标注只给用户看，不进上下文）
-                        conversationDtos.add(ChatMessageDto(role = "assistant", content = textBuf.toString()))
+                        conversationDtos.add(ChatMessageDto(role = "assistant", content = display))
                         finishReason = "stop"
 
-                        // length 说明被 max_tokens 截断，自动续写
-                        if (streamFinishReason == "length" && isActive && continuationRetries < 2) {
+                        // length 说明被 max_tokens 截断，自动续写（非流式 finish_reason 同样返回 length）
+                        if (fbody.choices.firstOrNull()?.finishReason == "length" && isActive && continuationRetries < 2) {
                             continuationRetries++
-                            // 先回滚被截断的消息，续写直接替换它
-                            val lastMsg = myMsgs.lastOrNull { it.role == "assistant" }
-                            if (lastMsg != null) {
-                                myMsgs = myMsgs.filterNot { it.content == lastMsg.content && it.timestamp == lastMsg.timestamp }
-                                commitMessages(myConvId, myMsgs)
-                            }
                             conversationDtos.add(ChatMessageDto(role = "system",
                                 content = "上一条回复因长度限制被截断。请从中断处继续输出，直到完整结束，不要重复已写过的内容。"))
                             finishReason = null
@@ -1017,23 +912,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-    }
-
-    /** 将 \uXXXX unicode 转义和常见 HTML 实体解码为实际字符 */
-    private fun unescapeUnicode(input: String?): String? {
-        if (input == null || !input.contains("\\u")) return input
-        return try {
-            val sb = StringBuffer()
-            val m = Regex("\\\\u([0-9a-fA-F]{4})").findAll(input)
-            var lastEnd = 0
-            for (match in m) {
-                sb.append(input.substring(lastEnd, match.range.first))
-                sb.append(match.groupValues[1].toInt(16).toChar())
-                lastEnd = match.range.last + 1
-            }
-            sb.append(input.substring(lastEnd))
-            sb.toString()
-        } catch (_: Exception) { input }
     }
 
     /** 非流式对话请求：直接 OkHttp + Gson 具体类解析。
@@ -1083,6 +961,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 ⑧ **对话隔离**：工作区和记忆都按对话隔离。write_file / build_html 保存文件时，写到 workspace/${if (myConvId.isBlank()) "" else sanitize(myConvId) + "/"} 目录下（你的专属目录）。默认只查看工作区中本对话的文件。如果用户主动要求查看其他对话或全局文件，可以用 read_file 读取完整路径。
 ⑨ **工具调用纪律**：需要计算、执行代码、搜索、读写文件时，直接发出工具调用（function calling），系统会自动执行并把结果返回给你。禁止把工具调用、代码、JSON 结构写进你的回答文本——回答里只放最终结论。禁止假装执行（如"我用Python算了一下结果是X"）——没调用工具就是没算。
 ⑫ **连贯完成任务（硬性）**：需要工具时直接发出 function calling，系统自动执行，禁止把"我要调用工具""接下来用python计算"这类过程描述写进回答文本——用户只看到最终答案。工具结果返回后，**必须继续完成用户的完整请求**：如果任务需要多步工具（如排盘→分析→交叉验证→总结），就连续调用直到全部完成，最后一次性输出完整的最终答案。禁止工具执行完只输出"已排盘完成""工具执行成功"之类的短句就结束——那等于没完成任务。
+⑬ **直接调用，禁止预告后停住（硬性）**：需要工具时立即输出 function call，禁止只输出"接下来我要调用工具"之类的预告文字后结束。若发现上一条回复只有预告、没有实际调用，本轮必须直接输出 function call。
 ⑩ **约定识别**：当用户提到未来的约定或承诺（"一会儿""等下""晚上""明天""下周"+要做的事）时，立即用 memory_save 记录。key 格式"约定-xxx"，content 必须写明：约定内容 + 约定时间（参照"## 当前时间"推算）。这样即使过很久，你也能在约定的时间提起它。
 
 ${PlanParser.planInstruction()}
