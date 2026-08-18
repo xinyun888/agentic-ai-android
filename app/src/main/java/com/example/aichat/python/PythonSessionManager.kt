@@ -103,6 +103,7 @@ class PythonSessionManager(private val context: Context) {
 
     fun closeSession(sessionId: String) {
         sessions.remove(sessionId)
+        lastAccess.remove(sessionId)
     }
 
     // --- 私有辅助函数 ---
@@ -160,18 +161,18 @@ __result__ = (_out.getvalue(), _err.getvalue())
         return ScriptResult(out, err)
     }
 
-    private fun getOrCreateSession(py: Python, id: String): PyObject {
+    private fun getOrCreateSession(py: Python, id: String): PyObject = synchronized(sessions) {
         lastAccess[id] = System.currentTimeMillis()
-        return sessions.getOrPut(id) {
-            evictIfNeeded(id)
-            val wsDir = File(context.filesDir, "workspace").also { it.mkdirs() }
-            val wsAbs = wsDir.absolutePath
+        val existing = sessions[id]
+        if (existing != null) return existing
 
-            // 创建 dict 作为会话命名空间
-            val ns = py.getModule("builtins").callAttr("dict")
+        evictIfNeeded(id)
 
-            // 注入上下文桥
-            py.getModule("builtins").callAttr("exec", """
+        // 创建 dict 作为会话命名空间
+        val ns = py.getModule("builtins").callAttr("dict")
+
+        // 注入上下文桥
+        py.getModule("builtins").callAttr("exec", """
 import os as _os
 
 def _ctx_read(p):
@@ -194,9 +195,9 @@ context = type('_Ctx', (), {
     'write': staticmethod(_ctx_write),
     'list_files': staticmethod(_ctx_list)
 })()
-            """.trimIndent(), ns)
-            ns
-        }
+        """.trimIndent(), ns)
+        sessions[id] = ns
+        ns
     }
 
     // 淘汰最久未访问的会话（当前会话除外），保持内存有界

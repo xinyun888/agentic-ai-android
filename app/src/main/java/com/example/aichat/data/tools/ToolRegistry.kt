@@ -57,13 +57,17 @@ class Workspace(private val context: Context) {
         get() = File(context.filesDir, "workspace").also { it.mkdirs() }
 
     fun resolve(path: String): File {
-        val clean = path.trimStart('/').replace("..", "")
+        // 统一正斜杠、去掉前导 / 和所有 .. 段，避免路径穿越到 workspace 外
+        val normalized = path.replace('\\', '/').trimStart('/')
+        val clean = normalized.split('/')
+            .filter { it.isNotBlank() && it != "." && it != ".." }
+            .joinToString("/")
         return File(root, clean)
     }
 
-    fun list(): String {
+    fun list(dir: File = root): String {
         val sb = StringBuilder()
-        listRecursive(root, "", sb)
+        listRecursive(dir, "", sb)
         return sb.toString().ifEmpty { "工作区为空" }
     }
 
@@ -107,14 +111,36 @@ class ReadFileTool : Tool {
         return try {
             val content = when {
                 file.extension.lowercase() == "docx" -> readDocx(file)
-                file.length() > 500 * 1024 -> "文件过大 (${file.length() / 1024}KB)，请用 offset/limit 分段读取:\n" +
-                        file.readText().substring(offset, minOf(offset + limit, file.length().toInt()))
-                else -> file.readText().substring(offset, minOf(offset + limit, file.length().toInt()))
+                else -> readTextChunk(file, offset, limit)
             }
             ToolResult("", true, content)
         } catch (e: Exception) {
             ToolResult("", false, "读取失败: ${e.message}")
         }
+    }
+
+    /** 按字符偏移读取文本片段，避免大文件一次性读入内存 */
+    private fun readTextChunk(file: File, offset: Int, limit: Int): String {
+        val sb = StringBuilder(minOf(limit, 8192))
+        file.inputStream().reader(Charsets.UTF_8).use { r ->
+            var skipped = 0
+            while (skipped < offset) {
+                val n = r.skip((offset - skipped).toLong())
+                if (n <= 0) break
+                skipped += n.toInt()
+            }
+            val buf = CharArray(minOf(limit, 8192))
+            var total = 0
+            var read = r.read(buf)
+            while (read > 0 && total < limit) {
+                val take = minOf(read, limit - total)
+                sb.append(buf, 0, take)
+                total += take
+                if (total >= limit) break
+                read = r.read(buf)
+            }
+        }
+        return sb.toString()
     }
 
     private fun readDocx(file: File): String {
@@ -198,12 +224,18 @@ class DeleteFileTool : Tool {
 class ListFilesTool : Tool {
     override val definition = ToolDef(
         name = "list_files",
-        description = "列出工作区中的所有文件",
+        description = "列出当前对话工作区中的文件",
         parameters = mapOf("type" to "object", "properties" to emptyMap<String, Any>())
     )
 
-    override suspend fun execute(args: Map<String, String>, context: Context): ToolResult {
-        return ToolResult("", true, Workspace(context).list())
+    override suspend fun execute(args: Map<String, String>, context: Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: Context, convId: String): ToolResult {
+        val root = java.io.File(context.filesDir, "workspace").also { it.mkdirs() }
+        val dir = if (convId.isBlank()) root
+                  else java.io.File(root, convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")).also { it.mkdirs() }
+        return ToolResult("", true, Workspace(context).list(dir))
     }
 }
 
@@ -228,26 +260,27 @@ class WebFetchTool : Tool {
                 .header("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
                 .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
                 .build()
-            val response = client.newCall(request).execute()
-            val html = response.body?.string() ?: ""
-            // 先尝试提取有意义的内容
-            val text = extractArticleText(html)
-                .takeIf { it.length > 100 }
-                ?: html
-                    .replace(Regex("<script[^>]*>.*?</script>", RegexOption.DOT_MATCHES_ALL), "")
-                    .replace(Regex("<style[^>]*>.*?</style>", RegexOption.DOT_MATCHES_ALL), "")
-                    .replace(Regex("<nav[^>]*>.*?</nav>", RegexOption.DOT_MATCHES_ALL), "")
-                    .replace(Regex("<footer[^>]*>.*?</footer>", RegexOption.DOT_MATCHES_ALL), "")
-                    .replace(Regex("<[^>]+>"), " ")
-                    .replace(Regex("&[a-z]+;")) { match ->
-                        when (match.value) {
-                            "&amp;" -> "&"; "&lt;" -> "<"; "&gt;" -> ">"
-                            "&quot;" -> "\""; "&nbsp;" -> " "
-                            "&#x27;" -> "'"; else -> match.value
+            client.newCall(request).execute().use { response ->
+                val html = response.body?.string() ?: ""
+                // 先尝试提取有意义的内容
+                val text = extractArticleText(html)
+                    .takeIf { it.length > 100 }
+                    ?: html
+                        .replace(Regex("<script[^>]*>.*?</script>", RegexOption.DOT_MATCHES_ALL), "")
+                        .replace(Regex("<style[^>]*>.*?</style>", RegexOption.DOT_MATCHES_ALL), "")
+                        .replace(Regex("<nav[^>]*>.*?</nav>", RegexOption.DOT_MATCHES_ALL), "")
+                        .replace(Regex("<footer[^>]*>.*?</footer>", RegexOption.DOT_MATCHES_ALL), "")
+                        .replace(Regex("<[^>]+>"), " ")
+                        .replace(Regex("&[a-z]+;")) { match ->
+                            when (match.value) {
+                                "&amp;" -> "&"; "&lt;" -> "<"; "&gt;" -> ">"
+                                "&quot;" -> "\""; "&nbsp;" -> " "
+                                "&#x27;" -> "'"; else -> match.value
+                            }
                         }
-                    }
-                    .replace(Regex("\\s+"), " ").trim()
-            ToolResult("", true, text.take(20000) + if (text.length > 20000) "\n\n(... 内容已截断至20000字符)" else "")
+                        .replace(Regex("\\s+"), " ").trim()
+                ToolResult("", true, text.take(20000) + if (text.length > 20000) "\n\n(... 内容已截断至20000字符)" else "")
+            }
         } catch (e: Exception) {
             ToolResult("", false, "抓取失败: ${e.message}")
         }
@@ -295,8 +328,8 @@ class RegexTool : Tool {
                 results.add(groups.joinToString(" | "))
             }
             val output = if (results.isEmpty()) "未找到匹配"
-            else results.take(50).joinToString("\n").let {
-                if (results.size > 50) "$it\n... (共 ${results.size} 条，只显示前 50)" else it
+            else results.take(30).joinToString("\n").let {
+                if (results.size > 30) "$it\n... (共 ${results.size} 条，只显示前 30)" else it
             }
             ToolResult("", true, output)
         } catch (e: Exception) {
@@ -396,6 +429,9 @@ class HttpTool : Tool {
         val url = args["url"] ?: return ToolResult("", false, "缺少 url 参数")
         return try {
             val method = (args["method"] ?: "GET").uppercase()
+            if (method !in setOf("GET", "POST", "PUT", "DELETE")) {
+                return ToolResult("", false, "不支持的 HTTP 方法: $method（仅支持 GET/POST/PUT/DELETE）")
+            }
             val body = args["body"]
             val builder = Request.Builder().url(url)
                 .header("User-Agent", "Mozilla/5.0")
@@ -406,9 +442,10 @@ class HttpTool : Tool {
             }
             val request = builder.build()
             val client = HttpClient.shortTimeout
-            val response = client.newCall(request).execute()
-            val respBody = response.body?.string()?.take(5000) ?: ""
-            ToolResult("", true, "HTTP ${response.code}\n$respBody")
+            client.newCall(request).execute().use { response ->
+                val respBody = response.body?.string()?.take(5000) ?: ""
+                ToolResult("", true, "HTTP ${response.code}\n$respBody")
+            }
         } catch (e: Exception) {
             ToolResult("", false, "请求失败: ${e.message}")
         }
@@ -436,11 +473,13 @@ class BuildHtmlTool : Tool {
         val filename = args["filename"] ?: return ToolResult("", false, "缺少 filename")
         val html = args["html"] ?: return ToolResult("", false, "缺少 html")
         val title = args["title"] ?: filename
-        val workspaceDir = java.io.File(context.filesDir, "workspace").also { it.mkdirs() }
-        val file = java.io.File(workspaceDir, filename)
+        val workspaceRoot = java.io.File(context.filesDir, "workspace").also { it.mkdirs() }
+        val file = Workspace(context).resolve(filename)
+        file.parentFile?.mkdirs()
+        val relPath = file.relativeTo(workspaceRoot).path.replace('\\', '/')
         try {
             file.writeText(html, Charsets.UTF_8)
-            return ToolResult("", true, "{\"type\":\"preview\",\"file\":\"$filename\",\"title\":\"$title\"}\n✓ 页面已保存并可在预览面板查看: workspace/$filename")
+            return ToolResult("", true, "{\"type\":\"preview\",\"file\":\"$relPath\",\"title\":\"$title\"}\n✓ 页面已保存并可在预览面板查看: workspace/$relPath")
         } catch (e: Exception) {
             return ToolResult("", false, "保存失败: ${e.message}")
         }
@@ -707,12 +746,16 @@ class GuaYaoTool : Tool {
         parameters = mapOf(
             "type" to "object",
             "properties" to mapOf(
-                "method" to mapOf("type" to "string", "description" to "起卦方法：liuyao(六爻摇卦) / meihua(梅花易数) / xiaoliuren(小六壬)"),
+                "method" to mapOf("type" to "string", "description" to "起卦方法：liuyao(六爻摇卦) / meihua(梅花易数) / xiaoliuren(小六壬) / random(梅花随机/外应起卦)"),
                 "question" to mapOf("type" to "string", "description" to "所问之事，如'问感情''问事业'（可选）"),
                 "year" to mapOf("type" to "string", "description" to "农历年地支（梅花需要，如'酉'），不传用当前年"),
                 "month" to mapOf("type" to "string", "description" to "农历月（梅花、小六壬需要，如'六月'）"),
                 "day" to mapOf("type" to "string", "description" to "农历日（梅花、小六壬需要，如'廿九'）"),
-                "hour" to mapOf("type" to "string", "description" to "农历时辰（梅花、小六壬需要，如'戌时'）")
+                "hour" to mapOf("type" to "string", "description" to "农历时辰（梅花、小六壬需要，如'戌时'）"),
+                "material" to mapOf("type" to "string", "description" to "随机/外应起卦材料：你当下看到、想到的数字、文字或事物，如'看到路边3棵树、手机尾号8866'"),
+                "num1" to mapOf("type" to "string", "description" to "报数起卦第一个数（随机/外应梅花用，可选）"),
+                "num2" to mapOf("type" to "string", "description" to "报数起卦第二个数（随机/外应梅花用，可选）"),
+                "num3" to mapOf("type" to "string", "description" to "报数起卦第三个数，决定动爻（随机/外应梅花用，可选）")
             ),
             "required" to listOf("method")
         )
@@ -724,10 +767,12 @@ class GuaYaoTool : Tool {
             val question = args["question"]?.trim().orEmpty()
             val q = if (question.isNotBlank()) "问：$question\n" else ""
             when (method) {
-                "liuyao", "六爻" -> ToolResult("", true, q + liuyao())
+                "liuyao", "六爻", "随机六爻" -> ToolResult("", true, q + liuyao())
                 "meihua", "梅花", "梅花易数" -> ToolResult("", true, q + meihua(args))
                 "xiaoliuren", "小六壬" -> ToolResult("", true, q + xiaoliuren(args))
-                else -> ToolResult("", false, "未知起卦方法: $method（可选 liuyao/六爻、meihua/梅花易数、xiaoliuren/小六壬）")
+                "random", "随机", "外应", "waiying", "随机梅花", "梅花随机" ->
+                    ToolResult("", true, q + meihuaRandom(args))
+                else -> ToolResult("", false, "未知起卦方法: $method（可选 liuyao/六爻、meihua/梅花易数、xiaoliuren/小六壬、random/随机外应）")
             }
         } catch (e: Exception) {
             ToolResult("", false, "起卦失败: ${e.message}")
@@ -736,8 +781,10 @@ class GuaYaoTool : Tool {
 
     private fun liuyao(): String {
         // 六爻：掷三枚铜钱六次。概率按三枚铜钱：老阴(6)1/8、少阳(7)3/8、少阴(8)3/8、老阳(9)1/8
+        // 使用 SecureRandom 真随机，避免可预测的伪随机/时间种子
+        val random = java.security.SecureRandom()
         val yao = IntArray(6) {
-            when (kotlin.random.Random.nextInt(8)) {
+            when (random.nextInt(8)) {
                 0 -> 6
                 1, 2, 3 -> 7
                 4, 5, 6 -> 8
@@ -856,6 +903,82 @@ class GuaYaoTool : Tool {
             append("体卦：$ti  用卦：$yong\n")
             append("（请结合体用生克、卦辞与动爻爻辞解读所问之事）")
         }
+    }
+
+    /** 梅花随机/外应起卦：可用报数、所见材料文字，或 SecureRandom 真随机 */
+    private fun meihuaRandom(args: Map<String, String>): String {
+        val random = java.security.SecureRandom()
+        val num1 = args["num1"]?.trim()?.toIntOrNull()
+        val num2 = args["num2"]?.trim()?.toIntOrNull()
+        val num3 = args["num3"]?.trim()?.toIntOrNull()
+        val material = args["material"]?.trim().orEmpty()
+
+        val (n1, n2, n3) = when {
+            num1 != null && num2 != null -> Triple(num1, num2, num3 ?: (random.nextInt(99) + 1))
+            material.isNotBlank() -> numbersFromMaterial(material)
+            else -> Triple(
+                random.nextInt(99) + 1,
+                random.nextInt(99) + 1,
+                random.nextInt(99) + 1
+            )
+        }
+
+        val upRaw = ((n1 - 1) % 8) + 1
+        val downRaw = ((n2 - 1) % 8) + 1
+        val dongPos = ((n3 - 1) % 6) + 1
+        val upIdx = upRaw - 1
+        val downIdx = downRaw - 1
+        val benGua = LIU_SHI_SI[upIdx * 8 + downIdx]
+        val benYao = triYang(downIdx) + triYang(upIdx)
+
+        val huXia = triToIndex(benYao.substring(1, 4))
+        val huShang = triToIndex(benYao.substring(2, 5))
+        val huGua = LIU_SHI_SI[huShang * 8 + huXia]
+
+        val bianArr = benYao.toCharArray()
+        bianArr[dongPos - 1] = if (bianArr[dongPos - 1] == '阳') '阴' else '阳'
+        val bianStr = String(bianArr)
+        val bianGua = guaName(bianStr)
+
+        val ti = if (dongPos <= 3) "下卦${BA_GUA[downIdx]}" else "上卦${BA_GUA[upIdx]}"
+        val yong = if (dongPos <= 3) "上卦${BA_GUA[upIdx]}" else "下卦${BA_GUA[downIdx]}"
+
+        return buildString {
+            append("梅花易数（随机/外应起卦）：\n")
+            append("起卦数：$n1、$n2、$n3\n")
+            append("上卦：${BA_GUA[upIdx]}  下卦：${BA_GUA[downIdx]}  动爻：第${dongPos}爻\n")
+            append("本卦：$benGua\n")
+            append("互卦：$huGua\n")
+            append("变卦：$bianGua\n")
+            append("体卦：$ti  用卦：$yong\n")
+            append("（请结合体用生克、卦辞与动爻爻辞解读所问之事）")
+        }
+    }
+
+    /** 从外应材料里提取起卦数：优先取文本中的数字，其次用文本编码生成 */
+    private fun numbersFromMaterial(material: String): Triple<Int, Int, Int> {
+        val digits = Regex("\\d+").findAll(material)
+            .map { it.value.toIntOrNull() }
+            .filterNotNull()
+            .toList()
+        if (digits.size >= 2) {
+            val n1 = digits[0]
+            val n2 = digits[1]
+            val n3 = if (digits.size >= 3) digits[2] else (material.length % 99 + 1)
+            return Triple(n1, n2, n3)
+        }
+        val text = material.filter { it.isLetterOrDigit() }
+        if (text.isEmpty()) {
+            val r = java.security.SecureRandom()
+            return Triple(r.nextInt(99) + 1, r.nextInt(99) + 1, r.nextInt(99) + 1)
+        }
+        val half = (text.length / 2).coerceAtLeast(1)
+        val first = text.substring(0, half)
+        val second = text.substring(half)
+        val n1 = first.sumOf { it.code } % 99 + 1
+        val n2 = second.sumOf { it.code } % 99 + 1
+        val n3 = text.length % 99 + 1
+        return Triple(n1, n2, n3)
     }
 
     // 八卦索引 -> 三爻阴阳字符串（下到上）
@@ -1176,7 +1299,7 @@ object ToolRegistry {
     private enum class Gate { KEEP, COMPACT, SPILL }
 
     private fun gateFor(name: String): Gate = when (name) {
-        "get_time", "gua_yao", "regex", "memory_save", "memory_load",
+        "get_time", "gua_yao", "run_regex", "memory_save", "memory_load",
         "clipboard_write", "share_text", "session_close", "date_convert",
         "delete_file", "write_file" -> Gate.KEEP
         "python_exec", "bazi_paipan", "list_files" -> Gate.COMPACT
@@ -1204,7 +1327,7 @@ object ToolRegistry {
         }
         val policy = gateFor(name)
         if (policy == Gate.KEEP) return result
-        val limit = if (policy == Gate.COMPACT) 12000 else 4000
+        val limit = if (policy == Gate.COMPACT) 8000 else 3000
         if (result.content.length <= limit) return result
 
         // 语义边界切割：优先段落边界，其次行边界，不切表格行
@@ -1223,7 +1346,7 @@ object ToolRegistry {
             if (convId.isBlank()) File(root, ".tool_outputs")
             else File(root, "${convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")}/.tool_outputs")
         }.also { it.mkdirs() }
-        val fileName = "tool_${System.currentTimeMillis()}.txt"
+        val fileName = "tool_${java.util.UUID.randomUUID()}.txt"
         try { File(spillDir, fileName).writeText(result.content) } catch (_: Exception) {}
         val pointer = if (convId.isBlank()) ".tool_outputs/$fileName"
             else "${convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")}/.tool_outputs/$fileName"
@@ -1240,8 +1363,7 @@ object ToolRegistry {
     // 命理师工具子集：只下发命理相关的工具，减少模型选择负担与 token
     private val FORTUNE_TOOLS = setOf(
         "python_exec", "session_close", "bazi_paipan", "date_convert", "gua_yao",
-        "memory_save", "memory_load", "read_file", "write_file", "list_files",
-        "web_fetch", "regex", "get_time"
+        "memory_save", "memory_load", "get_time"
     )
 
     fun toolCallsToJson(personaId: String = "", screenAvailable: Boolean = false): String = gson.toJson(

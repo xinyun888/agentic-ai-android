@@ -85,6 +85,7 @@ class ActiveModeService : Service() {
     override fun onCreate() {
         super.onCreate()
         createChannel()
+        com.example.aichat.data.UsageMeter.init(this)
         // 恢复持久化配置，进程被杀后由闹钟拉起时能继续心跳
         loadConfigsFromPrefs()
     }
@@ -176,12 +177,16 @@ class ActiveModeService : Service() {
             personaConvs[personaId] = convId
         }
 
-        val persona = Personas.getById(personaId)
+        val persona = Personas.getByIdWithCustom(personaId, this)
         val fullName = "${persona.emoji} ${persona.name}"
 
         // 每个角色独立的前台通知 id
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
-        startForeground(fgId, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · 每轮心跳写回对话", fgId))
+        try {
+            startForeground(fgId, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · 每轮心跳写回对话", fgId))
+        } catch (_: Exception) {
+            // 前台服务启动失败时不阻断配置保存，后续闹钟仍可尝试拉起
+        }
 
         // 持久化配置，进程被杀后闹钟拉起时能恢复
         configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
@@ -195,7 +200,7 @@ class ActiveModeService : Service() {
     private fun handleHeartbeat(personaId: String) {
         val cfg = configs[personaId] ?: return
         if (personaId !in runningPersonas) return
-        val persona = Personas.getById(personaId)
+        val persona = Personas.getByIdWithCustom(personaId, this)
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
         val fullName = "${persona.emoji} ${persona.name}"
 
@@ -229,6 +234,7 @@ class ActiveModeService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun stopHeartbeat(personaId: String) {
         jobs.remove(personaId)?.cancel()
         cancelAlarm(personaId)
@@ -236,6 +242,11 @@ class ActiveModeService : Service() {
         saveConfigsToPrefs()
         runningPersonas.remove(personaId)
         personaConvs.remove(personaId)?.let { runningConversations.remove(it) }
+        // 最后一个角色停止后，前台服务没有继续存在的必要
+        if (runningPersonas.isEmpty()) {
+            stopForeground(true)
+            stopSelf()
+        }
     }
 
     private suspend fun doHeartbeat(persona: Persona, convId: String, immersive: Boolean, showThinking: Boolean): String {
@@ -270,14 +281,32 @@ class ActiveModeService : Service() {
         val memDir = if (convId.isBlank()) File(filesDir, "memory")
                      else File(File(filesDir, "memory"), convId.replace(Regex("[^a-zA-Z0-9_-]"), "_")).also { it.mkdirs() }
 
+        // 极简/沉浸模式给不同的思维链协议：让思考方式本质不同，而不是只靠 max_tokens 决定长短
+        // 统一要求“第一人称强判断”，避免普通模式出现“让我先/我来”这类偏弱的开头
+        val thinkingStyle = if (immersive) {
+            when (profile.reasoningLevel) {
+                "fast" -> "\n\n直接以第一人称进入推理，禁止“让我先/我来”开头。按“问题本质 → 关键依据 → 结论”输出简洁强判断。"
+                "deep" -> "\n\n直接以第一人称进入推理，禁止“让我先/我来”开头。按“问题本质 → 假设 → 验证 → 多角度分析 → 结论与风险”输出完整强判断。"
+                else -> "\n\n直接以第一人称进入推理，禁止“让我先/我来”开头。按“问题 → 关键依据 → 推理 → 结论”输出，先判断再依据。"
+            }
+        } else {
+            "\n\n直接以第一人称极简推理：问题本质 → 关键依据 → 结论。禁止“让我先/我来”开头，保持强判断。"
+        }
+
         if (immersive) {
-            messages.add(ChatMessageDto(role = "system", content = persona.prompt))
+            messages.add(ChatMessageDto(role = "system", content = persona.prompt + thinkingStyle))
             val memFile = File(memDir, "memory.md")
             if (memFile.exists()) memFile.readText().take(1500).let {
                 if (it.isNotBlank()) messages.add(ChatMessageDto(role = "system", content = "长期记忆：\n$it"))
             }
+            // 沉浸模式也必须带最近对话上下文，否则只有人设没有聊天记忆，反而比极简模式弱
+            val conv = convId.ifBlank { null }?.let { StorageManager(this).getConversation(it) }
+            val lastMsgs = conv?.messages?.filter { it.role != "system" }?.takeLast(8)
+            lastMsgs?.forEach {
+                messages.add(ChatMessageDto(role = it.role, content = it.content))
+            }
         } else {
-            messages.add(ChatMessageDto(role = "system", content = persona.heartbeatPrompt()))
+            messages.add(ChatMessageDto(role = "system", content = persona.heartbeatPrompt() + thinkingStyle))
             val memFile = File(memDir, "memory.md")
             if (memFile.exists()) memFile.readText().take(400).let {
                 if (it.isNotBlank()) messages.add(ChatMessageDto(role = "system", content = "记忆：$it"))
@@ -328,18 +357,24 @@ class ActiveModeService : Service() {
             "max_tokens" to if (immersive) 512 else 350,
             "stream" to false
         )
+        bodyMap["reasoning_effort"] = when (profile.reasoningLevel) {
+            "fast" -> "low"
+            "deep" -> "max"
+            else -> "medium"
+        }
         if (showThinking) bodyMap["thinking"] = mapOf("type" to "enabled")
         val bodyJson = gson.toJson(bodyMap)
-        val response = try {
+        val bodyStr = try {
             client.newCall(Request.Builder()
-                .url("${profile.baseUrl}/chat/completions")
+                .url("${profile.baseUrl.trim().trimEnd('/')}/chat/completions")
                 .post(bodyJson.toRequestBody("application/json".toMediaType()))
                 .header("Authorization", "Bearer ${profile.apiKey}")
-                .build()).execute()
+                .build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use ""
+                    resp.body?.string() ?: return@use ""
+                }
         } catch (_: Exception) { return "" }
-
-        val bodyStr = response.body?.string() ?: return ""
-        response.close()
+        if (bodyStr.isBlank()) return ""
         val json = try { gson.fromJson(bodyStr, Map::class.java) as? Map<*, *> } catch (_: Exception) { return "" } ?: return ""
         // 心跳请求也计入用量
         try {

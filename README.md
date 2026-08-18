@@ -8,7 +8,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| 🐍 **嵌入 Python 运行时** | Chaquopy 内嵌 Python 3.12，AI 可以写代码并本地执行——不需要沙箱 API |
+| 🐍 **嵌入 Python 运行时** | Chaquopy 内嵌 Python 3.13，AI 可以写代码并本地执行——不需要沙箱 API |
 | 🛠️ **Agent 循环** | AI 自主选择工具、执行、观察结果、决定下一步，直到任务完成 |
 | 📱 **无障碍服务** | 读取屏幕、模拟点击、操作 App，不给 API 也能控手机 |
 | 💾 **工作区文件系统** | /workspace 目录，AI 读写文件、构建 HTML 页面、生成文档 |
@@ -42,7 +42,7 @@
 
 - **语言:** Kotlin
 - **UI:** Jetpack Compose + Material 3
-- **Python:** Chaquopy 16.0 (Python 3.12 内嵌)
+- **Python:** Chaquopy 17.0.0 (Python 3.13 内嵌)
 - **网络:** OkHttp + Retrofit + Gson
 - **无障碍:** AccessibilityService (BIND_ACCESSIBILITY_SERVICE)
 - **最低 SDK:** Android 8.0 (API 26)

@@ -1,8 +1,28 @@
 package com.example.aichat.ui
 
+import java.io.File
 import java.util.zip.ZipInputStream
 
 // 文件类型辅助函数 —— 从 Office XML 格式提取文本
+
+/** 读取文本文件的前 maxChars 个字符，避免大文件一次性读入内存 */
+fun readTextHead(file: File, maxChars: Int): String {
+    val sb = StringBuilder(minOf(maxChars, 8192))
+    file.inputStream().reader(Charsets.UTF_8).use { r ->
+        val buf = CharArray(minOf(maxChars, 8192))
+        var total = 0
+        var read = r.read(buf)
+        while (read > 0 && total < maxChars) {
+            val take = minOf(read, maxChars - total)
+            sb.append(buf, 0, take)
+            total += take
+            if (total >= maxChars) break
+            read = r.read(buf)
+        }
+    }
+    return sb.toString()
+}
+
 fun readZipXmlText(bytes: ByteArray, targetEntry: String): String {
     val sb = StringBuilder()
     ZipInputStream(bytes.inputStream()).use { zis ->

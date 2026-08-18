@@ -50,6 +50,28 @@ class StorageManager(context: Context) {
     private val convDir: File = File(context.filesDir, "conversations").also { it.mkdirs() }
     private val indexFile: File = File(convDir, "index.json")
 
+    /** 原子写文件：临时文件 + 尽量原子 rename，避免崩溃导致 JSON 半截/损坏 */
+    private fun atomicWrite(file: File, content: String) {
+        val tmp = File(file.parentFile, "${file.name}.tmp")
+        tmp.writeText(content, Charsets.UTF_8)
+        try {
+            java.nio.file.Files.move(
+                tmp.toPath(), file.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE
+            )
+        } catch (_: Exception) {
+            try {
+                if (file.exists()) file.delete()
+                if (!tmp.renameTo(file)) {
+                    file.writeText(content, Charsets.UTF_8)
+                }
+            } catch (_: Exception) {
+                file.writeText(content, Charsets.UTF_8)
+            }
+        }
+    }
+
     // ===== API 配置 =====
 
     fun getProfiles(): List<ApiProfile> {
@@ -59,7 +81,7 @@ class StorageManager(context: Context) {
         } else {
             val legacy = prefs.getString("profiles", null)
             if (legacy != null) {
-                try { profilesFile.writeText(legacy, Charsets.UTF_8) } catch (_: Exception) {}
+                try { atomicWrite(profilesFile, legacy) } catch (_: Exception) {}
             }
             legacy
         }
@@ -78,18 +100,14 @@ class StorageManager(context: Context) {
     /** 保存配置：文件为主（原子写），SP 双写备份。返回是否成功。 */
     fun saveProfiles(profiles: List<ApiProfile>): Boolean {
         val json = gson.toJson(profiles)
-        var ok = true
-        try {
-            val tmp = File(appContext.filesDir, "profiles.json.tmp")
-            tmp.writeText(json, Charsets.UTF_8)
-            if (profilesFile.exists()) profilesFile.delete()
-            ok = tmp.renameTo(profilesFile)
+        return try {
+            atomicWrite(profilesFile, json)
+            prefs.edit().putString("profiles", json).apply()
+            true
         } catch (e: Exception) {
             android.util.Log.e("StorageManager", "profiles 写文件失败", e)
-            ok = false
+            false
         }
-        prefs.edit().putString("profiles", json).commit()
-        return ok
     }
 
     fun getActiveProfileId(): String {
@@ -97,13 +115,13 @@ class StorageManager(context: Context) {
     }
 
     fun setActiveProfileId(id: String) {
-        prefs.edit().putString("active_profile_id", id).commit()
+        prefs.edit().putString("active_profile_id", id).apply()
     }
 
     fun getActiveProfile(): ApiProfile? {
         val activeId = getActiveProfileId()
-        return getProfiles().find { it.id == activeId }
-            ?: getProfiles().firstOrNull()
+        val profiles = getProfiles()
+        return profiles.find { it.id == activeId } ?: profiles.firstOrNull()
     }
 
     // ===== 会话（分文件存储）=====
@@ -116,17 +134,21 @@ class StorageManager(context: Context) {
         try {
             val legacy: Array<Conversation> = gson.fromJson(legacyJson, Array<Conversation>::class.java) ?: return
             for (conv in legacy) {
-                convFile(conv.id).writeText(gson.toJson(conv), Charsets.UTF_8)
+                atomicWrite(convFile(conv.id), gson.toJson(conv))
             }
             writeIndex(legacy.toList())
-            prefs.edit().remove("conversations").commit()
+            prefs.edit().remove("conversations").apply()
         } catch (_: Exception) {}
     }
 
     // index 只存元数据 + 最后一条消息，避免把全部消息塞进一个 JSON
     private fun writeIndex(convs: List<Conversation>) {
         val slim = convs.map { it.copy(messages = it.messages.takeLast(1)) }
-        indexFile.writeText(gson.toJson(slim), Charsets.UTF_8)
+        // 原子写，避免中途崩溃导致 index.json 损坏
+        try {
+            atomicWrite(indexFile, gson.toJson(slim))
+        } catch (_: Exception) {
+        }
     }
 
     private fun readIndex(): List<Conversation> {
@@ -163,7 +185,11 @@ class StorageManager(context: Context) {
     fun saveConversation(conv: Conversation) = synchronized(LOCK) {
         migrateIfNeeded()
         val updated = conv.copy(updatedAt = System.currentTimeMillis())
-        convFile(conv.id).writeText(gson.toJson(updated), Charsets.UTF_8)
+        val cf = convFile(conv.id)
+        try {
+            atomicWrite(cf, gson.toJson(updated))
+        } catch (_: Exception) {
+        }
         val list = readIndex().toMutableList()
         val idx = list.indexOfFirst { it.id == conv.id }
         if (idx >= 0) list[idx] = updated else list.add(0, updated)
@@ -193,20 +219,20 @@ class StorageManager(context: Context) {
     }
 
     fun setActiveConversationId(id: String) {
-        prefs.edit().putString("active_conv_id", id).commit()
+        prefs.edit().putString("active_conv_id", id).apply()
     }
 
     // 通用偏好（角色选择、开关等 UI 状态持久化）
     fun getStringPref(key: String, default: String): String = prefs.getString(key, default) ?: default
 
     fun setStringPref(key: String, value: String) {
-        prefs.edit().putString(key, value).commit()
+        prefs.edit().putString(key, value).apply()
     }
 
     fun getBoolPref(key: String, default: Boolean): Boolean = prefs.getBoolean(key, default)
 
     fun setBoolPref(key: String, value: Boolean) {
-        prefs.edit().putBoolean(key, value).commit()
+        prefs.edit().putBoolean(key, value).apply()
     }
 
     // ===== 消息便捷方法 =====

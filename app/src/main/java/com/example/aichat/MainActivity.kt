@@ -35,6 +35,7 @@ class MainActivity : ComponentActivity() {
                     ChatScreen(
                         viewModel = chatViewModel,
                         profile = profile ?: com.example.aichat.data.ApiProfile(),
+                        conversationId = mainViewModel.activeConversationId,
                         onBack = {
                             mainViewModel.showChat = false
                             mainViewModel.refreshConversations()

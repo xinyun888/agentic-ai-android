@@ -118,32 +118,34 @@ class ScreenControlService : AccessibilityService() {
 
     /** 按文本查找并点击节点 */
     fun findAndClickByText(text: String): Boolean {
+        var root: AccessibilityNodeInfo? = null
+        val parents = mutableSetOf<AccessibilityNodeInfo>()
         try {
-            val root = rootInActiveWindow ?: return false
+            root = rootInActiveWindow ?: return false
             val nodes = root.findAccessibilityNodeInfosByText(text)
-            for (node in nodes) {
-                if (node.isClickable && node.isEnabled) {
-                    val result = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    node.recycle()
-                    root.recycle()
-                    return result
-                }
-                var parent = node.parent
-                while (parent != null) {
-                    if (parent.isClickable && parent.isEnabled) {
-                        val result = parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        parent.recycle()
-                        root.recycle()
-                        return result
+            try {
+                for (node in nodes) {
+                    if (node.isClickable && node.isEnabled) {
+                        return node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                     }
-                    val grand = parent.parent
-                    parent.recycle()
-                    parent = grand
+                    var parent = node.parent
+                    while (parent != null) {
+                        parents.add(parent)
+                        if (parent.isClickable && parent.isEnabled) {
+                            return parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                        }
+                        val grand = parent.parent
+                        parent = grand
+                    }
                 }
-                node.recycle()
+            } finally {
+                nodes.forEach { it.recycle() }
+                parents.forEach { it.recycle() }
             }
-            root.recycle()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        } finally {
+            root?.recycle()
+        }
         return false
     }
 

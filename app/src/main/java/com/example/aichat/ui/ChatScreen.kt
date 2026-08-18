@@ -70,6 +70,7 @@ val TEXT_EXTS = setOf("txt", "md", "csv", "json", "xml", "html", "htm", "css", "
 fun ChatScreen(
     viewModel: ChatViewModel,
     profile: ApiProfile,
+    conversationId: String,
     onBack: () -> Unit
 ) {
     // 系统返回键回对话列表，而不是直接退出应用
@@ -78,7 +79,11 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     var inputText by remember { mutableStateOf("") }
     val context = LocalContext.current
-    val workspaceDir = remember { java.io.File(context.filesDir, "workspace").also { it.mkdirs() } }
+    val workspaceRoot = remember { java.io.File(context.filesDir, "workspace").also { it.mkdirs() } }
+    val workspaceDir = remember(workspaceRoot, conversationId) {
+        if (conversationId.isBlank()) workspaceRoot
+        else java.io.File(workspaceRoot, conversationId.replace(Regex("[^a-zA-Z0-9_-]"), "_")).also { it.mkdirs() }
+    }
     var showWorkspaceFiles by remember { mutableStateOf(false) }
     var showPersonaEditor by remember { mutableStateOf(false) }
     var editingPersona by remember { mutableStateOf<Persona?>(null) }
@@ -90,12 +95,14 @@ fun ChatScreen(
     val frequencyLabels = remember { listOf("5分钟", "15分钟", "30分钟", "1小时", "2小时", "4小时") }
     // 长按消息"删除此条及之后"：保存保留条数（截断点）
     var truncateKeep by remember { mutableStateOf<Int?>(null) }
+    // 工作区文件删除确认
+    var deleteFile by remember { mutableStateOf<java.io.File?>(null) }
 
     val startNow: () -> Unit = {
         val i = Intent(context, com.example.aichat.service.ActiveModeService::class.java).apply {
             action = com.example.aichat.service.ActiveModeService.ACTION_START
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_PERSONA_ID, viewModel.activePersonaId)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_CONV_ID, viewModel.currentConversationId())
+            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_CONV_ID, conversationId)
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_INTERVAL_MIN, pmFrequency)
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_IMMERSIVE, pmImmersive)
             putExtra(com.example.aichat.service.ActiveModeService.EXTRA_SHOW_THINKING, !pmHideThink)
@@ -150,15 +157,17 @@ fun ChatScreen(
             } ?: "未知文件"
             val ext = name.substringAfterLast('.').lowercase()
 
-            // 保存到工作区
-            val wsDir = java.io.File(context.filesDir, "workspace").also { it.mkdirs() }
+            // 保存到当前会话的工作区子目录，和 Agent 看到的一致
+            val wsDir = workspaceDir
             val destFile = java.io.File(wsDir, name)
             try {
                 context.contentResolver.openInputStream(it)?.use { input ->
                     destFile.outputStream().use { output -> input.copyTo(output) }
                 }
             } catch (_: Exception) { return@let }
-            viewModel.pendingFileText = Pair(name, ext)
+            val relName = if (wsDir == workspaceRoot) name else "${wsDir.name}/$name"
+            viewModel.pendingFileText = Pair(relName, ext)
+            workspaceFiles = workspaceDir.listFiles()?.sortedBy { it.name }?.toList() ?: emptyList()
 
             // 若是文档格式，同时提取文本预览
             if (ext in TEXT_EXTS || ext in setOf("docx", "pptx", "xlsx")) {
@@ -201,6 +210,10 @@ fun ChatScreen(
         if (viewModel.messages.isNotEmpty()) {
             listState.scrollToItem(viewModel.messages.size - 1)
         }
+    }
+
+    LaunchedEffect(conversationId) {
+        workspaceFiles = workspaceDir.listFiles()?.sortedBy { it.name }?.toList() ?: emptyList()
     }
 
     Scaffold(
@@ -490,6 +503,17 @@ fun ChatScreen(
                                 onClick = { viewModel.toggleFactCheck() },
                                 leadingIcon = { Icon(Icons.Filled.VerifiedUser, null) }
                             )
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text("🧠 显示思考过程")
+                                        Spacer(Modifier.weight(1f))
+                                        if (viewModel.showThinking) Text("✓", color = MaterialTheme.colorScheme.primary)
+                                    }
+                                },
+                                onClick = { viewModel.toggleShowThinking() },
+                                leadingIcon = { Icon(Icons.Outlined.Psychology, null) }
+                            )
                         }
                     }
                     IconButton(
@@ -762,12 +786,14 @@ fun ChatScreen(
                                 onClick = {
                                     if (f.isFile) {
                                         when (ext) {
-                                            "html", "htm" -> viewModel.addPreviewItem(f.name)
+                                            "html", "htm" -> viewModel.addPreviewItem(
+                                                f.relativeTo(workspaceRoot).path.replace('\\', '/')
+                                            )
                                             else -> {
                                                 // 在文本查看器中打开
                                                 try {
                                                     viewerFile = f
-                                                    viewerContent = f.readText(Charsets.UTF_8).take(50000)
+                                                    viewerContent = readTextHead(f, 50000)
                                                 } catch (_: Exception) {
                                                     viewerContent = "(无法读取此文件: ${f.name})"
                                                     viewerFile = f
@@ -794,9 +820,7 @@ fun ChatScreen(
                                     }
                                     IconButton(
                                         onClick = {
-                                            f.delete()
-                                            workspaceFiles = workspaceDir.listFiles()?.sortedBy { it.name }?.toList() ?: emptyList()
-                                            viewModel.forgetPreviews()
+                                            deleteFile = f
                                         },
                                         modifier = Modifier.size(28.dp)
                                     ) {
@@ -821,7 +845,7 @@ fun ChatScreen(
             ) {
                 items(viewModel.messages, key = { it.id ?: "${it.timestamp}-${it.role}-${it.content.hashCode()}" }) { message ->
                     // 在助手/实时消息之前显示思考过程
-                    if (message.thinking.isNotBlank() && (message.role == "assistant" || message.role == "assistant_live")) {
+                    if (viewModel.showThinking && message.thinking.isNotBlank() && (message.role == "assistant" || message.role == "assistant_live")) {
                         ThinkingChainCard(content = message.thinking)
                     }
                     // 工具步骤卡：本回复实际执行的工具（系统注入标"系统"，模型调用标"调用"）
@@ -884,11 +908,29 @@ fun ChatScreen(
                     text = { Text("将删除这条消息及其后的所有消息（保留前 $keep 条）。用于重开被污染的历史对话。此操作不可撤销。") },
                     confirmButton = {
                         TextButton(onClick = {
-                            viewModel.truncateFrom(viewModel.currentConversationId(), keep)
+                            viewModel.truncateFrom(conversationId, keep)
                             truncateKeep = null
                         }) { Text("删除", color = MaterialTheme.colorScheme.error) }
                     },
                     dismissButton = { TextButton(onClick = { truncateKeep = null }) { Text("取消") } }
+                )
+            }
+
+            // === 工作区文件删除确认 ===
+            deleteFile?.let { file ->
+                AlertDialog(
+                    onDismissRequest = { deleteFile = null },
+                    title = { Text("删除文件？") },
+                    text = { Text("确定删除「${file.name}」？此操作不可恢复。") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            if (file.isDirectory) file.deleteRecursively() else file.delete()
+                            workspaceFiles = workspaceDir.listFiles()?.sortedBy { it.name }?.toList() ?: emptyList()
+                            viewModel.forgetPreviews()
+                            deleteFile = null
+                        }) { Text("删除", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = { TextButton(onClick = { deleteFile = null }) { Text("取消") } }
                 )
             }
 
@@ -1469,7 +1511,7 @@ fun HtmlPreview(filePath: String, modifier: Modifier = Modifier) {
                         ViewGroup.LayoutParams.MATCH_PARENT
                     )
                     webViewClient = WebViewClient()
-                    settings.javaScriptEnabled = true
+                    settings.javaScriptEnabled = false
                     // 安全：禁止 file:// 访问，防模型生成的 HTML 里 JS 读本地文件（含记忆文件）
                     settings.allowFileAccess = false
                     settings.allowFileAccessFromFileURLs = false

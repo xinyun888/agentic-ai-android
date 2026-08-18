@@ -24,9 +24,11 @@ fun ProfileScreen(
     androidx.activity.compose.BackHandler { onBack() }
     val appCtx = LocalContext.current.applicationContext
     var profiles by remember { mutableStateOf(viewModel.getProfiles()) }
+    var usageText by remember { mutableStateOf(com.example.aichat.data.UsageMeter.stats()) }
     // 每次进入页面都强制从存储刷新（不依赖 remember 初始化语义）
     LaunchedEffect(Unit) {
         profiles = viewModel.getProfiles()
+        usageText = com.example.aichat.data.UsageMeter.stats()
     }
 
     Scaffold(
@@ -59,7 +61,6 @@ fun ProfileScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-                val usageText = remember { com.example.aichat.data.UsageMeter.stats() }
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text("📊 Token 用量（累计）", style = MaterialTheme.typography.titleSmall)
@@ -215,6 +216,7 @@ fun ProfileCard(
                     onValueChange = { apiKey = it },
                     label = { Text("API Key") },
                     singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth()
                 )
 
@@ -283,7 +285,9 @@ fun ProfileCard(
                     value = visionApiKey,
                     onValueChange = { visionApiKey = it },
                     label = { Text("视觉 API Key（留空复用上方）") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth()
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
 

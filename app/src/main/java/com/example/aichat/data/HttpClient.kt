@@ -12,6 +12,8 @@ object HttpClient {
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .followSslRedirects(true)
         if (BuildConfig.DEBUG) {
             // BASIC 只打印方法与状态码，不含请求头，避免 API Key 进 logcat
             builder.addInterceptor(HttpLoggingInterceptor().apply {

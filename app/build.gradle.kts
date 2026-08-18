@@ -1,8 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("com.chaquo.python")
 }
+
+// Python 可执行文件路径：优先用 gradle.properties/local.properties 或环境变量，避免硬编码到某台机器
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val pythonExecutable: String = (project.findProperty("pythonExecutable") as? String)
+    ?: System.getenv("PYTHON_EXECUTABLE")
+    ?: localProps.getProperty("pythonExecutable")
+    ?: "C:/Users/Lenovo/.workbuddy/binaries/python/versions/3.13.12/python.exe"
 
 android {
     namespace = "com.example.aichat"
@@ -16,7 +28,7 @@ android {
         versionName = "1.0"
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a", "x86_64")
         }
     }
 
@@ -27,6 +39,18 @@ android {
             keyAlias = "androiddebugkey"
             keyPassword = "android"
         }
+        create("release") {
+            val ks = rootProject.file("release.keystore")
+            if (ks.exists()) {
+                storeFile = ks
+                storePassword = (project.findProperty("RELEASE_STORE_PASSWORD") as? String)
+                    ?: System.getenv("RELEASE_STORE_PASSWORD") ?: ""
+                keyAlias = (project.findProperty("RELEASE_KEY_ALIAS") as? String)
+                    ?: System.getenv("RELEASE_KEY_ALIAS") ?: ""
+                keyPassword = (project.findProperty("RELEASE_KEY_PASSWORD") as? String)
+                    ?: System.getenv("RELEASE_KEY_PASSWORD") ?: ""
+            }
+        }
     }
 
     buildTypes {
@@ -36,7 +60,9 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            signingConfig = signingConfigs.getByName("debug")
+            // 有正式 keystore 用正式签名，否则退回 debug 签名保证 APK 可安装
+            signingConfig = if (file("../release.keystore").exists()) signingConfigs.getByName("release")
+                else signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -66,7 +92,7 @@ android {
 chaquopy {
     defaultConfig {
         version = "3.13"
-        buildPython("C:/Users/Lenovo/.workbuddy/binaries/python/versions/3.13.12/python.exe")
+        buildPython(pythonExecutable)
         pip {
             // lunar_python 在 PyPI 只有源码包，Chaquopy 只接受 wheel，这里用本地构建的 wheel
             options("--find-links", file("../python-wheels").absolutePath)

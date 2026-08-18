@@ -22,6 +22,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -61,8 +62,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         private set
 
     // 并行对话：每个对话 ID 对应一个 Job
-    private val currentJobs = mutableMapOf<String, Job>()
-    private val loadingConvs = mutableSetOf<String>()
+    private val currentJobs = ConcurrentHashMap<String, Job>()
+    private val loadingConvs = ConcurrentHashMap.newKeySet<String>()
 
     fun cancelLoading() {
         currentJobs.remove(currentConvId)?.cancel()
@@ -94,16 +95,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     var agentSteps by mutableStateOf<List<AgentStep>>(emptyList())
         private set
+    private val agentStepsByConv = ConcurrentHashMap<String, List<AgentStep>>()
 
-    fun appendAgentStep(step: AgentStep) {
-        agentSteps = (agentSteps + step).takeLast(100)
+    fun appendAgentStep(step: AgentStep, convId: String = currentConvId) {
+        val updated = ((agentStepsByConv[convId] ?: emptyList()) + step).takeLast(100)
+        agentStepsByConv[convId] = updated
+        if (convId == currentConvId) agentSteps = updated
     }
+
+    fun agentStepsFor(convId: String): List<AgentStep> = agentStepsByConv[convId] ?: emptyList()
 
     var pendingImageUri by mutableStateOf<String?>(null)
 
     /** bazi_paipan 结果中的确认卡 JSON，最终回答时附加到助手消息 */
     var pendingPaipanJson by mutableStateOf<String?>(null)
         private set
+    private val pendingPaipanByConv = ConcurrentHashMap<String, String>()
+
+    private fun setPendingPaipan(convId: String, value: String?) {
+        if (value == null) pendingPaipanByConv.remove(convId)
+        else pendingPaipanByConv[convId] = value
+        if (convId == currentConvId) pendingPaipanJson = value
+    }
 
     var pendingFileText by mutableStateOf<Pair<String, String>?>(null)  // (文件名, 扩展名)
     var fileTextContent by mutableStateOf("")  // 文本类文件的预提取文本
@@ -129,7 +142,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val phase: PlanPhase = PlanPhase.IDLE,
         val completed: Set<Int> = emptySet()
     )
-    private val planStates = mutableMapOf<String, PlanState>()
+    private val planStates = ConcurrentHashMap<String, PlanState>()
 
     private fun planStateOf(convId: String): PlanState = planStates[convId] ?: PlanState()
 
@@ -192,6 +205,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         storage.setBoolPref("learning_mode", learningMode)
     }
 
+    // 是否在聊天界面展示思维链
+    var showThinking by mutableStateOf(storage.getBoolPref("show_thinking", true))
+        private set
+
+    fun toggleShowThinking() {
+        showThinking = !showThinking
+        storage.setBoolPref("show_thinking", showThinking)
+    }
+
     // 恢复状态
     var hasSavedState by mutableStateOf(false)
         private set
@@ -252,13 +274,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val gson = Gson()
 
     /** 提取排盘确认卡 JSON：先 gson 验证再挂载，坏数据直接丢弃 */
-    private fun extractPaipanJson(content: String) {
+    private fun extractPaipanJson(content: String, convId: String) {
         val m = PAIPAN_REGEX.find(content) ?: return
         val captured = m.groupValues[1].trim()
         if (captured.isBlank()) return
         try {
             gson.fromJson(captured, Map::class.java)
-            pendingPaipanJson = captured
+            setPendingPaipan(convId, captured)
         } catch (e: Exception) {
             // 残缺/非 JSON 内容：丢弃，防止展示坏卡片
         }
@@ -307,11 +329,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 gson.fromJson(tc.function.arguments, GsonTypes.stringStringMap)
             } catch (e: Exception) { mapOf("_raw" to tc.function.arguments) }
             withContext(Dispatchers.Main) {
-                appendAgentStep(AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments))
+                appendAgentStep(AgentStep(type = "tool_call", toolName = tc.function.name, toolArgs = tc.function.arguments), myConvId)
             }
             val result = ToolRegistry.execute(ToolCall(id = tc.id, name = tc.function.name, arguments = args), getApplication(), myConvId)
             // 排盘确认卡：提取 bazi_paipan 结果中的 JSON
-            if (tc.function.name == "bazi_paipan") extractPaipanJson(result.content)
+            if (tc.function.name == "bazi_paipan") extractPaipanJson(result.content, myConvId)
             // 预览检测：build_html 输出
             handlePreviewIfAny(result.content, tc.function.name == "build_html", myConvId)
             // 错误追踪
@@ -322,7 +344,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 consecutiveErrors.clear()
             }
             withContext(Dispatchers.Main) {
-                appendAgentStep(AgentStep(type = "tool_result", toolName = tc.function.name, content = result.content))
+                appendAgentStep(AgentStep(type = "tool_result", toolName = tc.function.name, content = result.content), myConvId)
             }
             conversationDtos.add(ChatMessageDto(role = "tool", content = result.content, toolCallId = tc.id))
         }
@@ -352,14 +374,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (Regex("""(八字|排盘|大运|流年|出生|生辰|命盘)""").containsMatchIn(content)
             && !Regex("""(卦|占|吉凶|该不该)""").containsMatchIn(content)) return null
 
+        // 如果用户只是说“算一卦”但还没指定方式/外应材料，不自动起卦，让模型先询问
+        val noWaiYing = Regex("""(不用|不需要|不要|别用).{0,2}外应""").containsMatchIn(content)
+        val hasMethodChoice = listOf("六爻", "梅花", "小六壬", "随机", "随便", "直接")
+            .any { content.contains(it) } || noWaiYing
+        val hasMaterialOrNumbers = Regex("""(看到|想到|见到|听见|手机尾号|数字|号码|报数)""").containsMatchIn(content)
+        if (!hasMethodChoice && !hasMaterialOrNumbers) return null
+
         // 方法选择：用户点名优先，否则默认六爻（真随机，不依赖农历时刻）
         val method = when {
             content.contains("小六壬") -> "xiaoliuren"
+            !noWaiYing && (content.contains("外应") || content.contains("报数")) -> "random"
+            content.contains("梅花") && content.contains("随机") -> "random"
             content.contains("梅花") -> "meihua"
+            !noWaiYing && content.contains("随机") &&
+                !content.contains("直接") && !content.contains("随便") && !content.contains("六爻") -> "random"
             else -> "liuyao"
         }
         val args = mutableMapOf("method" to method, "question" to content.take(100))
-        if (method != "liuyao") {
+        if (method == "random") {
+            // 把用户描述的“看到/想到什么”作为外应材料传给起卦工具
+            args["material"] = content.take(200)
+        }
+        if (method == "meihua" || method == "xiaoliuren") {
             // 梅花/小六壬按当前农历时刻起：从已注入的 date_info 输出解析月日时
             val m = Regex("""农历: ([^年]+)年([^\s]+)月(\S+)""").find(lunarInfo)
             if (m != null) {
@@ -387,7 +424,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** 把系统起好的卦象以 assistant tool_call + tool 消息对注入上下文（步骤标 auto=true） */
     private suspend fun appendSystemGua(
-        args: Map<String, String>, guaText: String, conversationDtos: MutableList<ChatMessageDto>
+        args: Map<String, String>, guaText: String, conversationDtos: MutableList<ChatMessageDto>, convId: String
     ) {
         val callId = "sys_gua_${System.currentTimeMillis()}"
         conversationDtos.add(ChatMessageDto(role = "assistant", content = null,
@@ -396,8 +433,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         conversationDtos.add(ChatMessageDto(role = "tool", toolCallId = callId,
             content = "以下卦象已由系统起好，你只能解读，禁止另起卦或改写卦象。直接解读，不要说明卦象由谁生成、是否调用过工具。\n\n$guaText"))
         withContext(Dispatchers.Main) {
-            appendAgentStep(AgentStep(type = "tool_call", toolName = "gua_yao", toolArgs = gson.toJson(args), auto = true))
-            appendAgentStep(AgentStep(type = "tool_result", toolName = "gua_yao", content = guaText.take(300), auto = true))
+            appendAgentStep(AgentStep(type = "tool_call", toolName = "gua_yao", toolArgs = gson.toJson(args), auto = true), convId)
+            appendAgentStep(AgentStep(type = "tool_result", toolName = "gua_yao", content = guaText.take(300), auto = true), convId)
         }
     }
 
@@ -416,8 +453,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** 审计 + 溯源：最终答案落盘前调用，返回 (带标注的最终文本, 溯源标签, 工具步骤快照) */
-    private fun finalizeAnswer(text: String, stepBaseline: Int): Triple<String, List<String>?, List<AgentStep>?> {
-        val roundSteps = agentSteps.drop(stepBaseline)
+    private fun finalizeAnswer(text: String, stepBaseline: Int, convId: String): Triple<String, List<String>?, List<AgentStep>?> {
+        val roundSteps = agentStepsFor(convId).drop(stepBaseline)
         val warnings = AnswerAuditor.check(text, roundSteps, activePersonaId)
         val finalText = if (warnings.isEmpty()) text
             else text + "\n\n" + warnings.joinToString("\n")
@@ -459,11 +496,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun loadConversation(convId: String) {
         val sameConv = convId == currentConvId
         if (!sameConv) {
-            // 保存当前对话的计划状态，加载目标对话的（并行对话互不干扰）
+            // 保存当前对话的计划/步骤/排盘状态，加载目标对话的（并行对话互不干扰）
             planStates[currentConvId] = PlanState(currentPlan, planPhase, completedTaskIds)
+            agentStepsByConv[currentConvId] = agentSteps
+            // 局部变量承接：pendingPaipanJson 是 Compose 委托属性，不能 smart cast
+            val pp = pendingPaipanJson
+            if (pp != null) pendingPaipanByConv[currentConvId] = pp
+            else pendingPaipanByConv.remove(currentConvId)
             currentConvId = convId
             errorMessage = null
-            agentSteps = emptyList()
+            forgetPreviews()
+            agentSteps = agentStepsFor(convId)
+            pendingPaipanJson = pendingPaipanByConv[convId]
             val saved = planStates[convId]
             currentPlan = saved?.plan
             planPhase = saved?.phase ?: PlanPhase.IDLE
@@ -493,7 +537,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val myConvId = currentConvId
         if (myConvId in loadingConvs) return
         // 本轮 agentSteps 基线：审计器只检查本次消息以来新增的步骤（Main 线程调用，读安全）
-        val stepBaseline = agentSteps.size
+        val stepBaseline = agentStepsFor(myConvId).size
 
         // 构建 API 内容（如适用则附带文件文本）
         var apiContent = content.ifBlank {
@@ -555,10 +599,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 // 收集动态系统消息（放在历史之后，以利于缓存）
                 val dynamicSystemMsgs = mutableListOf<ChatMessageDto>()
+                // 相对稳定、不随每轮问题变化的系统消息，放在历史之前可以延长可缓存前缀
+                val preHistorySystemMsgs = mutableListOf<ChatMessageDto>()
 
                 // 实时时间，供模型判断时效
                 val now = java.time.LocalDateTime.now()
-                val nowStr = "${now.year}年${now.monthValue}月${now.dayOfMonth}日 ${now.hour}:${String.format("%02d", now.minute)}"
+                // 命理师场景分钟级精度不是必需，省略分钟可以让同一小时内的请求前缀更稳定，提升缓存命中
+                val nowStr = if (activePersonaId == "fortune") {
+                    "${now.year}年${now.monthValue}月${now.dayOfMonth}日 ${now.hour}时"
+                } else {
+                    "${now.year}年${now.monthValue}月${now.dayOfMonth}日 ${now.hour}:${String.format("%02d", now.minute)}"
+                }
 
                 // 命理师角色：额外注入农历+干支（系统算好，模型只引用不推算）。
                 // 同时把结果记进 agentSteps，让审计器知道"日期已由系统提供"。
@@ -574,7 +625,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             lunarInfo = dateResult.content
                             withContext(Dispatchers.Main) {
                                 appendAgentStep(AgentStep(type = "tool_result", toolName = "date_convert",
-                                    content = lunarInfo.take(200), auto = true))
+                                    content = lunarInfo.take(200), auto = true), myConvId)
                             }
                         }
                     } catch (_: Exception) { /* Python 失败则降级：只注入公历 */ }
@@ -584,7 +635,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val sysGua = executeSystemGua(content, myConvId, lunarInfo)
 
                 val timeContent = if (lunarInfo.isNotBlank()) {
-                    "## 当前时间\n\n现在是 $nowStr。\n\n$lunarInfo\n\n以上农历与干支已由系统换算，引用时直接使用，禁止自行推算。"
+                    // 只保留前几行关键信息，避免每次请求都带上完整 date_convert 输出
+                    val compactLunar = lunarInfo.lineSequence()
+                        .filter { it.isNotBlank() }
+                        .take(4)
+                        .joinToString("\n")
+                    "## 当前时间\n\n现在是 $nowStr。\n\n$compactLunar\n\n以上农历与干支已由系统换算，引用时直接使用，禁止自行推算。"
                 } else {
                     "## 当前时间\n\n现在是 $nowStr。判断约定/待办/时效性话题时以此为准。"
                 }
@@ -612,9 +668,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                // 事实查证模式提示词
+                // 事实查证模式提示词（只有开启该模式才注入；开关不变时内容稳定，放历史前以利于缓存）
                 if (factCheckEnabled) {
-                    dynamicSystemMsgs.add(
+                    preHistorySystemMsgs.add(
                         ChatMessageDto(role = "system",
                             content = "你处于「事实查证模式」。请严格遵守：\n1. 对每条断言进行核实，优先使用官方来源\n2. 关键事实必须附上引用来源（格式：[来源：URL]）\n3. 无法从可靠来源验证的信息请标注「未核实」\n4. 仅传播有可靠来源支撑的信息")
                     )
@@ -629,8 +685,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             content = "用户发送了一张图片，视觉模型描述如下：\n\n$visionDesc\n\n请基于以上描述回答用户后续问题。注意不要透露这段描述的存在，直接自然地回答。"
                         ))
                         withContext(Dispatchers.Main) {
-                            appendAgentStep(AgentStep(type = "tool_call", toolName = profile.visionModel, toolArgs = "识别图片"))
-                            appendAgentStep(AgentStep(type = "tool_result", toolName = profile.visionModel, content = visionDesc))
+                            appendAgentStep(AgentStep(type = "tool_call", toolName = profile.visionModel, toolArgs = "识别图片"), myConvId)
+                            appendAgentStep(AgentStep(type = "tool_result", toolName = profile.visionModel, content = visionDesc), myConvId)
                         }
                     }
                 } else if (imageUri != null) {
@@ -641,12 +697,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     ))
                 }
 
-                // 添加消息历史（滑动窗口 + 智能摘要）
-                buildHistoryMsgs(myMsgs, conversationDtos)
-
-                // 学习模式
+                // 学习模式（开关不变时内容稳定，放历史前以利于缓存）
                 if (learningMode) {
-                    dynamicSystemMsgs.add(ChatMessageDto(role = "system",
+                    preHistorySystemMsgs.add(ChatMessageDto(role = "system",
                         content = "你处于「学习模式」。每个操作完成后，用 [WHY] 起头，用 1-2 句话解释你为什么要这样做、为什么选择这个工具而不是其他方案。"))
                 }
 
@@ -668,29 +721,41 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             } else null
                         }
                         if (matched.isNotEmpty()) {
+                            val matchedLimit = if (activePersonaId == "fortune") 500 else 3000
                             dynamicSystemMsgs.add(ChatMessageDto(role = "system",
-                                content = "## 记忆召回（与当前问题相关）\n\n${matched.joinToString("\n\n")}"))
+                                content = "## 记忆召回（与当前问题相关）\n\n${matched.joinToString("\n\n").take(matchedLimit)}"))
                         } else {
                             val recent = sections.takeLast(3).map { "## $it".trim() }
                             if (recent.isNotEmpty()) {
+                                val recentLimit = if (activePersonaId == "fortune") 300 else 600
                                 dynamicSystemMsgs.add(ChatMessageDto(role = "system",
-                                    content = "## 你的长期记忆（最近记录，用 memory_load 可读全部）\n\n${recent.joinToString("\n\n").take(800)}"))
+                                    content = "## 你的长期记忆（最近记录，用 memory_load 可读全部）\n\n${recent.joinToString("\n\n").take(recentLimit)}"))
                             }
                         }
                     }
                 }
 
-                // 用户记忆（按对话隔离）
+                // 用户记忆（按对话隔离，通常比单轮问题稳定，放历史前以利于缓存）
                 val memory = loadUserMemory(myConvId)
                 if (memory.isNotBlank()) {
-                    dynamicSystemMsgs.add(ChatMessageDto(role = "system",
-                        content = "## 用户记忆\n\n以下是之前对话中记录的偏好和习惯，请在思考和决策时参考：\n\n$memory"))
+                    val memoryLimit = if (activePersonaId == "fortune") 400 else 1500
+                    preHistorySystemMsgs.add(ChatMessageDto(role = "system",
+                        content = "## 用户记忆\n\n以下是之前对话中记录的偏好和习惯，请在思考和决策时参考：\n\n${memory.take(memoryLimit)}"))
                 }
 
+                // 相对稳定的系统消息先放入，再接历史，尽量延长可缓存前缀
+                conversationDtos.addAll(preHistorySystemMsgs)
+
+                // 添加消息历史（滑动窗口 + 智能摘要）
+                buildHistoryMsgs(myMsgs, conversationDtos)
+
                 // 工作区状态（动态，放末尾以保持静态前缀稳定、命中缓存）
-                val wsStatus = workspaceStatus(myConvId)
-                if (wsStatus.isNotBlank()) {
-                    dynamicSystemMsgs.add(ChatMessageDto(role = "system", content = wsStatus))
+                // 命理师场景很少需要工作区文件列表，跳过可以省下不少 token
+                if (activePersonaId != "fortune") {
+                    val wsStatus = workspaceStatus(myConvId)
+                    if (wsStatus.isNotBlank()) {
+                        dynamicSystemMsgs.add(ChatMessageDto(role = "system", content = wsStatus))
+                    }
                 }
 
                 // 将动态系统消息追加到历史之后（位于静态前缀之后以利于缓存）
@@ -698,10 +763,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 // 系统自动起卦注入：卦象消息对放在状态行之后（模型先读状态行再读卦象）
                 if (sysGua != null) {
-                    appendSystemGua(sysGua.first, sysGua.second, conversationDtos)
+                    appendSystemGua(sysGua.first, sysGua.second, conversationDtos, myConvId)
                 }
 
                 // Agent 循环：不设硬性轮数上限，由模型决定何时停止
+                // 命理师工具链较固定，降低轮数上限可防止长时间循环烧 token
+                val maxRounds = if (activePersonaId == "fortune") 8 else MAX_AGENT_ROUNDS
                 var finishReason: String? = null
                 var round = 0
                 val consecutiveErrors = mutableMapOf<String, Int>()
@@ -711,11 +778,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 while (finishReason != "stop" && isActive) {
                     round++
                     // 轮数保护：达到上限时注入收尾提示，强制模型停止工具循环
-                    if (round == MAX_AGENT_ROUNDS) {
+                    if (round == maxRounds) {
                         conversationDtos.add(ChatMessageDto(role = "system",
-                            content = "你已调用 $MAX_AGENT_ROUNDS 轮工具，达到上限。请立即停止调用工具，基于已有信息总结并输出最终完整答案。"))
+                            content = "你已调用 $maxRounds 轮工具，达到上限。请立即停止调用工具，基于已有信息总结并输出最终完整答案。"))
                     }
-                    if (round > MAX_AGENT_ROUNDS + 1) {
+                    if (round > maxRounds + 1) {
                         finishReason = "stop"
                         withContext(Dispatchers.Main) { errorMessage = "任务过于复杂，已自动收尾，可分段继续提问。" }
                         continue
@@ -755,7 +822,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             if (keyRequests.isNotEmpty()) {
                                 saveUserMemory(myConvId, "用户曾处理：${keyRequests.take(3).joinToString("；")}")
                             }
-                            conversationDtos.removeAll { it in drop }
+                            conversationDtos.removeAll { dto -> drop.any { it === dto } }
                         }
                     }
 
@@ -770,11 +837,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val request = ChatRequest(
                         model = profile.model,
                         messages = conversationDtos,
-                        // Agent 循环：使用 "low" 推理而非 "max" — 对工具决策足够快，
-                        // 但仍给模型在行动前思考的机会。
-                        // 最终回答（非流式）仍使用 "max" 进行深度推理。
-                        // 陪伴对话不显示思维链
-                        reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "low" else null,
+                        // 单次请求直接承担“工具决策 + 最终回答”，所以按用户档位设置推理强度，
+                        // 不再额外发一次 final 请求，省掉一整套重复 prompt/tool schema。
+                        reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
+                            when (profile.reasoningLevel) {
+                                "fast" -> "low"
+                                "deep" -> "max"   // DeepSeek 只有 low/high/max 真正有效，max 才是深度推理
+                                else -> "medium"   // medium 映射为 high
+                            } else null,
                         thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(
                             ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
@@ -844,53 +914,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             }
                         }
 
-                        // 最终回答：非流式（"流式+推理+工具"三件套的衔接会丢工具调用，
-                        // 是预告句截断/空包等问题的根源；非流式响应原子返回，彻底规避。
-                        // 打字机观感由 ChatScreen 客户端模拟）
-                        val finalRequest = ChatRequest(
-                            model = profile.model,
-                            messages = conversationDtos,
-                            reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
-                                (if (profile.reasoningLevel == "fast") "low" else "max") else null,
-                            thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
-                                mapOf("type" to "enabled") else null,
-                            tools = gson.fromJson(
-                                ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
-                                GsonTypes.list(GsonTypes.stringAnyMap)
-                            ),
-                            stream = false
-                        )
-                        val fbody = try {
-                            chatCompletion(profile, finalRequest)
-                        } catch (e: ApiHttpException) {
-                            withContext(Dispatchers.Main) {
-                                errorMessage = "API 错误 ${e.code}: ${e.message}\n${e.errorBody}"
-                            }
-                            return@launch
-                        }
-                        fbody.usage?.let { u ->
-                            UsageMeter.record(u.promptTokens, u.completionTokens, u.cacheHitTokens, u.cacheMissTokens)
-                        }
-                        val fmsg = fbody.choices.firstOrNull()?.message ?: continue
-
-                        // 最终轮模型仍想调工具 → 走与循环轮完全相同的执行路径
-                        if (!fmsg.toolCalls.isNullOrEmpty()) {
-                            myMsgs = runToolCalls(fmsg, myConvId, myMsgs, conversationDtos, consecutiveErrors, round)
-                            finishReason = null
-                            continue
-                        }
-
-                        val finalText = fmsg.content ?: ""
-                        val finalThink = fmsg.reasoningContent ?: ""
+                        // 直接使用本轮非工具回答作为最终答案，不再发第二次 final 请求
+                        val finalText = msg.content ?: ""
+                        val finalThink = msg.reasoningContent ?: ""
                         // 空答案保护：任何情况下都不落盘空消息（服务端出幺蛾子时兜底）
                         val display = if (finalText.isBlank()) "⚠️ 本轮未生成回答，请重试。" else finalText
+                        val wasLength = finishReason == "length"
 
                         // 用 NonCancellable 收尾，避免退到后台时丢失消息
                         withContext(NonCancellable + Dispatchers.Main) {
-                            val paipan = pendingPaipanJson
-                            pendingPaipanJson = null
+                            val paipan = pendingPaipanByConv[myConvId]
+                            setPendingPaipan(myConvId, null)
                             // 审计 + 溯源：伪造卦象/日期会被打标；溯源标签与工具步骤快照随消息落盘
-                            val (auditedText, badges, toolSteps) = finalizeAnswer(display, stepBaseline)
+                            val (auditedText, badges, toolSteps) = finalizeAnswer(display, stepBaseline, myConvId)
                             myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                 role = "assistant",
                                 content = auditedText,
@@ -905,8 +941,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         conversationDtos.add(ChatMessageDto(role = "assistant", content = display))
                         finishReason = "stop"
 
-                        // length 说明被 max_tokens 截断，自动续写（非流式 finish_reason 同样返回 length）
-                        if (fbody.choices.firstOrNull()?.finishReason == "length" && isActive && continuationRetries < 2) {
+                        // length 说明被 max_tokens 截断，自动续写
+                        if (wasLength && isActive && continuationRetries < 2) {
                             continuationRetries++
                             conversationDtos.add(ChatMessageDto(role = "system",
                                 content = "上一条回复因长度限制被截断。请从中断处继续输出，直到完整结束，不要重复已写过的内容。"))
@@ -971,7 +1007,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun chatCompletion(profile: ApiProfile, request: ChatRequest): ChatResponse {
         val bodyJson = gson.toJson(request)
         val req = Request.Builder()
-            .url("${profile.baseUrl.trimEnd('/')}/chat/completions")
+            .url("${profile.baseUrl.trim().trimEnd('/')}/chat/completions")
             .addHeader("Authorization", "Bearer ${profile.apiKey}")
             .addHeader("Content-Type", "application/json")
             .post(bodyJson.toRequestBody("application/json".toMediaType()))
@@ -995,12 +1031,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // 静态 persona + 通用规则（放在消息链最前，作为稳定的前缀缓存）
     private fun buildSystemPrompt(myConvId: String): String {
         val persona = getActivePersona(getApplication<android.app.Application>())
-        return persona.prompt + "\n\n" + """
+        val activeProfile = storage.getActiveProfile()
+        // 思维链模式作为静态前缀的一部分：不同模式给模型不同的推理协议，
+        // 而不是只靠 reasoning_effort 改长短。这样既改变思维链本质，又不破坏前缀缓存。
+        val thinkingStyle = when (activeProfile?.reasoningLevel) {
+            "fast" -> "\n\n## 思维链模式（极简）\n直接以第一人称进入推理，禁止“让我先/我来”等开头。按“问题本质 → 关键依据 → 结论”输出，保持紧凑、肯定、强判断。"
+            "deep" -> "\n\n## 思维链模式（深度）\n直接以第一人称进入推理，禁止“让我先/我来”等开头。按“问题本质 → 假设 → 数据/工具验证 → 多角度分析 → 结论与风险”输出，推理要强判断、可追溯。"
+            else -> "\n\n## 思维链模式（平衡）\n直接以第一人称进入推理，禁止“让我先/我来”等开头。按“问题 → 关键依据 → 推理 → 结论”输出，先给判断再展开依据，保持有力、不犹豫。"
+        }
+        val agentRules = if (activePersonaId == "fortune") """
+Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
+
+## 工具使用铁律（命理师精简版）
+① **时间和日期**：涉及"现在/今天/当前"用 get_time；干支/农历/节气/星期换算必须用 date_convert，禁止自写代码或凭记忆推算。
+② **计算和数据**：涉及数字计算、数据分析、表格处理，必须用 python_exec，不要心算。
+⑥ **对外回答**：最终回答时禁止说"我用了 xxx 工具""根据 xxx 的执行结果"等内部过程，直接给结论。
+⑦ **长期记忆**：发现用户偏好、命盘信息、重要上下文时，立即用 memory_save 记下来。
+⑨ **工具调用纪律**：需要工具时直接 function calling，系统会自动执行并返回结果；禁止把工具调用/代码/JSON 写进回答文本，禁止假装执行。
+⑫ **连贯完成任务（硬性）**：需要多步工具就连续调用直到全部完成，最后一次性输出完整答案，禁止只报"已排盘完成""工具执行成功"就结束。
+⑬ **直接调用，禁止预告后停住（硬性）**：需要工具时立即输出 function call，禁止只输出"接下来我要调用工具"之类的预告后结束。
+⑭ **起卦流程（重要）**：用户要起卦/占卜时，如果还没明确说用外应、报数、六爻、梅花或小六壬，先不要调用 gua_yao，先问：“这次想起卦吗？可以用外应（告诉我你当下看到/想到的数字、文字、事物），也可以报数，或者直接随机六爻。” 用户提供外应/报数后，调用 gua_yao 的 method=random 并传入 material/num；用户说不用外应/随便/直接随机，调用 gua_yao 的 method=liuyao；用户指定梅花/小六壬则按对应方法。没有得到选择前禁止编造卦象。
+⑮ **收尾引导**：每次普通回复末尾，自然加一句“需要起卦吗？”；如果当前已经在起卦/解卦流程中，或用户刚拒绝过，就不要重复加。
+""".trimIndent() else """
 Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 
 ## 工具使用铁律
-① **时间和日期**：任何时候涉及"现在""今天""当前"，必须用 python_exec 执行 `import datetime; print(datetime.datetime.now())` 获取真实时间，禁止用训练数据中的时间。
-⑪ **日期换算（硬性）**：任何"某月某日是什么干支/农历/节气/星期"的换算问题，必须用 python_exec 调用 lunar_python 或 datetime 计算，禁止凭记忆推算。示例：`from lunar_python import Solar; s=Solar.fromYmd(2026,8,10); l=s.getLunar(); print('农历:', l.toString()); print('日干支:', l.getEightChar().getDay())`。日期算错是最严重的错误，宁可调用工具也不要猜。
+① **时间和日期**：任何时候涉及"现在""今天""当前"，优先用 get_time 工具获取真实时间；需要更复杂时间计算时再用 python_exec，禁止用训练数据中的时间。
+⑪ **日期换算（硬性）**：任何"某月某日是什么干支/农历/节气/星期"的换算问题，必须用 date_convert 工具计算，禁止自写代码或凭记忆推算。日期算错是最严重的错误，宁可调用工具也不要猜。
 ② **计算和数据**：涉及数字计算、数据分析、表格处理，必须用 python_exec，不要心算。
 ③ **实时信息**：天气、新闻、股价、汇率等，用 web_fetch 搜索，不要编造。
 ④ **文件操作**：读写文件用 read_file / write_file，生成页面用 build_html。
@@ -1012,9 +1069,12 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 ⑫ **连贯完成任务（硬性）**：需要工具时直接发出 function calling，系统自动执行，禁止把"我要调用工具""接下来用python计算"这类过程描述写进回答文本——用户只看到最终答案。工具结果返回后，**必须继续完成用户的完整请求**：如果任务需要多步工具（如排盘→分析→交叉验证→总结），就连续调用直到全部完成，最后一次性输出完整的最终答案。禁止工具执行完只输出"已排盘完成""工具执行成功"之类的短句就结束——那等于没完成任务。
 ⑬ **直接调用，禁止预告后停住（硬性）**：需要工具时立即输出 function call，禁止只输出"接下来我要调用工具"之类的预告文字后结束。若发现上一条回复只有预告、没有实际调用，本轮必须直接输出 function call。
 ⑩ **约定识别**：当用户提到未来的约定或承诺（"一会儿""等下""晚上""明天""下周"+要做的事）时，立即用 memory_save 记录。key 格式"约定-xxx"，content 必须写明：约定内容 + 约定时间（参照"## 当前时间"推算）。这样即使过很久，你也能在约定的时间提起它。
-
-${PlanParser.planInstruction()}
 """.trimIndent()
+        // 命理师有自己固定的分析流程，任务规划 JSON 指令反而占用大量 token 且容易干扰
+        val planPart = if (activePersonaId == "fortune") "" else "\n\n${PlanParser.planInstruction()}"
+        // 去掉 prompt 里的空行/多余空白，减少无效 token
+        val cleanPrompt = persona.prompt.lines().filter { it.isNotBlank() }.joinToString("\n")
+        return cleanPrompt + thinkingStyle + "\n\n" + agentRules + planPart
     }
 
     private fun buildHistoryMsgs(myMsgs: List<ChatMessage>, conversationDtos: MutableList<ChatMessageDto>) {
@@ -1022,15 +1082,22 @@ ${PlanParser.planInstruction()}
             // 文件上传消息：历史里只保留文件名提示，长预览不重复发送（全文在 workspace）
             ChatMessageDto(role = msg.role, content = slimFileMessage(msg.content))
         }
-        val keepRecent = 16
+        // 命理师在缓存与 token 之间取折中：保留更多原始历史利于缓存，但不设太大
+        val keepRecent = if (activePersonaId == "fortune") 20 else 16
         val userAssistant = historyMsgs.filter { it.role != "system" }
         if (userAssistant.size > keepRecent * 2) {
-            val dropped = userAssistant.dropLast(keepRecent * 2)
-            val oldCount = dropped.size
-            val userQs = dropped.filter { it.role == "user" }.mapNotNull { (it.content?.toString() ?: "").take(80) }
-            val asReplies = dropped.filter { it.role == "assistant" }.mapNotNull { (it.content?.toString() ?: "").take(80) }
+            // 缓存友好截断：保留开头几组稳定消息作为 anchor，
+            // 中间压缩成摘要，最近消息放最后。这样前缀尽量不变，提升 DeepSeek 前缀缓存命中。
+            val maxAnchor = (userAssistant.size - keepRecent * 2).coerceAtLeast(0)
+            val anchorCount = minOf(if (activePersonaId == "fortune") 2 else 4, maxAnchor)
+            val anchor = userAssistant.take(anchorCount)
+            val middle = userAssistant.drop(anchorCount).dropLast(keepRecent * 2)
+            val recent = userAssistant.takeLast(keepRecent * 2)
+            val oldCount = middle.size
+            val userQs = middle.filter { it.role == "user" }.mapNotNull { (it.content?.toString() ?: "").take(80) }
+            val asReplies = middle.filter { it.role == "assistant" }.mapNotNull { (it.content?.toString() ?: "").take(80) }
             val summary = buildString {
-                append("上下文摘要（前面 $oldCount 条消息）：")
+                append("上下文摘要（中间 $oldCount 条消息）：")
                 if (userQs.isNotEmpty()) {
                     append("用户处理过：")
                     userQs.take(5).forEachIndexed { i, q -> if (q.isNotBlank()) append("  ${i + 1}. $q") }
@@ -1039,10 +1106,13 @@ ${PlanParser.planInstruction()}
                     append(" 已完成：")
                     asReplies.takeLast(5).forEachIndexed { i, r -> if (r.isNotBlank()) append("  ${i + 1}. $r") }
                 }
-            }.take(600)
+            }.take(300)
             conversationDtos.addAll(historyMsgs.filter { it.role == "system" })
-            conversationDtos.add(ChatMessageDto(role = "system", content = summary))
-            conversationDtos.addAll(userAssistant.takeLast(keepRecent * 2))
+            conversationDtos.addAll(anchor)
+            if (middle.isNotEmpty()) {
+                conversationDtos.add(ChatMessageDto(role = "system", content = summary))
+            }
+            conversationDtos.addAll(recent)
         } else {
             conversationDtos.addAll(historyMsgs)
         }
@@ -1069,9 +1139,9 @@ ${PlanParser.planInstruction()}
         val files = wsDir.listFiles()?.toList() ?: return ""
         val count = files.size
         if (count == 0) return ""
-        val names = files.sortedBy { it.name }.take(15).joinToString(", ") { it.name }
+        val names = files.sortedBy { it.name }.take(10).joinToString(", ") { it.name }
         val pathHint = if (convId.isBlank()) "workspace/" else "workspace/${sanitize(convId)}/"
-        return "工作区（$pathHint）有 $count 个文件: $names" + if (count > 15) " ..." else ""
+        return "工作区（$pathHint）有 $count 个文件: $names" + if (count > 10) " ..." else ""
     }
 
     private suspend fun performSearch(query: String): String {
@@ -1105,31 +1175,31 @@ ${PlanParser.planInstruction()}
         val client = HttpClient.shortTimeout
         val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
         val req = Request.Builder().url(url).addHeader("User-Agent", "Mozilla/5.0").build()
-        val resp = client.newCall(req).execute()
-        val body = resp.body?.string() ?: return ""
-        resp.close()
-        val json = gson.fromJson(body, Map::class.java) ?: return ""
+        return client.newCall(req).execute().use { resp ->
+            val body = resp.body?.string() ?: return@use ""
+            val json = gson.fromJson(body, Map::class.java) ?: return@use ""
 
-        val sb = StringBuilder()
-        // 摘要/回答
-        (json["AbstractText"] as? String)?.takeIf { it.isNotBlank() }?.let {
-            sb.appendLine("【摘要】$it")
-            (json["AbstractSource"] as? String)?.let { src -> sb.appendLine("来源: $src") }
-        }
-        // 直接回答（如计算器、时间、天气）
-        (json["Answer"] as? String)?.takeIf { it.isNotBlank() }?.let {
-            sb.appendLine("【直接回答】$it")
-        }
-        // 相关条目
-        val topics = json["RelatedTopics"] as? List<Map<String, Any?>>
-        if (!topics.isNullOrEmpty()) {
-            sb.appendLine("\n【相关条目】")
-            topics.take(6).forEach { t ->
-                val text = (t["Text"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
-                sb.appendLine("- $text")
+            val sb = StringBuilder()
+            // 摘要/回答
+            (json["AbstractText"] as? String)?.takeIf { it.isNotBlank() }?.let {
+                sb.appendLine("【摘要】$it")
+                (json["AbstractSource"] as? String)?.let { src -> sb.appendLine("来源: $src") }
             }
+            // 直接回答（如计算器、时间、天气）
+            (json["Answer"] as? String)?.takeIf { it.isNotBlank() }?.let {
+                sb.appendLine("【直接回答】$it")
+            }
+            // 相关条目
+            val topics = json["RelatedTopics"] as? List<Map<String, Any?>>
+            if (!topics.isNullOrEmpty()) {
+                sb.appendLine("\n【相关条目】")
+                topics.take(4).forEach { t ->
+                    val text = (t["Text"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
+                    sb.appendLine("- $text")
+                }
+            }
+            sb.toString().trim()
         }
-        return sb.toString().trim()
     }
 
     private fun trySearchEngine(url: String, parser: (String) -> List<String>): String {
@@ -1138,11 +1208,11 @@ ${PlanParser.planInstruction()}
             .url(url)
             .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36")
             .build()
-        val resp = client.newCall(req).execute()
-        val html = resp.body?.string() ?: ""
-        resp.close()
-        val results = parser(html)
-        return if (results.isNotEmpty()) results.joinToString("\n\n") else ""
+        return client.newCall(req).execute().use { resp ->
+            val html = resp.body?.string() ?: ""
+            val results = parser(html)
+            if (results.isNotEmpty()) results.joinToString("\n\n") else ""
+        }
     }
 
     private fun parseSearchHtml(html: String): List<String> {
@@ -1150,8 +1220,8 @@ ${PlanParser.planInstruction()}
         // DDG Lite：每条结果是带链接和摘要的 <tr>
         val linkRegex = Regex("<a[^>]*href=\"([^\"]+)\"[^>]*>([^<]+)</a>")
         val snippetRegex = Regex("<td class=\"result-snippet\">([^<]+)</td>")
-        val matches = linkRegex.findAll(html).take(8)
-        val snippets = snippetRegex.findAll(html).take(8).map { it.groupValues[1].trim() }.toList()
+        val matches = linkRegex.findAll(html).take(5)
+        val snippets = snippetRegex.findAll(html).take(5).map { it.groupValues[1].trim() }.toList()
 
         matches.forEachIndexed { i, m ->
             val url = m.groupValues[1]
@@ -1168,7 +1238,7 @@ ${PlanParser.planInstruction()}
         val results = mutableListOf<String>()
         // Bing：结果位于 <li class="b_algo"> 中
         val blockRegex = Regex("<li class=\"b_algo\"[^>]*>(.*?)</li>", RegexOption.DOT_MATCHES_ALL)
-        val blocks = blockRegex.findAll(html).take(8)
+        val blocks = blockRegex.findAll(html).take(5)
         for ((i, block) in blocks.withIndex()) {
             val text = block.groupValues[1]
             val titleMatch = Regex("<a[^>]*>(.*?)</a>").find(text)
@@ -1271,7 +1341,7 @@ ${PlanParser.planInstruction()}
             val state = gson.fromJson(f.readText(Charsets.UTF_8), AgentState::class.java)
             if (state.conversationDtos.isNullOrEmpty()) return
             // 恢复轮的 agentSteps 基线：审计只检查恢复以来新增的步骤
-            val resumeBaseline = agentSteps.size
+            val resumeBaseline = agentStepsFor(currentConvId).size
 
             // 恢复计划状态（按对话隔离）
             val restoredPlan = if (state.planJson.isNotBlank()) {
@@ -1323,23 +1393,52 @@ ${PlanParser.planInstruction()}
                     dtos.add(ChatMessageDto(role = "system",
                         content = "你从断点恢复执行。之前的对话历史已保留。请检查当前进度并继续未完成的工作。"))
 
-                    val request = ChatRequest(
-                        model = profile.model,
-                        messages = dtos,
-                        reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) "max" else null,
-                        thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
-                        tools = gson.fromJson(ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
-                            GsonTypes.list(GsonTypes.stringAnyMap)),
-                        stream = false
-                    )
+                    // 恢复时也走完整 Agent 循环：如果模型继续返回工具调用，就继续执行而不是只取 content
+                    var currentDtos = dtos
+                    var currentMsgs = myMsgs
+                    var reply = ""
+                    var replyThinking = ""
+                    var rounds = 0
+                    while (true) {
+                        val request = ChatRequest(
+                            model = profile.model,
+                            messages = currentDtos,
+                            reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
+                                when (profile.reasoningLevel) {
+                                    "fast" -> "low"
+                                    "deep" -> "max"
+                                    else -> "medium"
+                                } else null,
+                            thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
+                            tools = gson.fromJson(ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
+                                GsonTypes.list(GsonTypes.stringAnyMap)),
+                            stream = false
+                        )
 
-                    // 简单的非流式恢复调用（原生 OkHttp，ApiHttpException 由外层 catch 兜底）
-                    val respBody = chatCompletion(profile, request)
-                    val reply = respBody.choices.firstOrNull()?.message?.content ?: ""
+                        val respBody = chatCompletion(profile, request)
+                        val msg = respBody.choices.firstOrNull()?.message
+                        if (msg == null) break
+                        if (!msg.toolCalls.isNullOrEmpty()) {
+                            if (rounds >= MAX_AGENT_ROUNDS) break
+                            currentMsgs = runToolCalls(msg, myConvId, currentMsgs, currentDtos, mutableMapOf(), rounds)
+                            rounds++
+                            continue
+                        }
+                        reply = msg.content ?: ""
+                        replyThinking = msg.reasoningContent ?: ""
+                        break
+                    }
+
                     withContext(Dispatchers.Main) {
-                        val (auditedText, badges, toolSteps) = finalizeAnswer(reply, resumeBaseline)
-                        myMsgs = myMsgs + ChatMessage(role = "assistant", content = auditedText, toolBadges = badges, toolSteps = toolSteps)
-                        commitMessages(myConvId, myMsgs)
+                        val (auditedText, badges, toolSteps) = finalizeAnswer(reply, resumeBaseline, myConvId)
+                        currentMsgs = currentMsgs + ChatMessage(
+                            role = "assistant",
+                            content = auditedText,
+                            thinking = replyThinking,
+                            toolBadges = badges,
+                            toolSteps = toolSteps
+                        )
+                        commitMessages(myConvId, currentMsgs)
                     }
                 } catch (e: Exception) {
                     withContext(Dispatchers.Main) {
