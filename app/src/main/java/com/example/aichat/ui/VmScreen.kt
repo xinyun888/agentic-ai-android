@@ -95,7 +95,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "第一步装 rootfs，然后离线装 QEMU，释放内核，创建磁盘，最后启动。QEMU 在 PRoot 里以 TCG 软件模拟运行，首次启动会比较慢。",
+                        "第一步装 rootfs，然后离线装 QEMU，释放 ISO，创建磁盘，最后启动。QEMU 在 PRoot 里以 TCG 软件模拟运行，首次启动会比较慢。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -157,14 +157,14 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                     onClick = {
                         busy = true
                         scope.launch {
-                            val r = manager.installNetbootFromAssets { msg -> scope.launch { appendLog(msg) } }
+                            val r = manager.installIsoFromAssets { msg -> scope.launch { appendLog(msg) } }
                             busy = false
                             refreshStatus()
                             if (r.isFailure) appendLog("失败: ${r.exceptionOrNull()?.message}")
                         }
                     },
                     modifier = Modifier.weight(1f)
-                ) { Text("3. 释放内核", maxLines = 1) }
+                ) { Text("3. 释放 ISO", maxLines = 1) }
 
                 OutlinedButton(
                     enabled = !busy && manager.rootfsInstalled() && manager.qemuInstalled() && manager.imagesReady() && !manager.diskReady(),

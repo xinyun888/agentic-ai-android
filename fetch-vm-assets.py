@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """下载 LinuxVM 完整离线运行时：
-- Alpine QEMU 依赖包（含递归依赖） -> app/src/main/assets/qemu/
-- Alpine netboot vmlinuz/initramfs/modloop -> app/src/main/assets/vm/
-
-需要联网。下载完成后重新构建 APK 即可完全离线运行 QEMU。
+- Alpine QEMU 依赖包 -> app/src/main/assets/qemu/
+- Alpine virt ISO    -> app/src/main/assets/vm/alpine-virt.iso
 """
 import os
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
 
 ALPINE_VERSION = "v3.24"
+ISO_VERSION = "3.24.2"
+ISO_URL = (
+    f"https://dl-cdn.alpinelinux.org/alpine/{ALPINE_VERSION}/releases/aarch64/"
+    f"alpine-virt-{ISO_VERSION}-aarch64.iso"
+)
 BASE = f"https://dl-cdn.alpinelinux.org/alpine/{ALPINE_VERSION}"
 ROOT = Path(__file__).resolve().parent
-ASSETS = ROOT / "app/src/main/assets"
-QEMU_DIR = ASSETS / "qemu"
-VM_DIR = ASSETS / "vm"
+QEMU_DIR = ROOT / "app/src/main/assets/qemu"
+VM_DIR = ROOT / "app/src/main/assets/vm"
 
 
 def fetch(url: str, out: Path, retries: int = 3) -> None:
@@ -30,7 +33,7 @@ def fetch(url: str, out: Path, retries: int = 3) -> None:
     last = None
     for i in range(retries):
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(out, "wb") as f:
+            with urllib.request.urlopen(url, timeout=300) as r, open(out, "wb") as f:
                 while True:
                     chunk = r.read(262144)
                     if not chunk:
@@ -46,7 +49,7 @@ def fetch(url: str, out: Path, retries: int = 3) -> None:
 
 
 def load_index(repo: str):
-    tmp = ROOT / f".apkindex-{repo}.tar.gz"
+    tmp = Path(tempfile.gettempdir()) / f"apkindex-{repo}-{os.getpid()}.tar.gz"
     fetch(f"{BASE}/{repo}/aarch64/APKINDEX.tar.gz", tmp)
     with tarfile.open(tmp, "r:gz") as t:
         data = t.extractfile("APKINDEX").read().decode("utf-8", "replace")
@@ -68,10 +71,9 @@ def main() -> int:
             if not name:
                 continue
             ver = next((l[2:] for l in lines if l.startswith("V:")), "")
-            size = int(next((l[2:] for l in lines if l.startswith("S:")), "0"))
             deps = next((l[2:] for l in lines if l.startswith("D:")), "").split()
             prov = next((l[2:] for l in lines if l.startswith("p:")), "").split()
-            pkgs[name] = {"repo": repo, "version": ver, "size": size, "deps": deps}
+            pkgs[name] = {"repo": repo, "version": ver, "deps": deps}
             for token in prov:
                 provides.setdefault(token.split("=")[0], []).append(name)
 
@@ -112,20 +114,15 @@ def main() -> int:
         manifest.append((fn, out.stat().st_size, url))
         total += out.stat().st_size
 
-    for fn in ("vmlinuz-virt", "initramfs-virt", "modloop-virt"):
-        url = f"{BASE}/releases/aarch64/netboot/{fn}"
-        out = VM_DIR / fn
-        fetch(url, out)
-        manifest.append((fn, out.stat().st_size, url))
-        total += out.stat().st_size
+    fetch(ISO_URL, VM_DIR / "alpine-virt.iso")
+    manifest.append(("alpine-virt.iso", (VM_DIR / "alpine-virt.iso").stat().st_size, ISO_URL))
+    total += (VM_DIR / "alpine-virt.iso").stat().st_size
 
     (QEMU_DIR / "MANIFEST.txt").write_text(
         "".join(f"{fn}\t{size}\t{url}\n" for fn, size, url in manifest),
         encoding="utf-8",
     )
     print(f"\n完成：{len(manifest)} 个文件，共 {total / 1024 / 1024:.1f} MB")
-    print(f"QEMU packages: {QEMU_DIR}")
-    print(f"netboot files: {VM_DIR}")
     return 0
 
 

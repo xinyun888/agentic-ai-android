@@ -1,3 +1,13 @@
+## v2.58.3（离线启动修正）
+
+- 发现并修正：netboot 的 `modloop=/vm/modloop-virt` 是宿主路径，guest initramfs 实际访问不到
+- 改为使用 APK 内置的 **Alpine virt ISO**：
+  - 内核 / initramfs / modloop / APK 仓库都在 ISO 内
+  - QEMU 通过 UEFI pflash + `-cdrom` + `-boot d` 启动
+  - 完全离线，首次启动直接进入 Alpine live 环境
+- 已在 Windows QEMU 上用同一组参数验证：能进入 `localhost login:`
+- APK 会变大（ISO 约 89MB），release 约 188MB
+
 # 版本记录
 
 ## v2.58.1（合体修复）
