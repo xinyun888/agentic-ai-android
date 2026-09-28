@@ -20,6 +20,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     var showProfileManager by mutableStateOf(false)
 
+    /** Linux 环境/终端页面 */
+    var showLinux by mutableStateOf(false)
+
     var activeConversationId by mutableStateOf(storage.getActiveConversationId())
         private set
 

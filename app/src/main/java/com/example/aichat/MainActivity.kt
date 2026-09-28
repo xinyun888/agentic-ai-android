@@ -6,7 +6,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.*
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.aichat.linux.PhoneBridgeManager
 import com.example.aichat.ui.ChatScreen
+import com.example.aichat.ui.LinuxScreen
 import com.example.aichat.ui.MainScreen
 import com.example.aichat.ui.ProfileScreen
 import com.example.aichat.ui.theme.AiChatTheme
@@ -17,6 +19,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // 启动 guest Linux -> 无障碍 的文件桥
+        PhoneBridgeManager.start(applicationContext)
         setContent {
             AiChatTheme {
                 val mainViewModel: MainViewModel = viewModel()
@@ -26,6 +30,11 @@ class MainActivity : ComponentActivity() {
                     ProfileScreen(
                         viewModel = mainViewModel,
                         onBack = { mainViewModel.showProfileManager = false }
+                    )
+                } else if (mainViewModel.showLinux) {
+                    LinuxScreen(
+                        manager = chatViewModel.linuxManager,
+                        onBack = { mainViewModel.showLinux = false }
                     )
                 } else if (mainViewModel.showChat && mainViewModel.activeConversationId.isNotEmpty()) {
                     val profile = mainViewModel.getActiveProfile()
@@ -49,5 +58,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onDestroy() {
+        PhoneBridgeManager.stop()
+        super.onDestroy()
     }
 }

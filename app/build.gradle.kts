@@ -16,6 +16,10 @@ val pythonExecutable: String = (project.findProperty("pythonExecutable") as? Str
     ?: localProps.getProperty("pythonExecutable")
     ?: "C:/Users/Lenovo/.workbuddy/binaries/python/versions/3.13.12/python.exe"
 
+// PRoot 在 Android 10+ targetSdk>=29 的 W^X 限制下可能无法执行 rootfs 内二进制。
+// 侧载构建 Linux 环境时可加 -PtargetSdk=28 绕过；默认仍保持现代 target。
+val targetSdkVersion: Int = (project.findProperty("targetSdk") as? String)?.toIntOrNull() ?: 35
+
 android {
     namespace = "com.example.aichat"
     compileSdk = 35
@@ -23,7 +27,7 @@ android {
     defaultConfig {
         applicationId = "com.example.aichat"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = targetSdkVersion
         versionCode = 1
         versionName = "1.0"
 
@@ -87,6 +91,13 @@ android {
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.10"
     }
+
+    packaging {
+        jniLibs {
+            // 让 libproot_exec.so 实际解压到 nativeLibraryDir，便于以可执行文件方式启动
+            useLegacyPackaging = true
+        }
+    }
 }
 
 chaquopy {
@@ -139,6 +150,9 @@ dependencies {
 
     // Gson（显式依赖；之前由 Retrofit converter-gson 传递引入）
     implementation("com.google.code.gson:gson:2.10.1")
+
+    // Alpine rootfs tar.gz 解压（无额外 Android 端依赖问题）
+    implementation("org.apache.commons:commons-compress:1.21")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

@@ -8,6 +8,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.aichat.data.*
 import com.example.aichat.data.tools.*
+import com.example.aichat.linux.LinuxRuntimeManager
 import com.example.aichat.python.PythonSessionManager
 import com.example.aichat.service.ActiveModeService
 import com.example.aichat.service.ScreenControlService
@@ -30,6 +31,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         // Agent 循环轮数上限：防止模型陷入工具循环无限烧 token
         private const val MAX_AGENT_ROUNDS = 30
+        // 单轮审计步骤上限：一次请求最多几轮工具，留足余量防止 runaway
+        private const val MAX_TURN_STEPS = 300
 
         // 花括号一律用字符类 [{]/[}]：Android ICU 正则引擎不认反斜杠转义的花括号，
         // 真机上会直接 PatternSyntaxException（JVM 单测通过 ≠ 真机通过）。
@@ -49,9 +52,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val storage = StorageManager(application)
     val workspace = Workspace(application)
     val pyManager = PythonSessionManager(application)
+    val linuxManager = LinuxRuntimeManager(application)
 
     init {
-        ToolRegistry.init { pyManager }
+        ToolRegistry.init({ pyManager }, { linuxManager })
         UsageMeter.init(application)
     }
 
@@ -96,8 +100,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     var agentSteps by mutableStateOf<List<AgentStep>>(emptyList())
         private set
     private val agentStepsByConv = ConcurrentHashMap<String, List<AgentStep>>()
+    /** 本轮（一次用户请求从发起到收尾）的步骤，审计/溯源只用它，避免被 100 条上限截断 */
+    private val turnStepsByConv = ConcurrentHashMap<String, List<AgentStep>>()
+
+    private fun beginTurn(convId: String) {
+        turnStepsByConv[convId] = emptyList()
+    }
+
+    private fun turnStepsFor(convId: String): List<AgentStep> = turnStepsByConv[convId] ?: emptyList()
 
     fun appendAgentStep(step: AgentStep, convId: String = currentConvId) {
+        val turnUpdated = ((turnStepsByConv[convId] ?: emptyList()) + step).takeLast(MAX_TURN_STEPS)
+        turnStepsByConv[convId] = turnUpdated
         val updated = ((agentStepsByConv[convId] ?: emptyList()) + step).takeLast(100)
         agentStepsByConv[convId] = updated
         if (convId == currentConvId) agentSteps = updated
@@ -318,12 +332,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         var msgs = myMsgs
         // 保留模型随工具调用输出的文本
         if (!msg.content.isNullOrBlank()) {
-            msgs = msgs + ChatMessage(role = "assistant", content = msg.content)
-            commitMessages(myConvId, msgs)
-            conversationDtos.add(ChatMessageDto(role = "assistant", content = msg.content))
+            // 工具轮里可能夹带计划完成标记：先更新进度，再对用户隐藏标记
+            trackTaskDone(msg.content, myConvId)
+            val cleanContent = stripTaskMarkers(msg.content)
+            if (cleanContent.isNotBlank()) {
+                msgs = msgs + ChatMessage(role = "assistant", content = cleanContent)
+                commitMessages(myConvId, msgs)
+            }
         }
-        // 不要把模型"我来搜索..."之类的闲聊传给 API — 那是噪音
-        conversationDtos.add(ChatMessageDto(role = "assistant", content = null, toolCalls = msg.toolCalls))
+        // DeepSeek 思考模式下，带 tool_calls 的 assistant 消息必须原样回传 reasoning_content，
+        // 否则下一轮请求会报 400: The `reasoning_content` in the thinking mode must be passed back to the API.
+        conversationDtos.add(ChatMessageDto(
+            role = "assistant",
+            content = msg.content?.takeIf { it.isNotBlank() }?.let { stripTaskMarkers(it) }?.takeIf { it.isNotBlank() },
+            toolCalls = msg.toolCalls,
+            reasoningContent = msg.reasoningContent
+        ))
         for (tc in msg.toolCalls.orEmpty()) {
             val args: Map<String, String> = try {
                 gson.fromJson(tc.function.arguments, GsonTypes.stringStringMap)
@@ -426,12 +450,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun appendSystemGua(
         args: Map<String, String>, guaText: String, conversationDtos: MutableList<ChatMessageDto>, convId: String
     ) {
-        val callId = "sys_gua_${System.currentTimeMillis()}"
-        conversationDtos.add(ChatMessageDto(role = "assistant", content = null,
-            toolCalls = listOf(ToolCallDto(id = callId, type = "function",
-                function = ToolCallFunctionDto(name = "gua_yao", arguments = gson.toJson(args))))))
-        conversationDtos.add(ChatMessageDto(role = "tool", toolCallId = callId,
-            content = "以下卦象已由系统起好，你只能解读，禁止另起卦或改写卦象。直接解读，不要说明卦象由谁生成、是否调用过工具。\n\n$guaText"))
+        conversationDtos.add(ChatMessageDto(
+            role = "system",
+            content = "系统已根据用户问题自动起卦。以下卦象是确定性结果，你只能解读，禁止另起卦或改写卦象；直接解读，不要说明卦象由谁生成、是否调用过工具。\n\n$guaText"
+        ))
         withContext(Dispatchers.Main) {
             appendAgentStep(AgentStep(type = "tool_call", toolName = "gua_yao", toolArgs = gson.toJson(args), auto = true), convId)
             appendAgentStep(AgentStep(type = "tool_result", toolName = "gua_yao", content = guaText.take(300), auto = true), convId)
@@ -452,9 +474,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return if (badges.isEmpty()) null else badges
     }
 
+    /** 计划进度标记只用于内部解析，不展示给用户 */
+    private fun stripTaskMarkers(text: String): String =
+        text.replace(Regex("""\s*\[TASK_DONE:\s*\d+]\s*"""), " ").trim()
+
+    /** 解析模型输出的 [TASK_DONE:id]，更新计划进度。工具轮和最终轮都会调用 */
+    private fun trackTaskDone(text: String, convId: String) {
+        val st = planStateOf(convId)
+        if (st.phase != PlanPhase.EXECUTING || st.plan == null) return
+        val newDone = Regex("""\[TASK_DONE:\s*(\d+)]""").findAll(text)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .toSet()
+        if (newDone.isEmpty()) return
+        updatePlanState(convId) { cur ->
+            val done = cur.completed + newDone
+            cur.copy(
+                completed = done,
+                phase = if (done.size >= (cur.plan?.tasks?.size ?: Int.MAX_VALUE)) PlanPhase.COMPLETED else cur.phase
+            )
+        }
+    }
+
     /** 审计 + 溯源：最终答案落盘前调用，返回 (带标注的最终文本, 溯源标签, 工具步骤快照) */
-    private fun finalizeAnswer(text: String, stepBaseline: Int, convId: String): Triple<String, List<String>?, List<AgentStep>?> {
-        val roundSteps = agentStepsFor(convId).drop(stepBaseline)
+    private fun finalizeAnswer(text: String, convId: String): Triple<String, List<String>?, List<AgentStep>?> {
+        val roundSteps = turnStepsFor(convId)
         val warnings = AnswerAuditor.check(text, roundSteps, activePersonaId)
         val finalText = if (warnings.isEmpty()) text
             else text + "\n\n" + warnings.joinToString("\n")
@@ -536,9 +579,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // 只挡当前对话，其他对话并行不受影响
         val myConvId = currentConvId
         if (myConvId in loadingConvs) return
-        // 本轮 agentSteps 基线：审计器只检查本次消息以来新增的步骤（Main 线程调用，读安全）
-        val stepBaseline = agentStepsFor(myConvId).size
-
         // 构建 API 内容（如适用则附带文件文本）
         var apiContent = content.ifBlank {
             if (hasImage) "请描述这张图片" else ""
@@ -577,6 +617,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         loadingConvs.add(myConvId)
         isLoading = myConvId in loadingConvs
         errorMessage = null
+        beginTurn(myConvId)
         // 保留之前的 agent 步骤，不清空
         // agentSteps = emptyList() — 已移除，以保留历史
 
@@ -762,6 +803,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 conversationDtos.addAll(dynamicSystemMsgs)
 
                 // 系统自动起卦注入：卦象消息对放在状态行之后（模型先读状态行再读卦象）
+                val thinkingMode = profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations
                 if (sysGua != null) {
                     appendSystemGua(sysGua.first, sysGua.second, conversationDtos, myConvId)
                 }
@@ -839,13 +881,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         messages = conversationDtos,
                         // 单次请求直接承担“工具决策 + 最终回答”，所以按用户档位设置推理强度，
                         // 不再额外发一次 final 请求，省掉一整套重复 prompt/tool schema。
-                        reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
+                        reasoningEffort = if (thinkingMode)
                             when (profile.reasoningLevel) {
                                 "fast" -> "low"
                                 "deep" -> "max"   // DeepSeek 只有 low/high/max 真正有效，max 才是深度推理
                                 else -> "medium"   // medium 映射为 high
                             } else null,
-                        thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
+                        thinking = if (thinkingMode) mapOf("type" to "enabled") else null,
                         tools = gson.fromJson(
                             ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
                             GsonTypes.list(GsonTypes.stringAnyMap)
@@ -892,17 +934,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
 
                         // 任务完成追踪（按对话隔离）
-                        val st = planStateOf(myConvId)
-                        if (st.phase == PlanPhase.EXECUTING && st.plan != null) {
-                            val doneRegex = Regex("""\[TASK_DONE:\s*(\d+)\]""").findAll(textContent)
-                            val newDone = doneRegex.mapNotNull { it.groupValues[1].toIntOrNull() }.toSet()
-                            if (newDone.isNotEmpty()) {
-                                updatePlanState(myConvId) { cur ->
-                                    val done = cur.completed + newDone
-                                    cur.copy(completed = done,
-                                        phase = if (done.size >= (cur.plan?.tasks?.size ?: Int.MAX_VALUE)) PlanPhase.COMPLETED else cur.phase)
-                                }
-                            }
+                        val planSnapshot = planStateOf(myConvId)
+                        trackTaskDone(textContent, myConvId)
+                        if (planSnapshot.phase == PlanPhase.EXECUTING && planSnapshot.plan != null) {
                             // 用户记忆：自动检测偏好表述
                             val prefPatterns = listOf(
                                 Regex("""用户(偏好|习惯|喜欢|倾向于)(.+?)[。.]"""),
@@ -917,8 +951,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         // 直接使用本轮非工具回答作为最终答案，不再发第二次 final 请求
                         val finalText = msg.content ?: ""
                         val finalThink = msg.reasoningContent ?: ""
-                        // 空答案保护：任何情况下都不落盘空消息（服务端出幺蛾子时兜底）
-                        val display = if (finalText.isBlank()) "⚠️ 本轮未生成回答，请重试。" else finalText
+                        // [TASK_DONE:id] 是计划进度内部标记，解析完进度后对用户隐藏
+                        val cleanFinalText = stripTaskMarkers(finalText)
+                        val display = if (cleanFinalText.isBlank()) {
+                            if (finalText.isBlank()) "\u26A0\uFE0F 本轮未生成回答，请重试。" else "\u2705 已完成当前步骤。"
+                        } else cleanFinalText
                         val wasLength = finishReason == "length"
 
                         // 用 NonCancellable 收尾，避免退到后台时丢失消息
@@ -926,7 +963,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             val paipan = pendingPaipanByConv[myConvId]
                             setPendingPaipan(myConvId, null)
                             // 审计 + 溯源：伪造卦象/日期会被打标；溯源标签与工具步骤快照随消息落盘
-                            val (auditedText, badges, toolSteps) = finalizeAnswer(display, stepBaseline, myConvId)
+                            val (auditedText, badges, toolSteps) = finalizeAnswer(display, myConvId)
                             myMsgs = myMsgs.filter { it.role != "assistant_live" } + ChatMessage(
                                 role = "assistant",
                                 content = auditedText,
@@ -938,7 +975,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             commitMessages(myConvId, myMsgs)
                         }
                         // API 上下文里保持原文（审计标注只给用户看，不进上下文）
-                        conversationDtos.add(ChatMessageDto(role = "assistant", content = display))
+                        conversationDtos.add(ChatMessageDto(
+                            role = "assistant",
+                            content = display,
+                            reasoningContent = if (thinkingMode) finalThink.takeIf { it.isNotBlank() } else null
+                        ))
                         finishReason = "stop"
 
                         // length 说明被 max_tokens 截断，自动续写
@@ -1308,7 +1349,8 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
                         "role" to dto.role,
                         "content" to (dto.content?.toString() ?: ""),
                         "tool_calls" to (dto.toolCalls?.let { gson.toJson(it) } ?: ""),
-                        "tool_call_id" to (dto.toolCallId ?: "")
+                        "tool_call_id" to (dto.toolCallId ?: ""),
+                        "reasoning_content" to (dto.reasoningContent ?: "")
                     )
                 },
                 round = round,
@@ -1340,9 +1382,6 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
         try {
             val state = gson.fromJson(f.readText(Charsets.UTF_8), AgentState::class.java)
             if (state.conversationDtos.isNullOrEmpty()) return
-            // 恢复轮的 agentSteps 基线：审计只检查恢复以来新增的步骤
-            val resumeBaseline = agentStepsFor(currentConvId).size
-
             // 恢复计划状态（按对话隔离）
             val restoredPlan = if (state.planJson.isNotBlank()) {
                 val raw = gson.fromJson(state.planJson, TaskPlan::class.java)
@@ -1379,11 +1418,14 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
                 try {
                     loadingConvs.add(myConvId)
                     isLoading = myConvId in loadingConvs
+                    beginTurn(myConvId)
+                    val thinkingMode = profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations
                     val dtos = state.conversationDtos.map { dto ->
                         ChatMessageDto(
                             role = dto["role"] as? String ?: "",
                             content = dto["content"] ?: "",
                             toolCallId = (dto["tool_call_id"] as? String)?.ifBlank { null },
+                            reasoningContent = (dto["reasoning_content"] as? String)?.ifBlank { null },
                             toolCalls = (dto["tool_calls"] as? String)?.takeIf { it.isNotBlank() }?.let {
                                 gson.fromJson(it, GsonTypes.list(ToolCallDto::class.java))
                             }
@@ -1403,13 +1445,13 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
                         val request = ChatRequest(
                             model = profile.model,
                             messages = currentDtos,
-                            reasoningEffort = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations)
+                            reasoningEffort = if (thinkingMode)
                                 when (profile.reasoningLevel) {
                                     "fast" -> "low"
                                     "deep" -> "max"
                                     else -> "medium"
                                 } else null,
-                            thinking = if (profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations) mapOf("type" to "enabled") else null,
+                            thinking = if (thinkingMode) mapOf("type" to "enabled") else null,
                             tools = gson.fromJson(ToolRegistry.toolCallsToJson(personaId = activePersonaId, screenAvailable = ScreenControlService.isAvailable()),
                                 GsonTypes.list(GsonTypes.stringAnyMap)),
                             stream = false
@@ -1430,7 +1472,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
                     }
 
                     withContext(Dispatchers.Main) {
-                        val (auditedText, badges, toolSteps) = finalizeAnswer(reply, resumeBaseline, myConvId)
+                        val (auditedText, badges, toolSteps) = finalizeAnswer(reply, myConvId)
                         currentMsgs = currentMsgs + ChatMessage(
                             role = "assistant",
                             content = auditedText,

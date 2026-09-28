@@ -17,7 +17,8 @@ data class ChatMessageDto(
     val role: String,           // "user" | "assistant" | "system" | "tool"
     val content: Any? = null,   // String for text, List<Map> for multimodal
     @SerializedName("tool_calls") val toolCalls: List<ToolCallDto>? = null,
-    @SerializedName("tool_call_id") val toolCallId: String? = null
+    @SerializedName("tool_call_id") val toolCallId: String? = null,
+    @SerializedName("reasoning_content") val reasoningContent: String? = null
 )
 
 data class ToolCallDto(

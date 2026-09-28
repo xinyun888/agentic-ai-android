@@ -112,11 +112,35 @@ class ActiveModeService : Service() {
                 handleHeartbeat(personaId)
             }
             action == ACTION_BOOT_RESUME -> {
-                // 设备重启后恢复：重新注册所有陪伴角色的闹钟
-                configs.keys.forEach { pid ->
-                    if (pid in runningPersonas) scheduleAlarm(pid)
+                if (configs.isEmpty()) {
+                    stopSelf()
+                } else {
+                    // 先注册闹钟：即使前台启动失败，后续心跳也能由 AlarmManager 拉起
+                    configs.keys.forEach { pid ->
+                        if (pid in runningPersonas) scheduleAlarm(pid)
+                    }
+                    // BootReceiver 用 startForegroundService 拉起，必须在 5 秒内进入前台
+                    val firstPid = configs.keys.firstOrNull()
+                    if (firstPid == null) {
+                        stopSelf()
+                    } else {
+                        val firstPersona = Personas.getByIdWithCustom(firstPid, this)
+                        val fgId = 2000 + Math.floorMod(firstPid.hashCode(), 1000)
+                        try {
+                            startForeground(
+                                fgId,
+                                buildNotification(
+                                    "${firstPersona.emoji} ${firstPersona.name} 正在陪伴",
+                                    "已恢复主动模式，共 ${configs.size} 个角色",
+                                    fgId
+                                )
+                            )
+                        } catch (_: Exception) {
+                            // 前台启动失败就退出；闹钟已经注册，后续心跳仍会尝试
+                            stopSelf()
+                        }
+                    }
                 }
-                if (configs.isEmpty()) stopSelf()
             }
         }
         return START_STICKY
@@ -357,12 +381,15 @@ class ActiveModeService : Service() {
             "max_tokens" to if (immersive) 512 else 350,
             "stream" to false
         )
-        bodyMap["reasoning_effort"] = when (profile.reasoningLevel) {
-            "fast" -> "low"
-            "deep" -> "max"
-            else -> "medium"
+        // 与主聊天保持一致：只有开启思考模式才发送推理参数，避免第三方后端 400
+        if (profile.thinkingEnabled) {
+            bodyMap["reasoning_effort"] = when (profile.reasoningLevel) {
+                "fast" -> "low"
+                "deep" -> "max"
+                else -> "medium"
+            }
+            if (showThinking) bodyMap["thinking"] = mapOf("type" to "enabled")
         }
-        if (showThinking) bodyMap["thinking"] = mapOf("type" to "enabled")
         val bodyJson = gson.toJson(bodyMap)
         val bodyStr = try {
             client.newCall(Request.Builder()

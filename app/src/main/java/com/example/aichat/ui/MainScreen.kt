@@ -35,6 +35,9 @@ fun MainScreen(
             TopAppBar(
                 title = { Text("命苦打工人") },
                 actions = {
+                    IconButton(onClick = { viewModel.showLinux = true }) {
+                        Icon(Icons.Filled.Terminal, contentDescription = "Linux 环境")
+                    }
                     IconButton(onClick = { viewModel.showProfileManager = true }) {
                         Icon(Icons.Outlined.Tune, contentDescription = "API 配置")
                     }

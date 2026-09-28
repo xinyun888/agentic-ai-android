@@ -79,5 +79,7 @@ object PlanParser {
 - 有模糊环节时在 question 中写明需要确认什么
 - 完成计划 JSON 后等待用户确认，不要立即执行
 - 用户确认后逐步执行，每步完成后汇报进度
+- 每完成一个任务，必须在该轮回复中输出标记 [TASK_DONE:任务id]，id 与计划中 tasks[].id 一致，然后再继续下一项
+- 所有任务完成后，在总结中逐条输出已完成的 [TASK_DONE:id]
     """.trimIndent()
 }

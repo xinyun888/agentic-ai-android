@@ -32,3 +32,10 @@ hs_err_pid*.log
 replay_pid*.log
 *.class
 *.jar
+
+# Linux runtime assets (run fetch-linux-runtime.ps1 to download)
+app/src/main/jniLibs/
+app/src/main/assets/linux/*.tar.gz
+
+# Local built APKs
+dist/

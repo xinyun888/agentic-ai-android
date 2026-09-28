@@ -8,6 +8,7 @@ import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.example.aichat.data.HttpClient
+import com.example.aichat.linux.LinuxRuntimeManager
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -486,6 +487,45 @@ class BuildHtmlTool : Tool {
     }
 }
 
+// ==================== Linux 环境 ====================
+
+class LinuxExecTool(private val linuxManager: () -> LinuxRuntimeManager?) : Tool {
+    override val definition = ToolDef(
+        name = "linux_exec",
+        description = "在本地 Alpine Linux 环境中执行 shell 命令。工作区映射到 /workspace，手机控制通过 phone 命令（如 phone dump / phone tap 100 200 / phone text 你好）。支持 apk add 安装软件，适合复杂自动化脚本。",
+        parameters = mapOf(
+            "type" to "object",
+            "properties" to mapOf(
+                "command" to mapOf("type" to "string", "description" to "要执行的 shell 命令"),
+                "timeout" to mapOf("type" to "string", "description" to "超时秒数，默认600，最大3600")
+            ),
+            "required" to listOf("command")
+        )
+    )
+
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
+        val manager = linuxManager() ?: LinuxRuntimeManager(context.applicationContext)
+        val command = args["command"] ?: return ToolResult("", false, "缺少 command 参数")
+        if (!manager.rootfsInstalled()) {
+            return ToolResult("", false, "Linux 环境未安装。请先在 Linux 环境页面安装 Alpine rootfs。")
+        }
+        if (manager.prootFile() == null) {
+            return ToolResult("", false, "缺少 PRoot 可执行文件。请先运行 fetch-linux-runtime.ps1 并重新构建 APK。")
+        }
+        val timeout = (args["timeout"]?.trim()?.toLongOrNull() ?: 600L).coerceIn(5L, 3600L)
+        val result = manager.exec(command, convId, timeout)
+        val status = when {
+            result.timedOut -> "\u274C 命令执行超时（${timeout}s）"
+            result.exitCode == 0 -> "\u2705 命令执行完成"
+            else -> "\u274C 命令退出码: ${result.exitCode}"
+        }
+        return ToolResult("", result.exitCode == 0 && !result.timedOut, "$status\n${result.output}")
+    }
+}
+
 // ==================== 注册表 ====================
 
 // ==================== Python 工具 ====================
@@ -548,15 +588,19 @@ class PythonSessionCloseTool(private val pyManager: () -> com.example.aichat.pyt
         parameters = mapOf(
             "type" to "object",
             "properties" to mapOf(
-                "session" to mapOf("type" to "string", "description" to "要关闭的会话标识，留空关闭默认会话")
+                "session" to mapOf("type" to "string", "description" to "要关闭的会话标识，留空关闭当前对话的默认会话")
             ),
             "required" to emptyList<String>()
         )
     )
 
-    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult {
+    override suspend fun execute(args: Map<String, String>, context: android.content.Context): ToolResult =
+        executeForConv(args, context, "")
+
+    override suspend fun executeForConv(args: Map<String, String>, context: android.content.Context, convId: String): ToolResult {
         val py = pyManager() ?: return ToolResult("", false, "Python 环境未初始化")
-        val session = args["session"] ?: "default"
+        val session = args["session"]?.takeIf { it.isNotBlank() }
+            ?: if (convId.isBlank()) "default" else "conv_$convId"
         py.closeSession(session)
         return ToolResult("", true, "会话 '$session' 已关闭")
     }
@@ -1274,7 +1318,10 @@ object ToolRegistry {
     private var tools: List<Tool> = emptyList()
     private val gson = Gson()
 
-    fun init(pyManager: () -> com.example.aichat.python.PythonSessionManager?) {
+    fun init(
+        pyManager: () -> com.example.aichat.python.PythonSessionManager?,
+        linuxManager: () -> LinuxRuntimeManager?
+    ) {
         tools = listOf(
             ReadFileTool(), WriteFileTool(), DeleteFileTool(), ListFilesTool(),
             WebFetchTool(), RegexTool(), TimeTool(),
@@ -1282,6 +1329,7 @@ object ToolRegistry {
             BuildHtmlTool(),
             PythonExecTool(pyManager),
             PythonSessionCloseTool(pyManager),
+            LinuxExecTool(linuxManager),
             BaziPaipanTool(pyManager), DateConvertTool(pyManager),
             MemorySaveTool(), MemoryLoadTool(),
             GuaYaoTool(),
@@ -1291,7 +1339,7 @@ object ToolRegistry {
     }
 
     fun getDefinitions(): List<ToolDef> {
-        if (tools.isEmpty()) init { null }
+        if (tools.isEmpty()) init({ null }, { null })
         return tools.map { it.definition }
     }
 
@@ -1303,7 +1351,7 @@ object ToolRegistry {
         "clipboard_write", "share_text", "session_close", "date_convert",
         "delete_file", "write_file" -> Gate.KEEP
         "python_exec", "bazi_paipan", "list_files" -> Gate.COMPACT
-        "web_fetch", "read_file", "http_request" -> Gate.SPILL
+        "web_fetch", "read_file", "http_request", "linux_exec" -> Gate.SPILL
         else -> Gate.COMPACT
     }
 
@@ -1363,7 +1411,7 @@ object ToolRegistry {
     // 命理师工具子集：只下发命理相关的工具，减少模型选择负担与 token
     private val FORTUNE_TOOLS = setOf(
         "python_exec", "session_close", "bazi_paipan", "date_convert", "gua_yao",
-        "memory_save", "memory_load", "get_time"
+        "memory_save", "memory_load", "get_time", "linux_exec"
     )
 
     fun toolCallsToJson(personaId: String = "", screenAvailable: Boolean = false): String = gson.toJson(
