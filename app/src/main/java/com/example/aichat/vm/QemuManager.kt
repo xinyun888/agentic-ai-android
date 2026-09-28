@@ -1,6 +1,7 @@
 package com.example.aichat.vm
 
 import android.content.Context
+import android.os.Build
 import com.example.aichat.linux.LinuxRuntimeManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -9,7 +10,7 @@ import okhttp3.Request
 import java.io.File
 import java.util.concurrent.TimeUnit
 
-class QemuManager(private val context: Context) {
+class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) {
 
     companion object {
         const val ALPINE_VERSION = "v3.24"
@@ -18,7 +19,6 @@ class QemuManager(private val context: Context) {
         const val QEMU_GUEST_PATH = "/usr/bin/qemu-system-aarch64"
     }
 
-    val linux = LinuxRuntimeManager(context)
     val vmDir: File = linux.vmDir
 
     private val client = OkHttpClient.Builder()
@@ -33,10 +33,13 @@ class QemuManager(private val context: Context) {
 
     fun rootfsInstalled(): Boolean = linux.rootfsInstalled()
 
+    fun abiSupported(): Boolean = Build.SUPPORTED_ABIS.any { it.contains("arm64") }
+
     fun qemuApkAssetsReady(): Boolean =
-        (context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0) > 0
+        abiSupported() && (context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0) > 0
 
     fun netbootAssetsReady(): Boolean {
+        if (!abiSupported()) return false
         val names = context.assets.list("vm")?.toSet() ?: emptySet()
         return names.containsAll(setOf("vmlinuz-virt", "initramfs-virt", "modloop-virt"))
     }
@@ -48,6 +51,9 @@ class QemuManager(private val context: Context) {
     suspend fun installQemuFromAssets(onProgress: (String) -> Unit): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
+                if (!abiSupported()) {
+                    return@withContext Result.failure(IllegalStateException("当前设备/ABI 不支持内置 arm64 VM 运行时"))
+                }
                 if (qemuInstalled()) {
                     onProgress("QEMU 已安装")
                     return@withContext Result.success(Unit)
@@ -55,6 +61,8 @@ class QemuManager(private val context: Context) {
                 if (!rootfsInstalled()) {
                     return@withContext Result.failure(IllegalStateException("请先安装 Alpine rootfs"))
                 }
+                onProgress("检查并修复 rootfs 符号链接 ...")
+                linux.fixRootfsSymlinks()
                 val names = context.assets.list("qemu")?.filter { it.endsWith(".apk") } ?: emptyList()
                 if (names.isEmpty()) {
                     return@withContext Result.failure(IllegalStateException("assets/qemu 为空"))
@@ -79,6 +87,8 @@ class QemuManager(private val context: Context) {
                         )
                     )
                 }
+                onProgress("修复 rootfs 绝对符号链接 ...")
+                linux.fixRootfsSymlinks()
                 onProgress("QEMU 离线安装完成")
                 Result.success(Unit)
             } catch (e: Exception) {
@@ -90,6 +100,9 @@ class QemuManager(private val context: Context) {
     suspend fun installNetbootFromAssets(onProgress: (String) -> Unit): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
+                if (!abiSupported()) {
+                    return@withContext Result.failure(IllegalStateException("当前设备/ABI 不支持内置 arm64 VM 运行时"))
+                }
                 val names = context.assets.list("vm")?.toSet() ?: emptySet()
                 for (file in listOf("vmlinuz-virt", "initramfs-virt", "modloop-virt")) {
                     if (file !in names) {
@@ -127,6 +140,7 @@ class QemuManager(private val context: Context) {
         val qemuApkCount = context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0
         appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 ${qemuApkCount} 个" else "\u274C 缺失")
         appendLine("内核包: " + if (netbootAssetsReady()) "\u2705 已内置" else "\u274C 缺失")
+        appendLine("架构: " + if (abiSupported()) "\u2705 arm64" else "\u274C 当前仅内置 arm64 VM 运行时")
         appendLine("VM 目录: ${vmDir.absolutePath}")
     }
 
@@ -139,6 +153,8 @@ class QemuManager(private val context: Context) {
             if (!rootfsInstalled()) {
                 return@withContext Result.failure(IllegalStateException("请先安装 Alpine rootfs"))
             }
+            onProgress("检查并修复 rootfs 符号链接 ...")
+            linux.fixRootfsSymlinks()
             onProgress("apk update ...")
             val update = linux.exec("apk update", timeoutSec = 600)
             if (update.exitCode != 0) {
@@ -156,6 +172,8 @@ class QemuManager(private val context: Context) {
                     IllegalStateException("安装 QEMU 失败:\n${install.output.takeLast(3000)}")
                 )
             }
+            onProgress("修复 rootfs 绝对符号链接 ...")
+            linux.fixRootfsSymlinks()
             onProgress("QEMU 安装完成")
             Result.success(Unit)
         } catch (e: Exception) {
@@ -177,8 +195,8 @@ class QemuManager(private val context: Context) {
     suspend fun createDisk(sizeGb: Int = 8, onProgress: (String) -> Unit): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
-                if (!rootfsInstalled()) {
-                    return@withContext Result.failure(IllegalStateException("请先安装 rootfs"))
+                if (!rootfsInstalled() || !qemuInstalled()) {
+                    return@withContext Result.failure(IllegalStateException("请先安装 rootfs 和 QEMU"))
                 }
                 if (diskReady()) {
                     onProgress("磁盘已存在")
@@ -211,7 +229,7 @@ class QemuManager(private val context: Context) {
         "-kernel", "/vm/vmlinuz-virt",
         "-initrd", "/vm/initramfs-virt",
         "-append",
-        "console=ttyAMA0 modules=loop,squashfs,virtio_blk,virtio_pci,virtio_net ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/main modloop=/vm/modloop-virt",
+        "console=ttyAMA0 modules=loop,squashfs,virtio_blk,virtio_pci,virtio_net ip=dhcp alpine_repo=http://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/main modloop=/vm/modloop-virt",
         "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
         "-netdev", "user,id=n0",
         "-device", "virtio-net-pci,netdev=n0",
@@ -222,11 +240,17 @@ class QemuManager(private val context: Context) {
     private var activeSession: QemuSession? = null
 
     fun startSession(memoryMb: Int = 1024, smp: Int = 2): QemuSession? {
+        if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
         stopSession()
-        return QemuSession(linux, buildQemuArgs(memoryMb, smp)).also {
-            activeSession = it
-            it.start()
+        return try {
+            QemuSession(linux, buildQemuArgs(memoryMb, smp)).also {
+                activeSession = it
+                it.start()
+            }
+        } catch (_: Exception) {
+            stopSession()
+            null
         }
     }
 

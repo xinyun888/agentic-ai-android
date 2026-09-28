@@ -17,6 +17,7 @@ import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.nio.file.Files
 
 /**
  * PRoot + Alpine Linux 运行时。
@@ -321,6 +322,41 @@ rm -f "${'$'}RESP"
         return null
     }
 
+    /**
+     * Alpine 的 apk add 会把包里的绝对符号链接原样展开，例如 /bin/sh -> /bin/busybox。
+     * 在 Android 宿主上这会导致 guest 解析到宿主根目录，所以安装完 QEMU 后要把
+     * rootfs 内的绝对符号链接统一改成相对链接。
+     */
+    fun fixRootfsSymlinks() {
+        if (!rootfsInstalled()) return
+        try {
+            walkNoFollow(rootfsDir) { file ->
+                try {
+                    if (!Files.isSymbolicLink(file.toPath())) return@walkNoFollow
+                    val target = Os.readlink(file.absolutePath) ?: return@walkNoFollow
+                    if (!target.startsWith("/")) return@walkNoFollow
+                    val parent = file.parentFile ?: return@walkNoFollow
+                    val targetHost = File(rootfsDir, target.trimStart('/'))
+                    val relative = parent.toPath().relativize(targetHost.toPath())
+                        .toString().replace('\\', '/')
+                    file.delete()
+                    Os.symlink(relative, file.absolutePath)
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun walkNoFollow(dir: File, action: (File) -> Unit) {
+        dir.listFiles()?.forEach { file ->
+            action(file)
+            if (file.isDirectory && !Files.isSymbolicLink(file.toPath())) {
+                walkNoFollow(file, action)
+            }
+        }
+    }
+
     private fun configureRootfs(root: File) {
         root.mkdirs()
         File(root, "dev").mkdirs()
@@ -462,9 +498,11 @@ rm -f "${'$'}RESP"
             while (true) {
                 val n = reader.read(buf)
                 if (n < 0) break
-                val take = minOf(n, limit - sb.length)
-                if (take <= 0) break
-                sb.append(buf, 0, take)
+                if (sb.length < limit) {
+                    val take = minOf(n, limit - sb.length)
+                    sb.append(buf, 0, take)
+                }
+                // 超过上限后继续读并丢弃，防止子进程写满管道后卡死
             }
         }
         if (sb.length >= limit) sb.append("\n...[输出已截断]")

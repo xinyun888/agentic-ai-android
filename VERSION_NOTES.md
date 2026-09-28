@@ -1,5 +1,16 @@
 # 版本记录
 
+## v2.58.1（合体修复）
+
+- 修复长命令输出超过 200k 后可能卡死的问题
+- QEMU 与 chat-app 共用同一个 LinuxRuntimeManager，避免双 manager 作用域冲突
+- 离线 QEMU 安装前先修复 rootfs 绝对符号链接，安装后再修复一次
+- 预修正 busybox-binsh 包内的 `/bin/sh -> /bin/busybox` 为相对链接，防止 apk 安装断开 guest shell
+- VM 页面增加 arm64 ABI 检查；非 arm64 设备禁用 VM 功能
+- 创建磁盘前强制检查 QEMU 已安装
+- QEMU 启动异常时清理 session，避免残留进程
+- Boot 参数改用 HTTP Alpine repo，避免 initramfs 无证书时引导失败
+
 ## v2.58（合体版）
 
 在 chat-app 内合并 Linux VM 能力：

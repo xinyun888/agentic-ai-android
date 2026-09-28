@@ -95,7 +95,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "第一步装 rootfs，然后装 QEMU，下载内核，创建磁盘，最后启动。QEMU 在 PRoot 里以 TCG 软件模拟运行，首次启动会比较慢。",
+                        "第一步装 rootfs，然后离线装 QEMU，释放内核，创建磁盘，最后启动。QEMU 在 PRoot 里以 TCG 软件模拟运行，首次启动会比较慢。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -118,7 +118,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
-                    enabled = !busy && !manager.rootfsInstalled(),
+                    enabled = !busy && manager.abiSupported() && !manager.rootfsInstalled(),
                     onClick = {
                         busy = true
                         scope.launch {
@@ -167,7 +167,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 ) { Text("3. 释放内核", maxLines = 1) }
 
                 OutlinedButton(
-                    enabled = !busy && manager.rootfsInstalled() && !manager.diskReady(),
+                    enabled = !busy && manager.rootfsInstalled() && manager.qemuInstalled() && manager.imagesReady() && !manager.diskReady(),
                     onClick = {
                         busy = true
                         scope.launch {
@@ -185,7 +185,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    enabled = !running && manager.qemuInstalled() && manager.imagesReady() && manager.diskReady(),
+                    enabled = !running && manager.abiSupported() && manager.qemuInstalled() && manager.imagesReady() && manager.diskReady(),
                     onClick = {
                         val s = manager.startSession()
                         if (s == null) {
