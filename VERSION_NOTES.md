@@ -1,5 +1,17 @@
 # 版本记录
 
+## v2.58（合体版）
+
+在 chat-app 内合并 Linux VM 能力：
+
+- 新增 `vm/QemuManager`、`vm/QemuSession`
+- 新增 `ui/VmScreen`
+- APK 内置完整离线 QEMU 包与 Alpine netboot（`assets/qemu`、`assets/vm`）
+- 主界面新增 QEMU 虚拟机入口
+- 保留原有全部功能：AI 聊天、Agent 工具、无障碍手机控制、PhoneBridge、主动模式、命理师等
+- 支持 targetSdk=35 构建，也支持 `build-linux.bat` 的 targetSdk=28 侧载构建
+- 推荐侧载使用 `AI-Chat-v2.58-combined-linux-target28-release.apk`，避免 Android 10+ W^X 限制
+
 ## v2.57（当前版本）
 
 完成内容：

@@ -35,6 +35,9 @@ fun MainScreen(
             TopAppBar(
                 title = { Text("命苦打工人") },
                 actions = {
+                    IconButton(onClick = { viewModel.showVm = true }) {
+                        Icon(Icons.Filled.Computer, contentDescription = "QEMU 虚拟机")
+                    }
                     IconButton(onClick = { viewModel.showLinux = true }) {
                         Icon(Icons.Filled.Terminal, contentDescription = "Linux 环境")
                     }

@@ -39,3 +39,5 @@ app/src/main/assets/linux/*.tar.gz
 
 # Local built APKs
 dist/
+app/src/main/assets/qemu/
+app/src/main/assets/vm/

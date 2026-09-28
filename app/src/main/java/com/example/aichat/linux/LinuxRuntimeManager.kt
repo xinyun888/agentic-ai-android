@@ -79,8 +79,9 @@ rm -f "${'$'}RESP"
 
     val bridgeDir: File = File(appContext.filesDir, BRIDGE_DIR_NAME).also { it.mkdirs() }
     private val linuxRoot = File(appContext.filesDir, LINUX_DIR_NAME)
-    private val rootfsDir = File(linuxRoot, ROOTFS_DIR_NAME)
+    val rootfsDir = File(linuxRoot, ROOTFS_DIR_NAME)
     private val workspaceRoot = File(appContext.filesDir, "workspace").also { it.mkdirs() }
+    val vmDir = File(appContext.filesDir, "vm").also { it.mkdirs() }
     private val cacheDir = appContext.cacheDir
     private val scope = kotlinx.coroutines.CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -196,7 +197,8 @@ rm -f "${'$'}RESP"
             "-b", "/proc",
             "-b", "/sys",
             "-b", "${bridgeDir.absolutePath}:/phone",
-            "-b", "${wsDir.absolutePath}:/workspace"
+            "-b", "${wsDir.absolutePath}:/workspace",
+            "-b", "${vmDir.absolutePath}:/vm"
         )
         cmd += listOf(
             "/usr/bin/env", "-i",
@@ -252,6 +254,53 @@ rm -f "${'$'}RESP"
             val output = runCatching { outputDeferred.await() }.getOrDefault("")
             ExecResult(output = output, exitCode = process.exitValue())
         }
+    }
+
+    /** 构建 PRoot 启动参数；QEMU 等交互式进程可复用。 */
+    fun buildProotCommand(
+        payload: List<String>,
+        extraBinds: List<Pair<String, String>> = emptyList()
+    ): List<String> {
+        val proot = prootFile() ?: throw IllegalStateException("PRoot 未打包")
+        val cmd = mutableListOf<String>()
+        cmd += proot.absolutePath
+        cmd += listOf(
+            "--link2symlink",
+            "--kill-on-exit",
+            "-0",
+            "-r", rootfsDir.absolutePath,
+            "-w", "/root",
+            "-b", "/dev",
+            "-b", "/proc",
+            "-b", "/sys",
+            "-b", "${bridgeDir.absolutePath}:/phone",
+            "-b", "${workspaceRoot.absolutePath}:/workspace",
+            "-b", "${vmDir.absolutePath}:/vm"
+        )
+        extraBinds.forEach { (host, guest) -> cmd += listOf("-b", "$host:$guest") }
+        cmd += payload
+        return cmd
+    }
+
+    /** 启动交互式进程（QEMU、shell 等）。 */
+    fun startProcess(
+        payload: List<String>,
+        extraBinds: List<Pair<String, String>> = emptyList()
+    ): Process {
+        val cmd = buildProotCommand(payload, extraBinds)
+        val pb = ProcessBuilder(cmd)
+        pb.directory(rootfsDir)
+        pb.redirectErrorStream(true)
+        pb.environment()["PROOT_TMP_DIR"] = cacheDir.absolutePath
+        pb.environment()["PROOT_NO_SECCOMP"] = "1"
+        val proot = prootFile()!!
+        ensureLoader(File(proot.parentFile, "libproot_loader.so"), File(linuxRoot, "proot_loader"))?.let {
+            pb.environment()["PROOT_LOADER"] = it.absolutePath
+        }
+        ensureLoader(File(proot.parentFile, "libproot_loader_m32.so"), File(linuxRoot, "proot_loader_m32"))?.let {
+            pb.environment()["PROOT_LOADER_32"] = it.absolutePath
+        }
+        return pb.start()
     }
 
     fun shutdown() {

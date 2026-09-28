@@ -53,10 +53,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val workspace = Workspace(application)
     val pyManager = PythonSessionManager(application)
     val linuxManager = LinuxRuntimeManager(application)
+    val qemuManager = com.example.aichat.vm.QemuManager(application)
 
     init {
         ToolRegistry.init({ pyManager }, { linuxManager })
         UsageMeter.init(application)
+    }
+
+    override fun onCleared() {
+        linuxManager.shutdown()
+        qemuManager.shutdown()
+        super.onCleared()
     }
 
     var messages by mutableStateOf<List<ChatMessage>>(emptyList())

@@ -10,6 +10,7 @@ import com.example.aichat.linux.PhoneBridgeManager
 import com.example.aichat.ui.ChatScreen
 import com.example.aichat.ui.LinuxScreen
 import com.example.aichat.ui.MainScreen
+import com.example.aichat.ui.VmScreen
 import com.example.aichat.ui.ProfileScreen
 import com.example.aichat.ui.theme.AiChatTheme
 import com.example.aichat.viewmodel.ChatViewModel
@@ -35,6 +36,11 @@ class MainActivity : ComponentActivity() {
                     LinuxScreen(
                         manager = chatViewModel.linuxManager,
                         onBack = { mainViewModel.showLinux = false }
+                    )
+                } else if (mainViewModel.showVm) {
+                    VmScreen(
+                        manager = chatViewModel.qemuManager,
+                        onBack = { mainViewModel.showVm = false }
                     )
                 } else if (mainViewModel.showChat && mainViewModel.activeConversationId.isNotEmpty()) {
                     val profile = mainViewModel.getActiveProfile()

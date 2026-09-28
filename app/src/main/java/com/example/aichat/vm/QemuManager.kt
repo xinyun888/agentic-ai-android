@@ -1,0 +1,269 @@
+package com.example.aichat.vm
+
+import android.content.Context
+import com.example.aichat.linux.LinuxRuntimeManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+class QemuManager(private val context: Context) {
+
+    companion object {
+        const val ALPINE_VERSION = "v3.24"
+        const val NETBOOT_BASE =
+            "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/releases/aarch64/netboot"
+        const val QEMU_GUEST_PATH = "/usr/bin/qemu-system-aarch64"
+    }
+
+    val linux = LinuxRuntimeManager(context)
+    val vmDir: File = linux.vmDir
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
+        .build()
+
+    val kernelFile = File(vmDir, "vmlinuz-virt")
+    val initrdFile = File(vmDir, "initramfs-virt")
+    val modloopFile = File(vmDir, "modloop-virt")
+    val diskFile = File(vmDir, "alpine.qcow2")
+
+    fun rootfsInstalled(): Boolean = linux.rootfsInstalled()
+
+    fun qemuApkAssetsReady(): Boolean =
+        (context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0) > 0
+
+    fun netbootAssetsReady(): Boolean {
+        val names = context.assets.list("vm")?.toSet() ?: emptySet()
+        return names.containsAll(setOf("vmlinuz-virt", "initramfs-virt", "modloop-virt"))
+    }
+
+    suspend fun installRootfs(onProgress: (String) -> Unit): Result<Unit> =
+        linux.installRootfs(onProgress)
+
+    /** 完全离线：从 assets/qemu 复制 .apk 到 /vm/qemu-apks，再用本地 apk 安装 */
+    suspend fun installQemuFromAssets(onProgress: (String) -> Unit): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                if (qemuInstalled()) {
+                    onProgress("QEMU 已安装")
+                    return@withContext Result.success(Unit)
+                }
+                if (!rootfsInstalled()) {
+                    return@withContext Result.failure(IllegalStateException("请先安装 Alpine rootfs"))
+                }
+                val names = context.assets.list("qemu")?.filter { it.endsWith(".apk") } ?: emptyList()
+                if (names.isEmpty()) {
+                    return@withContext Result.failure(IllegalStateException("assets/qemu 为空"))
+                }
+                val targetDir = File(vmDir, "qemu-apks").also { it.mkdirs() }
+                targetDir.listFiles()?.forEach { it.delete() }
+                onProgress("复制 ${names.size} 个离线包 ...")
+                names.forEach { name ->
+                    context.assets.open("qemu/$name").use { input ->
+                        File(targetDir, name).outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+                onProgress("apk add --no-network（离线安装 QEMU）...")
+                val result = linux.exec(
+                    "apk add --no-network --allow-untrusted /vm/qemu-apks/*.apk",
+                    timeoutSec = 2400
+                )
+                if (result.exitCode != 0 || !qemuInstalled()) {
+                    return@withContext Result.failure(
+                        IllegalStateException(
+                            "离线安装 QEMU 失败（exit=${result.exitCode}）:\n${result.output.takeLast(4000)}"
+                        )
+                    )
+                }
+                onProgress("QEMU 离线安装完成")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    /** 完全离线：从 assets/vm 复制内核/initramfs/modloop 到 /vm */
+    suspend fun installNetbootFromAssets(onProgress: (String) -> Unit): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                val names = context.assets.list("vm")?.toSet() ?: emptySet()
+                for (file in listOf("vmlinuz-virt", "initramfs-virt", "modloop-virt")) {
+                    if (file !in names) {
+                        return@withContext Result.failure(IllegalStateException("缺少 assets/vm/$file"))
+                    }
+                    val target = File(vmDir, file)
+                    if (target.exists() && target.length() > 0) {
+                        onProgress("已存在 $file")
+                        continue
+                    }
+                    onProgress("释放 $file ...")
+                    context.assets.open("vm/$file").use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+                onProgress("内核/initramfs/modloop 已就绪")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    fun qemuInstalled(): Boolean = File(linux.rootfsDir, "usr/bin/qemu-system-aarch64").exists()
+
+    fun imagesReady(): Boolean =
+        kernelFile.exists() && initrdFile.exists() && modloopFile.exists()
+
+    fun diskReady(): Boolean = diskFile.exists() && diskFile.length() > 0
+
+    fun statusText(): String = buildString {
+        appendLine("rootfs: " + if (rootfsInstalled()) "\u2705 已安装" else "\u274C 未安装")
+        appendLine("QEMU:   " + if (qemuInstalled()) "\u2705 已安装" else "\u274C 未安装")
+        appendLine("内核/initrd: " + if (imagesReady()) "\u2705 已下载" else "\u274C 未下载")
+        appendLine("磁盘:   " + if (diskReady()) "\u2705 ${diskFile.name} (${diskFile.length() / 1024 / 1024}MB)" else "\u274C 未创建")
+        val qemuApkCount = context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0
+        appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 ${qemuApkCount} 个" else "\u274C 缺失")
+        appendLine("内核包: " + if (netbootAssetsReady()) "\u2705 已内置" else "\u274C 缺失")
+        appendLine("VM 目录: ${vmDir.absolutePath}")
+    }
+
+    suspend fun installQemuOnline(onProgress: (String) -> Unit): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            if (qemuInstalled()) {
+                onProgress("QEMU 已安装")
+                return@withContext Result.success(Unit)
+            }
+            if (!rootfsInstalled()) {
+                return@withContext Result.failure(IllegalStateException("请先安装 Alpine rootfs"))
+            }
+            onProgress("apk update ...")
+            val update = linux.exec("apk update", timeoutSec = 600)
+            if (update.exitCode != 0) {
+                return@withContext Result.failure(
+                    IllegalStateException("apk update 失败:\n${update.output.takeLast(2000)}")
+                )
+            }
+            onProgress("apk add qemu-system-aarch64 qemu-img ...（可能需要几分钟）")
+            val install = linux.exec(
+                "apk add qemu-system-aarch64 qemu-img ca-certificates",
+                timeoutSec = 1800
+            )
+            if (install.exitCode != 0) {
+                return@withContext Result.failure(
+                    IllegalStateException("安装 QEMU 失败:\n${install.output.takeLast(3000)}")
+                )
+            }
+            onProgress("QEMU 安装完成")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun downloadNetboot(onProgress: (String) -> Unit): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            downloadOne("$NETBOOT_BASE/vmlinuz-virt", kernelFile, onProgress)
+            downloadOne("$NETBOOT_BASE/initramfs-virt", initrdFile, onProgress)
+            downloadOne("$NETBOOT_BASE/modloop-virt", modloopFile, onProgress)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun createDisk(sizeGb: Int = 8, onProgress: (String) -> Unit): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                if (!rootfsInstalled()) {
+                    return@withContext Result.failure(IllegalStateException("请先安装 rootfs"))
+                }
+                if (diskReady()) {
+                    onProgress("磁盘已存在")
+                    return@withContext Result.success(Unit)
+                }
+                onProgress("创建 qcow2 磁盘（${sizeGb}G）...")
+                val r = linux.exec(
+                    "qemu-img create -f qcow2 /vm/alpine.qcow2 ${sizeGb}G",
+                    timeoutSec = 300
+                )
+                if (r.exitCode != 0) {
+                    return@withContext Result.failure(
+                        IllegalStateException("qemu-img 失败:\n${r.output.takeLast(2000)}")
+                    )
+                }
+                onProgress("磁盘创建完成")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
+    fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 2): List<String> = listOf(
+        QEMU_GUEST_PATH,
+        "-accel", "tcg",
+        "-M", "virt",
+        "-cpu", "cortex-a57",
+        "-smp", smp.toString(),
+        "-m", memoryMb.toString(),
+        "-kernel", "/vm/vmlinuz-virt",
+        "-initrd", "/vm/initramfs-virt",
+        "-append",
+        "console=ttyAMA0 modules=loop,squashfs,virtio_blk,virtio_pci,virtio_net ip=dhcp alpine_repo=https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/main modloop=/vm/modloop-virt",
+        "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
+        "-netdev", "user,id=n0",
+        "-device", "virtio-net-pci,netdev=n0",
+        "-nographic",
+        "-no-reboot"
+    )
+
+    private var activeSession: QemuSession? = null
+
+    fun startSession(memoryMb: Int = 1024, smp: Int = 2): QemuSession? {
+        if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
+        stopSession()
+        return QemuSession(linux, buildQemuArgs(memoryMb, smp)).also {
+            activeSession = it
+            it.start()
+        }
+    }
+
+    fun stopSession() {
+        activeSession?.shutdown()
+        activeSession = null
+    }
+
+    fun shutdown() {
+        stopSession()
+        linux.shutdown()
+    }
+
+    private fun downloadOne(
+        url: String,
+        target: File,
+        onProgress: (String) -> Unit
+    ) {
+        if (target.exists() && target.length() > 0) {
+            onProgress("已存在 ${target.name}")
+            return
+        }
+        onProgress("下载 ${target.name} ...")
+        val tmp = File(target.parentFile, target.name + ".part")
+        val request = Request.Builder().url(url).build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code}: $url")
+            }
+            val body = response.body ?: throw IllegalStateException("空响应: $url")
+            body.byteStream().use { input ->
+                tmp.outputStream().use { output -> input.copyTo(output) }
+            }
+        }
+        if (!tmp.renameTo(target)) {
+            throw IllegalStateException("无法重命名 ${tmp.name}")
+        }
+        onProgress("下载完成 ${target.name} (${target.length() / 1024 / 1024}MB)")
+    }
+}

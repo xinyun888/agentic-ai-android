@@ -23,6 +23,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /** Linux 环境/终端页面 */
     var showLinux by mutableStateOf(false)
 
+    /** QEMU 虚拟机页面 */
+    var showVm by mutableStateOf(false)
+
     var activeConversationId by mutableStateOf(storage.getActiveConversationId())
         private set
 
