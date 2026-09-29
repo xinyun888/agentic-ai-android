@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""下载 LinuxVM 完整离线运行时：
-- Alpine QEMU 依赖包 -> app/src/main/assets/qemu/
-- Alpine virt ISO    -> app/src/main/assets/vm/alpine-virt.iso
-"""
+"""下载 LinuxVM 完整离线运行时（arm64 + x86_64 QEMU 包 + Alpine virt ISO）。"""
 import os
 import sys
 import tarfile
@@ -20,8 +17,7 @@ ISO_URL = (
 )
 BASE = f"https://dl-cdn.alpinelinux.org/alpine/{ALPINE_VERSION}"
 ROOT = Path(__file__).resolve().parent
-QEMU_DIR = ROOT / "app/src/main/assets/qemu"
-VM_DIR = ROOT / "app/src/main/assets/vm"
+ASSETS = ROOT / "app/src/main/assets"
 
 
 def fetch(url: str, out: Path, retries: int = 3) -> None:
@@ -48,19 +44,17 @@ def fetch(url: str, out: Path, retries: int = 3) -> None:
     raise RuntimeError(f"download failed: {url}: {last}")
 
 
-def load_index(repo: str):
-    tmp = Path(tempfile.gettempdir()) / f"apkindex-{repo}-{os.getpid()}.tar.gz"
-    fetch(f"{BASE}/{repo}/aarch64/APKINDEX.tar.gz", tmp)
+def load_index(arch: str, repo: str) -> str:
+    tmp = Path(tempfile.gettempdir()) / f"apkindex-{arch}-{repo}-{os.getpid()}.tar.gz"
+    fetch(f"{BASE}/{repo}/{arch}/APKINDEX.tar.gz", tmp)
     with tarfile.open(tmp, "r:gz") as t:
         data = t.extractfile("APKINDEX").read().decode("utf-8", "replace")
     tmp.unlink(missing_ok=True)
     return data
 
 
-def main() -> int:
-    QEMU_DIR.mkdir(parents=True, exist_ok=True)
-    VM_DIR.mkdir(parents=True, exist_ok=True)
-
+def fetch_qemu(arch: str, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
     pkgs = {}
     provides = {}
 
@@ -78,7 +72,7 @@ def main() -> int:
                 provides.setdefault(token.split("=")[0], []).append(name)
 
     for repo in ("main", "community"):
-        parse(repo, load_index(repo))
+        parse(repo, load_index(arch, repo))
 
     def resolve(token: str):
         if token.startswith("!"):
@@ -103,26 +97,22 @@ def main() -> int:
             if resolved:
                 queue.append(resolved)
 
-    manifest = []
     total = 0
     for name in sorted(closure):
         info = pkgs[name]
         fn = f"{name}-{info['version']}.apk"
-        url = f"{BASE}/{info['repo']}/aarch64/{fn}"
-        out = QEMU_DIR / fn
+        url = f"{BASE}/{info['repo']}/{arch}/{fn}"
+        out = dest / fn
         fetch(url, out)
-        manifest.append((fn, out.stat().st_size, url))
         total += out.stat().st_size
+    print(f"[{arch}] QEMU packages: {len(closure)} files, {total / 1024 / 1024:.1f} MB")
 
-    fetch(ISO_URL, VM_DIR / "alpine-virt.iso")
-    manifest.append(("alpine-virt.iso", (VM_DIR / "alpine-virt.iso").stat().st_size, ISO_URL))
-    total += (VM_DIR / "alpine-virt.iso").stat().st_size
 
-    (QEMU_DIR / "MANIFEST.txt").write_text(
-        "".join(f"{fn}\t{size}\t{url}\n" for fn, size, url in manifest),
-        encoding="utf-8",
-    )
-    print(f"\n完成：{len(manifest)} 个文件，共 {total / 1024 / 1024:.1f} MB")
+def main() -> int:
+    fetch_qemu("aarch64", ASSETS / "qemu")
+    fetch_qemu("x86_64", ASSETS / "qemu-x86_64")
+    fetch(ISO_URL, ASSETS / "vm/alpine-virt.iso")
+    print("\n完成")
     return 0
 
 

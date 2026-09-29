@@ -32,10 +32,17 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
 
     fun rootfsInstalled(): Boolean = linux.rootfsInstalled()
 
-    fun abiSupported(): Boolean = Build.SUPPORTED_ABIS.any { it.contains("arm64") }
+    private fun hostAbi(): String? = Build.SUPPORTED_ABIS.firstOrNull {
+        it.contains("arm64") || it.contains("x86_64")
+    }
+
+    private fun qemuAssetDir(): String =
+        if (hostAbi()?.contains("x86_64") == true) "qemu-x86_64" else "qemu"
+
+    fun abiSupported(): Boolean = hostAbi() != null
 
     fun qemuApkAssetsReady(): Boolean =
-        abiSupported() && (context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0) > 0
+        abiSupported() && (context.assets.list(qemuAssetDir())?.count { it.endsWith(".apk") } ?: 0) > 0
 
     fun netbootAssetsReady(): Boolean {
         if (!abiSupported()) return false
@@ -62,15 +69,16 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                 }
                 onProgress("检查并修复 rootfs 符号链接 ...")
                 linux.fixRootfsSymlinks()
-                val names = context.assets.list("qemu")?.filter { it.endsWith(".apk") } ?: emptyList()
+                val assetDir = qemuAssetDir()
+                val names = context.assets.list(assetDir)?.filter { it.endsWith(".apk") } ?: emptyList()
                 if (names.isEmpty()) {
-                    return@withContext Result.failure(IllegalStateException("assets/qemu 为空"))
+                    return@withContext Result.failure(IllegalStateException("assets/$assetDir 为空"))
                 }
                 val targetDir = File(vmDir, "qemu-apks").also { it.mkdirs() }
                 targetDir.listFiles()?.forEach { it.delete() }
                 onProgress("复制 ${names.size} 个离线包 ...")
                 names.forEach { name ->
-                    context.assets.open("qemu/$name").use { input ->
+                    context.assets.open("$assetDir/$name").use { input ->
                         File(targetDir, name).outputStream().use { output -> input.copyTo(output) }
                     }
                 }
@@ -79,12 +87,15 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                     "apk add --no-network --allow-untrusted /vm/qemu-apks/*.apk",
                     timeoutSec = 2400
                 )
-                if (result.exitCode != 0 || !qemuInstalled()) {
+                if (!qemuInstalled()) {
                     return@withContext Result.failure(
                         IllegalStateException(
                             "离线安装 QEMU 失败（exit=${result.exitCode}）:\n${result.output.takeLast(4000)}"
                         )
                     )
+                }
+                if (result.exitCode != 0) {
+                    onProgress("安装脚本有警告（exit=${result.exitCode}），但 QEMU 二进制已安装，继续")
                 }
                 onProgress("修复 rootfs 绝对符号链接 ...")
                 linux.fixRootfsSymlinks()
@@ -132,10 +143,11 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         appendLine("QEMU:   " + if (qemuInstalled()) "\u2705 已安装" else "\u274C 未安装")
         appendLine("ISO:    " + if (imagesReady()) "\u2705 ${isoFile.length() / 1024 / 1024}MB" else "\u274C 未释放")
         appendLine("磁盘:   " + if (diskReady()) "\u2705 ${diskFile.name} (${diskFile.length() / 1024 / 1024}MB)" else "\u274C 未创建")
-        val qemuApkCount = context.assets.list("qemu")?.count { it.endsWith(".apk") } ?: 0
-        appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 ${qemuApkCount} 个" else "\u274C 缺失")
+        val assetDir = qemuAssetDir()
+        val qemuApkCount = context.assets.list(assetDir)?.count { it.endsWith(".apk") } ?: 0
+        appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 $qemuApkCount 个 ($assetDir)" else "\u274C 缺失")
         appendLine("ISO 包: " + if (netbootAssetsReady()) "\u2705 已内置" else "\u274C 缺失")
-        appendLine("架构: " + if (abiSupported()) "\u2705 arm64" else "\u274C 当前仅内置 arm64 VM 运行时")
+        appendLine("架构: " + if (abiSupported()) "\u2705 ${hostAbi()}" else "\u274C 当前仅支持 arm64 / x86_64 VM 运行时")
         appendLine("VM 目录: ${vmDir.absolutePath}")
     }
 
@@ -213,7 +225,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
             }
         }
 
-    fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 2): List<String> = listOf(
+    fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 1): List<String> = listOf(
         QEMU_GUEST_PATH,
         "-accel", "tcg",
         "-M", "virt",
@@ -234,7 +246,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
 
     private var activeSession: QemuSession? = null
 
-    fun startSession(memoryMb: Int = 1024, smp: Int = 2): QemuSession? {
+    fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? {
         if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
         if (!ensureEfiVars()) return null

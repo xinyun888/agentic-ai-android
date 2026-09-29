@@ -473,9 +473,13 @@ rm -f "${'$'}RESP"
      */
     private fun relativeLinkTarget(destDir: File, linkFile: File, linkName: String): String {
         if (!linkName.startsWith("/")) return linkName
-        val target = File(destDir, linkName.trimStart('/'))
-        val parent = linkFile.parentFile ?: return linkName
         return try {
+            // Android 上 /data/user/0 可能是指向 /data/data 的符号链接；
+            // linkFile 已经 canonicalize 过，target 也必须 canonicalize，
+            // 否则 relativize 会跨别名计算，生成错误的相对路径。
+            val base = destDir.canonicalFile
+            val target = File(base, linkName.trimStart('/')).canonicalFile
+            val parent = linkFile.parentFile?.canonicalFile ?: return linkName
             parent.toPath().relativize(target.toPath()).toString().replace('\\', '/')
         } catch (_: Exception) {
             linkName

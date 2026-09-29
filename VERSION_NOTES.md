@@ -1,3 +1,21 @@
+## v2.58.4（真机模拟器修复）
+
+- 修复 rootfs 绝对符号链接相对化错误：
+  - `File.canonicalFile` 与非 canonical 路径混用，导致 `bin/sh` 等链接指向 `alpine.tmp`
+  - 现在统一 canonicalize，已验证 `bin/sh -> busybox`
+- 修复离线安装 QEMU 被误判失败：
+  - PRoot 下 apk post-install/trigger 脚本会 `fork: Function not implemented`
+  - 但 QEMU 二进制已安装，现在按二进制存在判定成功
+- 新增 x86_64 QEMU 离线包，支持 x86_64 模拟器/设备
+- QEMU 默认改用 1 个 vCPU，提高 PRoot 下稳定性
+- Android 14 x86_64 模拟器实测：
+  - App 启动正常
+  - rootfs 解压正常
+  - 离线安装 QEMU 正常
+  - ISO 释放、qcow2 创建正常
+  - QEMU UEFI + GRUB + Alpine ISO 能启动
+- 注意：模拟器里 QEMU 套 QEMU，guest kernel 会 soft lockup；需要真机 arm64 最终验证
+
 ## v2.58.3（离线启动修正）
 
 - 发现并修正：netboot 的 `modloop=/vm/modloop-virt` 是宿主路径，guest initramfs 实际访问不到
