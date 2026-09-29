@@ -12,7 +12,7 @@ data class ApiProfile(
     val name: String = "DeepSeek V4 Pro",
     val baseUrl: String = "https://api.deepseek.com",
     val apiKey: String = "",
-    val model: String = "deepseek-v4-pro",
+    val model: String = "deepseek-flash",
     val thinkingEnabled: Boolean = true,
     val visionModel: String = "",     // 如 glm-4v，空则不启用视觉管道
     val visionBaseUrl: String = "https://open.bigmodel.cn/api/paas/v4/",
@@ -90,7 +90,13 @@ class StorageManager(context: Context) {
             // 用 Array 反序列化（不依赖 TypeToken 泛型签名，R8 混淆下更稳）
             val arr: Array<ApiProfile> = gson.fromJson(json, Array<ApiProfile>::class.java)
                 ?: return listOf(ApiProfile(name = "Default"))
-            arr.map { p -> if (p.reasoningLevel == null) p.copy(reasoningLevel = "balanced") else p }
+            arr.map { p ->
+            val normalized = if (p.reasoningLevel == null) p.copy(reasoningLevel = "balanced") else p
+            // 用户明确要求默认用 flash；旧的 DeepSeek v4-pro 配置自动迁移，避免继续走贵模型
+            if (normalized.model == "deepseek-v4-pro" &&
+                normalized.baseUrl.contains("deepseek", ignoreCase = true)
+            ) normalized.copy(model = "deepseek-flash") else normalized
+        }
         } catch (e: Exception) {
             android.util.Log.e("StorageManager", "profiles 反序列化失败", e)
             listOf(ApiProfile(name = "Default(读取出错: ${e.message?.take(60)})"))

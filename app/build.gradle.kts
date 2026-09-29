@@ -28,8 +28,8 @@ android {
         applicationId = "com.example.aichat"
         minSdk = 26
         targetSdk = targetSdkVersion
-        versionCode = 260
-        versionName = "2.59.1"
+        versionCode = 261
+        versionName = "2.59.2"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

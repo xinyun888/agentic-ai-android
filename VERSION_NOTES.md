@@ -1,3 +1,18 @@
+## v2.59.2（默认 Flash + 内置 rootfs 复验）
+
+- 按用户要求默认模型改为 `deepseek-flash`，默认不再使用 `deepseek-v4-pro`
+- 已有 DeepSeek v4-pro 配置读取时自动迁移到 flash，避免继续用贵模型
+- 清空 App 数据后复验内置 rootfs：
+  - APK 内 `assets/linux/alpine-x86_64.tar.gz` 解压成功
+  - `rootfs: `
+  - `bin/sh -> busybox` 相对链接正确
+  - Linux 环境执行 `uname` 返回 `Linux`，shell 正常
+- 真实 key 复验：
+  - flash 文本对话 
+  - 图片直传识别 CODE7391 
+  - 主动模式 5 分钟心跳真实推送 
+- versionCode 261 / versionName 2.59.2
+
 ## v2.59.1（真实 API 验证）
 
 - DeepSeek 图片直传自动选模型：
