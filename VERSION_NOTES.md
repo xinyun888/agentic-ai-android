@@ -1,3 +1,17 @@
+## v2.59.1（真实 API 验证）
+
+- DeepSeek 图片直传自动选模型：
+  - `deepseek-v4-pro` 是纯文本模型，`deepseek-flash` 才支持图片
+  - 未配置独立视觉模型且当前是 DeepSeek v4-pro 时，带图的这一轮自动切到 `deepseek-flash`
+  - 文本轮仍走用户选择的模型
+- 用真实 test key 端到端验证：
+  - 文本对话 
+  - 图片直传：正确读出红框、蓝圆、绿三角和 CODE7391 
+  - 退出对话重进：旧答案不再重新打字机播放 
+  - 主动模式：5 分钟心跳真实调用 API，通知显示已推送，消息写回对话 
+  - 心跳闹钟：`dumpsys alarm` 确认使用 `PendingIntent.getForegroundService` 
+- versionCode 260 / versionName 2.59.1
+
 ## v2.59（多模态直传 + 主动模式/保活修复）
 
 - 图片处理：

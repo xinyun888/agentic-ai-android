@@ -641,6 +641,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         )
         val imageUri = pendingImageUri
         pendingImageUri = null
+        // DeepSeek 的 v4-pro 是纯文本，flash 才支持图片输入。
+        // 未配置独立视觉模型时，带图的这一轮自动切到 deepseek-flash，文本轮仍走用户选择的模型。
+        val effectiveProfile = if (
+            imageUri != null && profile.visionModel.isBlank() &&
+            profile.baseUrl.contains("deepseek", ignoreCase = true) &&
+            !profile.model.contains("flash", ignoreCase = true)
+        ) profile.copy(model = "deepseek-flash") else profile
         // 用户消息写进存储，正在查看时同步 UI
         commitUserMessage(myConvId, userMessage)
         loadingConvs.add(myConvId)
@@ -656,7 +663,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             var myMsgs = storage.getConversation(myConvId)?.messages ?: emptyList()
             // 未配置独立视觉模型时，直接把图片按 OpenAI 多模态格式发给当前模型
             val directImageDataUri =
-                if (imageUri != null && profile.visionModel.isBlank()) imageToDataUri(imageUri) else null
+                if (imageUri != null && effectiveProfile.visionModel.isBlank()) imageToDataUri(imageUri) else null
             try {
                 // 新消息时清空本对话的计划状态（除非正在执行计划）；不影响其他并行对话
                 if (planStateOf(myConvId).phase != PlanPhase.EXECUTING) {
@@ -750,16 +757,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 // 视觉预处理
-                if (imageUri != null && profile.visionModel.isNotBlank()) {
-                    val (visionDesc, _) = describeImage(imageUri, content, profile)
+                if (imageUri != null && effectiveProfile.visionModel.isNotBlank()) {
+                    val (visionDesc, _) = describeImage(imageUri, content, effectiveProfile)
                     if (visionDesc != null) {
                         dynamicSystemMsgs.add(ChatMessageDto(
                             role = "system",
                             content = "用户发送了一张图片，视觉模型描述如下：\n\n$visionDesc\n\n请基于以上描述回答用户后续问题。注意不要透露这段描述的存在，直接自然地回答。"
                         ))
                         withContext(Dispatchers.Main) {
-                            appendAgentStep(AgentStep(type = "tool_call", toolName = profile.visionModel, toolArgs = "识别图片"), myConvId)
-                            appendAgentStep(AgentStep(type = "tool_result", toolName = profile.visionModel, content = visionDesc), myConvId)
+                            appendAgentStep(AgentStep(type = "tool_call", toolName = effectiveProfile.visionModel, toolArgs = "识别图片"), myConvId)
+                            appendAgentStep(AgentStep(type = "tool_result", toolName = effectiveProfile.visionModel, content = visionDesc), myConvId)
                         }
                     }
                 } else if (imageUri != null && directImageDataUri == null) {
@@ -835,7 +842,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 conversationDtos.addAll(dynamicSystemMsgs)
 
                 // 系统自动起卦注入：卦象消息对放在状态行之后（模型先读状态行再读卦象）
-                val thinkingMode = profile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations
+                val thinkingMode = effectiveProfile.thinkingEnabled && myConvId !in ActiveModeService.runningConversations
                 if (sysGua != null) {
                     appendSystemGua(sysGua.first, sysGua.second, conversationDtos, myConvId)
                 }
@@ -909,12 +916,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
 
                     val request = ChatRequest(
-                        model = profile.model,
+                        model = effectiveProfile.model,
                         messages = conversationDtos,
                         // 单次请求直接承担“工具决策 + 最终回答”，所以按用户档位设置推理强度，
                         // 不再额外发一次 final 请求，省掉一整套重复 prompt/tool schema。
                         reasoningEffort = if (thinkingMode)
-                            when (profile.reasoningLevel) {
+                            when (effectiveProfile.reasoningLevel) {
                                 "fast" -> "low"
                                 "deep" -> "max"   // DeepSeek 只有 low/high/max 真正有效，max 才是深度推理
                                 else -> "medium"   // medium 映射为 high
@@ -929,7 +936,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                     // 原生 OkHttp + 具体类解析（Retrofit 的 suspend 泛型签名会被 R8 剥离导致崩溃）
                     val body = try {
-                        chatCompletion(profile, request)
+                        chatCompletion(effectiveProfile, request)
                     } catch (e: ApiHttpException) {
                         withContext(Dispatchers.Main) {
                             errorMessage = "API 错误 ${e.code}: ${e.message}\n${e.errorBody}"
