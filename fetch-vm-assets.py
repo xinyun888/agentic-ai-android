@@ -20,10 +20,24 @@ ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "app/src/main/assets"
 
 
+def is_valid_apk(path: Path) -> bool:
+    """Alpine APK v2 is a concatenation of signature + control + data gzip streams."""
+    if path.suffix != ".apk":
+        return True
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return False
+    return data[:2] == b"\x1f\x8b" and data.count(b"\x1f\x8b\x08") >= 3
+
+
 def fetch(url: str, out: Path, retries: int = 3) -> None:
-    if out.exists() and out.stat().st_size > 0:
+    if out.exists() and out.stat().st_size > 0 and is_valid_apk(out):
         print(f"skip {out.name}")
         return
+    if out.exists() and out.stat().st_size > 0:
+        print(f"invalid APK, re-download {out.name}")
+        out.unlink()
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"download {url}")
     last = None

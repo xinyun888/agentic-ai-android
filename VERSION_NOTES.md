@@ -1,3 +1,15 @@
+## v2.59.4（修复 arm64 busybox-binsh 离线包损坏）
+
+- 根因：早期为了避免 `/bin/sh -> /bin/busybox` 绝对链接，曾用 Python tarfile 重打包
+  `busybox-binsh`，破坏了 Alpine APK v2 的签名 + control + data多 gzip 段格式，
+  真机 `apk add` 报 `v2 package format error`（exit=99）
+- 已重新下载官方原版 `busybox-binsh-1.37.0-r31.apk` 替换损坏包
+- rootfs 绝对符号链接仍由 `fixRootfsSymlinks()` 在安装后统一修复，不再改包
+- `fetch-vm-assets.py` 增加 APK 格式校验：如果已有 `.apk` 不是合法的 v2 多段 gzip 格式，
+  自动删除并重新下载，避免再次出现跳过后一直用坏包
+- 已重新构建 arm64 内置 QEMU 包
+- versionCode 263 / versionName 2.59.4
+
 ## v2.59.3（GitHub 发布前安全清理）
 
 - 移除源码里的个人绝对路径 `C:/Users/Lenovo/...` fallback，Python 解释器改为按平台自动选择
