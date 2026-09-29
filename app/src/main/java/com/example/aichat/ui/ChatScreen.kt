@@ -866,11 +866,15 @@ fun ChatScreen(
                         }
                     }
                     // 最后一条助手消息：客户端打字机（最终回答已改非流式，观感由这里模拟）
+                    // typewriterDone 保证退出对话重进后不会把旧答案再播放一遍
+                    val typewriterKey = viewModel.typewriterKey(message)
                     val isLastAssistant = message.role == "assistant" &&
-                        viewModel.messages.lastOrNull { it.role == "assistant" } === message
+                        viewModel.messages.lastOrNull { it.role == "assistant" } === message &&
+                        viewModel.shouldTypewriter(message)
                     MessageBubble(
                         message = message,
                         typewriter = isLastAssistant,
+                        onTypewriterDone = { viewModel.markTypewriterDone(typewriterKey) },
                         onLongClick = {
                             // 引用相等定位（同内容消息不能靠 indexOf）
                             val idx = viewModel.messages.indexOfFirst { it === message }
@@ -1122,7 +1126,12 @@ fun ChatScreen(
 
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-fun MessageBubble(message: ChatMessage, typewriter: Boolean = false, onLongClick: (() -> Unit)? = null) {
+fun MessageBubble(
+    message: ChatMessage,
+    typewriter: Boolean = false,
+    onTypewriterDone: () -> Unit = {},
+    onLongClick: (() -> Unit)? = null
+) {
     val isUser = message.role == "user"
     val bubbleColor = if (isUser) {
         MaterialTheme.colorScheme.primaryContainer
@@ -1134,7 +1143,7 @@ fun MessageBubble(message: ChatMessage, typewriter: Boolean = false, onLongClick
     var shownChars by remember(message.timestamp, message.id) {
         mutableStateOf(if (typewriter) 0 else message.content.length)
     }
-    LaunchedEffect(message.timestamp, message.id) {
+    LaunchedEffect(message.timestamp, message.id, typewriter) {
         if (typewriter && shownChars < message.content.length) {
             var i = shownChars
             while (i < message.content.length) {
@@ -1142,6 +1151,7 @@ fun MessageBubble(message: ChatMessage, typewriter: Boolean = false, onLongClick
                 shownChars = i
                 delay(16)
             }
+            onTypewriterDone()
         }
     }
     val displayContent = if (typewriter) message.content.take(shownChars) else message.content

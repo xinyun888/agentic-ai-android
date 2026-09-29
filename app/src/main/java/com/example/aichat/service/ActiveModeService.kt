@@ -91,9 +91,24 @@ class ActiveModeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent == null) return START_STICKY
+        if (intent == null) {
+            // START_STICKY 被系统重新拉起：没有 intent，也要恢复前台和闹钟
+            if (configs.isNotEmpty()) {
+                val pid = configs.keys.first()
+                ensureForeground(pid, "主动模式已恢复")
+                configs.keys.forEach { scheduleAlarm(it) }
+            } else {
+                stopSelf()
+            }
+            return START_STICKY
+        }
         val action = intent.action ?: ""
         val personaId = intent.getStringExtra(EXTRA_PERSONA_ID) ?: "worker"
+        // startForegroundService 启动的路径必须在 5 秒内进入前台；
+        // even if startHeartbeat early-returns，也不能漏掉 startForeground。
+        if (action == ACTION_START || action == ACTION_HEARTBEAT || action == ACTION_BOOT_RESUME) {
+            ensureForeground(personaId, "正在启动主动模式...")
+        }
         when {
             action == ACTION_START -> {
                 val convId = intent.getStringExtra(EXTRA_CONV_ID) ?: ""
@@ -113,37 +128,63 @@ class ActiveModeService : Service() {
             }
             action == ACTION_BOOT_RESUME -> {
                 if (configs.isEmpty()) {
+                    stopForeground(true)
                     stopSelf()
                 } else {
                     // 先注册闹钟：即使前台启动失败，后续心跳也能由 AlarmManager 拉起
                     configs.keys.forEach { pid ->
                         if (pid in runningPersonas) scheduleAlarm(pid)
                     }
-                    // BootReceiver 用 startForegroundService 拉起，必须在 5 秒内进入前台
                     val firstPid = configs.keys.firstOrNull()
                     if (firstPid == null) {
+                        stopForeground(true)
                         stopSelf()
                     } else {
-                        val firstPersona = Personas.getByIdWithCustom(firstPid, this)
-                        val fgId = 2000 + Math.floorMod(firstPid.hashCode(), 1000)
-                        try {
-                            startForeground(
-                                fgId,
-                                buildNotification(
-                                    "${firstPersona.emoji} ${firstPersona.name} 正在陪伴",
-                                    "已恢复主动模式，共 ${configs.size} 个角色",
-                                    fgId
-                                )
-                            )
-                        } catch (_: Exception) {
-                            // 前台启动失败就退出；闹钟已经注册，后续心跳仍会尝试
-                            stopSelf()
-                        }
+                        ensureForeground(firstPid, "已恢复主动模式，共 ${configs.size} 个角色")
                     }
                 }
             }
         }
         return START_STICKY
+    }
+
+    /** 确保服务处于前台；重复调用安全。 */
+    private fun ensureForeground(personaId: String, text: String) {
+        val persona = try {
+            Personas.getByIdWithCustom(personaId, this)
+        } catch (_: Exception) { null }
+        val name = persona?.let { "${it.emoji} ${it.name}" } ?: "主动模式"
+        val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
+        try {
+            startForeground(fgId, buildNotification("$name 正在陪伴", text, fgId))
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (configs.isEmpty()) return
+        try {
+            // 用户从最近任务划掉：先把每个角色的后续闹钟补齐
+            configs.keys.forEach { scheduleAlarm(it) }
+            // 再用一次精确闹钟把自己拉起来（PendingIntent.getForegroundService 兼容后台限制）
+            val am = getSystemService(ALARM_SERVICE) as AlarmManager
+            val restart = Intent(this, ActiveModeService::class.java).apply {
+                action = ACTION_BOOT_RESUME
+            }
+            val pi = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                PendingIntent.getForegroundService(this, 99, restart,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            } else {
+                PendingIntent.getService(this, 99, restart,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            }
+            val at = System.currentTimeMillis() + 1000L
+            val canExact = Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
+            if (canExact) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+        } catch (_: Exception) {
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -161,8 +202,17 @@ class ActiveModeService : Service() {
             action = ACTION_HEARTBEAT
             putExtra(EXTRA_PERSONA_ID, personaId)
         }
-        return PendingIntent.getService(this, 1000 + Math.floorMod(personaId.hashCode(), 1000),
-            intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            PendingIntent.getForegroundService(
+                this, 1000 + Math.floorMod(personaId.hashCode(), 1000), intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        } else {
+            PendingIntent.getService(
+                this, 1000 + Math.floorMod(personaId.hashCode(), 1000), intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        }
     }
 
     private fun scheduleAlarm(personaId: String) {
@@ -193,23 +243,30 @@ class ActiveModeService : Service() {
         personaId: String, convId: String, intervalMin: Int, immersive: Boolean,
         showThinking: Boolean, startHour: Int, endHour: Int
     ) {
-        // 已运行则忽略重复开启
-        if (personaId in runningPersonas) return
+        val persona = Personas.getByIdWithCustom(personaId, this)
+        val fullName = "${persona.emoji} ${persona.name}"
+        val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
+
+        // 先确保前台（ACTION_START 路径可能因为配置已存在而 early-return）
+        ensureForeground(personaId, "主动模式  ${intervalMin}分钟  每轮心跳写回对话")
+
+        if (personaId in runningPersonas) {
+            // 已运行：更新配置、通知和下一次闹钟，不重复启动 Job
+            configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
+            saveConfigsToPrefs()
+            if (convId.isNotBlank()) {
+                runningConversations.add(convId)
+                personaConvs[personaId] = convId
+            }
+            updateNotification(fgId, fullName, "${intervalMin}分钟后下一次心跳")
+            scheduleAlarm(personaId)
+            return
+        }
+
         runningPersonas.add(personaId)
         if (convId.isNotBlank()) {
             runningConversations.add(convId)
             personaConvs[personaId] = convId
-        }
-
-        val persona = Personas.getByIdWithCustom(personaId, this)
-        val fullName = "${persona.emoji} ${persona.name}"
-
-        // 每个角色独立的前台通知 id
-        val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
-        try {
-            startForeground(fgId, buildNotification(fullName + " 正在陪伴", "主动模式 · ${intervalMin}分钟 · 每轮心跳写回对话", fgId))
-        } catch (_: Exception) {
-            // 前台服务启动失败时不阻断配置保存，后续闹钟仍可尝试拉起
         }
 
         // 持久化配置，进程被杀后闹钟拉起时能恢复
@@ -220,10 +277,17 @@ class ActiveModeService : Service() {
         scheduleAlarm(personaId)
     }
 
-    /** 闹钟唤醒时执行心跳 */
+/** 闹钟唤醒时执行心跳 */
     private fun handleHeartbeat(personaId: String) {
-        val cfg = configs[personaId] ?: return
-        if (personaId !in runningPersonas) return
+        val cfg = configs[personaId]
+        if (cfg == null || personaId !in runningPersonas) {
+            // 配置已被停止但闹钟仍到点：结束这个孤儿前台服务
+            if (runningPersonas.isEmpty()) {
+                stopForeground(true)
+                stopSelf()
+            }
+            return
+        }
         val persona = Personas.getByIdWithCustom(personaId, this)
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
         val fullName = "${persona.emoji} ${persona.name}"

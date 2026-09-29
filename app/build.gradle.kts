@@ -28,8 +28,8 @@ android {
         applicationId = "com.example.aichat"
         minSdk = 26
         targetSdk = targetSdkVersion
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 259
+        versionName = "2.59"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -98,6 +98,30 @@ android {
             useLegacyPackaging = true
         }
     }
+}
+
+// 这些运行时必须内置进 APK，避免用户首次使用时还要联网下载。
+val requiredBundledAssets = listOf(
+    "src/main/assets/linux/alpine-aarch64.tar.gz",
+    "src/main/assets/linux/alpine-x86_64.tar.gz",
+    "src/main/assets/vm/alpine-virt.iso"
+)
+
+tasks.register("checkBundledLinuxAssets") {
+    doLast {
+        val missing = requiredBundledAssets.filter { !file(it).exists() || file(it).length() == 0L }
+        if (missing.isNotEmpty()) {
+            throw GradleException(
+                "缺少内置 Linux/VM 资源：${missing.joinToString()}；" +
+                    "请先运行 fetch-linux-runtime.ps1 和 fetch-vm-assets.py 生成后再打包。"
+            )
+        }
+        requiredBundledAssets.forEach { println("bundled: $it (${file(it).length()} bytes)") }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("checkBundledLinuxAssets")
 }
 
 chaquopy {

@@ -1,3 +1,24 @@
+## v2.59（多模态直传 + 主动模式/保活修复）
+
+- 图片处理：
+  - 未配置独立视觉模型时，直接把图片以 OpenAI `image_url` 多模态格式发给当前模型
+  - 历史图片只发文字占位，避免每轮重复上传 base64
+  - 大图最长边压缩到 1600，控制请求体积
+  - 配置了独立视觉模型时仍走视觉模型描述 -> 主模型旧流程
+- 修复退出对话重进后旧答案重新打字机播放：
+  - ViewModel 记录已播放消息 key，进对话时把历史消息标记为已播放
+  - 陈旧 `.agent_state.json` 断点自动清理，不再误导恢复
+- rootfs/VM 资源内置：
+  - Alpine rootfs、virt ISO 本就打进 APK
+  - 增加 `checkBundledLinuxAssets`，缺失时直接构建失败并提示
+- 主动模式 / 防杀后台修复：
+  - 所有 FGS 启动路径先调用 `startForeground`，避免 5 秒超时
+  - 心跳闹钟改用 `PendingIntent.getForegroundService`，兼容 Android 12+ 后台限制
+  - 已运行角色再次启动时更新配置和下一次闹钟，而不是直接 return
+  - 新增 `onTaskRemoved`：划掉最近任务后自动补闹钟并拉起自己
+  - 闹钟到点但配置已删除时自动结束孤儿前台服务
+- versionCode 259 / versionName 2.59
+
 ## v2.58.4（真机模拟器修复）
 
 - 修复 rootfs 绝对符号链接相对化错误：

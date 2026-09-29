@@ -69,6 +69,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     var messages by mutableStateOf<List<ChatMessage>>(emptyList())
         private set
 
+    /** 已经播放过打字机的消息 key，防止退出对话重进后整段答案重新流式播放 */
+    var typewriterDone by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    fun typewriterKey(msg: ChatMessage): String =
+        msg.id ?: "${msg.timestamp}_${msg.content.length}"
+
+    fun shouldTypewriter(msg: ChatMessage): Boolean = typewriterKey(msg) !in typewriterDone
+
+    fun markTypewriterDone(key: String) {
+        if (key !in typewriterDone) typewriterDone = typewriterDone + key
+    }
+
     var isLoading by mutableStateOf(false)
         private set
 
@@ -495,9 +508,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (newDone.isEmpty()) return
         updatePlanState(convId) { cur ->
             val done = cur.completed + newDone
+            val finished = done.size >= (cur.plan?.tasks?.size ?: Int.MAX_VALUE)
+            if (finished) {
+                // 计划已完成：旧断点状态不再需要，避免重进对话时提示恢复甚至重播旧答案
+                getStateFile(convId).delete()
+                hasSavedState = false
+                resumePending = false
+            }
             cur.copy(
                 completed = done,
-                phase = if (done.size >= (cur.plan?.tasks?.size ?: Int.MAX_VALUE)) PlanPhase.COMPLETED else cur.phase
+                phase = if (finished) PlanPhase.COMPLETED else cur.phase
             )
         }
     }
@@ -570,6 +590,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // 无论是否同对话，都以存储为准重载——丢弃任何残留的 live/过期状态（存储是唯一真值）
         val conv = storage.getConversation(convId)
         messages = conv?.messages ?: emptyList()
+        // 进入对话时把已有历史标记为打字机已完成，只有本轮新生成的回答才播放动画
+        conv?.messages?.forEach { msg -> typewriterDone = typewriterDone + typewriterKey(msg) }
         conversationTitle = conv?.title ?: ""
     }
 
@@ -632,6 +654,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         currentJobs[myConvId] = viewModelScope.launch(Dispatchers.IO) {
             // 本对话自己的消息列表，不依赖共享 UI 状态
             var myMsgs = storage.getConversation(myConvId)?.messages ?: emptyList()
+            // 未配置独立视觉模型时，直接把图片按 OpenAI 多模态格式发给当前模型
+            val directImageDataUri =
+                if (imageUri != null && profile.visionModel.isBlank()) imageToDataUri(imageUri) else null
             try {
                 // 新消息时清空本对话的计划状态（除非正在执行计划）；不影响其他并行对话
                 if (planStateOf(myConvId).phase != PlanPhase.EXECUTING) {
@@ -737,8 +762,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             appendAgentStep(AgentStep(type = "tool_result", toolName = profile.visionModel, content = visionDesc), myConvId)
                         }
                     }
-                } else if (imageUri != null) {
-                    // 无视觉模型：告知模型无法识别图片，避免瞎猜
+                } else if (imageUri != null && directImageDataUri == null) {
+                    // 无视觉模型且图片编码失败：告知模型无法识别图片，避免瞎猜
                     dynamicSystemMsgs.add(ChatMessageDto(
                         role = "system",
                         content = "用户发送了一张图片，但当前模型不支持图片识别。请直接告诉用户你无法查看图片，建议其配置视觉模型或改用文字描述，不要假装看懂了图片内容。"
@@ -795,7 +820,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 conversationDtos.addAll(preHistorySystemMsgs)
 
                 // 添加消息历史（滑动窗口 + 智能摘要）
-                buildHistoryMsgs(myMsgs, conversationDtos)
+                buildHistoryMsgs(myMsgs, conversationDtos, directImageDataUri)
 
                 // 工作区状态（动态，放末尾以保持静态前缀稳定、命中缓存）
                 // 命理师场景很少需要工作区文件列表，跳过可以省下不少 token
@@ -1125,10 +1150,32 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
         return cleanPrompt + thinkingStyle + "\n\n" + agentRules + planPart
     }
 
-    private fun buildHistoryMsgs(myMsgs: List<ChatMessage>, conversationDtos: MutableList<ChatMessageDto>) {
-        val historyMsgs = myMsgs.map { msg ->
-            // 文件上传消息：历史里只保留文件名提示，长预览不重复发送（全文在 workspace）
-            ChatMessageDto(role = msg.role, content = slimFileMessage(msg.content))
+    private fun buildHistoryMsgs(
+        myMsgs: List<ChatMessage>,
+        conversationDtos: MutableList<ChatMessageDto>,
+        directImageDataUri: String? = null
+    ) {
+        // 只把图片挂在本轮最后一条带图用户消息上；历史图片只留文字占位，避免每轮都重复上传 base64
+        val lastImageUserIndex = if (directImageDataUri != null) {
+            myMsgs.indexOfLast { it.role == "user" && it.imageUri != null }
+        } else -1
+
+        val historyMsgs = myMsgs.mapIndexed { index, msg ->
+            val text = slimFileMessage(msg.content)
+            when {
+                index == lastImageUserIndex && directImageDataUri != null -> ChatMessageDto(
+                    role = "user",
+                    content = listOf<Map<String, Any?>>(
+                        mapOf("type" to "text", "text" to text.ifBlank { "请描述这张图片" }),
+                        mapOf("type" to "image_url", "image_url" to mapOf("url" to directImageDataUri))
+                    )
+                )
+                msg.role == "user" && msg.imageUri != null -> ChatMessageDto(
+                    role = "user",
+                    content = if (text.isBlank()) "[图片]" else "$text\n[历史图片已省略]"
+                )
+                else -> ChatMessageDto(role = msg.role, content = text)
+            }
         }
         // 命理师在缓存与 token 之间取折中：保留更多原始历史利于缓存，但不设太大
         val keepRecent = if (activePersonaId == "fortune") 20 else 16
@@ -1375,8 +1422,18 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
             val f = getStateFile()
             if (!f.exists()) return false
             val state = gson.fromJson(f.readText(Charsets.UTF_8), AgentState::class.java)
-            hasSavedState = true
-            resumePending = !state.conversationDtos.isNullOrEmpty()
+            // 只有未执行完的计划才提示恢复；已完成/陈旧状态直接清掉，避免重进对话又重播旧回答
+            val planTasks = try {
+                if (state.planJson.isNotBlank()) {
+                    gson.fromJson(state.planJson, TaskPlan::class.java)?.tasks?.size ?: 0
+                } else 0
+            } catch (_: Exception) { 0 }
+            val executable = state.planPhase == "EXECUTING" &&
+                !state.conversationDtos.isNullOrEmpty() &&
+                (planTasks == 0 || state.completedTaskIds.size < planTasks)
+            resumePending = executable
+            hasSavedState = resumePending
+            if (!resumePending) f.delete()
             resumePending
         } catch (_: Exception) {
             false
@@ -1512,6 +1569,37 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
 
     // --- 视觉 API（直接走 OkHttp，绕过 Retrofit URL 前缀问题）---
 
+    /** 把本地图片转成 data URI；大图先按最长边 1600 压缩，避免请求体过大 */
+    private fun imageToDataUri(path: String): String? {
+        if (path.startsWith("data:") || path.startsWith("http")) return path
+        return try {
+            val f = java.io.File(path)
+            if (!f.exists()) return null
+            val bytes = f.readBytes()
+            val mime = when (f.extension.lowercase()) {
+                "png" -> "image/png"
+                "webp" -> "image/webp"
+                "gif" -> "image/gif"
+                else -> "image/jpeg"
+            }
+            if (bytes.size <= 1_500_000) {
+                return "data:$mime;base64,${android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)}"
+            }
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 1600) sample *= 2
+            val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+            val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+            val out = java.io.ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
+            bmp.recycle()
+            "data:image/jpeg;base64,${android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)}"
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private suspend fun describeImage(imageDataUri: String, userQuestion: String, profile: ApiProfile): Pair<String?, String> {
         return try {
             val model = profile.visionModel.ifBlank { return Pair(null, "") }
@@ -1520,21 +1608,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
             val key = profile.visionApiKey.ifBlank { profile.apiKey }
 
             // 图片已落盘为文件路径，读成 base64 data URI 发给视觉模型
-            val imageUrl = if (imageDataUri.startsWith("data:") || imageDataUri.startsWith("http")) {
-                imageDataUri
-            } else {
-                val f = java.io.File(imageDataUri)
-                if (f.exists()) {
-                    val bytes = f.readBytes()
-                    val mime = when (f.extension.lowercase()) {
-                        "png" -> "image/png"
-                        "webp" -> "image/webp"
-                        "gif" -> "image/gif"
-                        else -> "image/jpeg"
-                    }
-                    "data:$mime;base64,${android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)}"
-                } else imageDataUri
-            }
+            val imageUrl = imageToDataUri(imageDataUri) ?: return Pair(null, "")
 
             val hasQuestion = userQuestion.isNotBlank() && userQuestion != "请描述这张图片"
             val prompt = buildString {

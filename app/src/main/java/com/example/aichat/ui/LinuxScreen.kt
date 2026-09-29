@@ -85,7 +85,7 @@ fun LinuxScreen(
                     if (!manager.rootfsInstalled()) {
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "尚未安装 Alpine rootfs。安装后即可使用 apk / sh / phone 等命令。",
+                            "尚未安装 Alpine rootfs（APK 已内置，安装时不需要联网下载）。安装后即可使用 apk / sh / phone 等命令。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
