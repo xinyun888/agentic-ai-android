@@ -11,7 +11,9 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import com.example.aichat.MainActivity
 import com.example.aichat.R
 import com.example.aichat.data.*
@@ -40,6 +42,8 @@ class ActiveModeService : Service() {
         const val EXTRA_SHOW_THINKING = "show_thinking"
         const val EXTRA_START_HOUR = "start_hour"
         const val EXTRA_END_HOUR = "end_hour"
+
+        private const val TAG = "ActiveModeService"
 
         /** 正在运行的角色集合，支持多开 */
         val runningPersonas: MutableSet<String> = ConcurrentHashMap.newKeySet()
@@ -148,16 +152,32 @@ class ActiveModeService : Service() {
         return START_STICKY
     }
 
-    /** 确保服务处于前台；重复调用安全。 */
-    private fun ensureForeground(personaId: String, text: String) {
+    /** 确保服务处于前台；重复调用安全。返回 false 说明系统拒绝/异常。 */
+    private fun ensureForeground(personaId: String, text: String): Boolean {
         val persona = try {
             Personas.getByIdWithCustom(personaId, this)
         } catch (_: Exception) { null }
         val name = persona?.let { "${it.emoji} ${it.name}" } ?: "主动模式"
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
-        try {
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+            Log.w(TAG, "通知被系统关闭：主动模式仍会运行，但通知栏不会显示任何消息")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                val ch = nm.getNotificationChannel(CHANNEL_FG)
+                if (ch == null || ch.importance == NotificationManager.IMPORTANCE_NONE) {
+                    Log.w(TAG, "主动模式通知频道被关闭：请在系统设置-通知里打开主动模式频道")
+                }
+            } catch (_: Exception) {}
+        }
+        return try {
             startForeground(fgId, buildNotification("$name 正在陪伴", text, fgId))
-        } catch (_: Exception) {
+            Log.i(TAG, "前台服务已启动 persona=$personaId")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground 失败 persona=$personaId: ${e.message}", e)
+            false
         }
     }
 
@@ -272,6 +292,7 @@ class ActiveModeService : Service() {
         // 持久化配置，进程被杀后闹钟拉起时能恢复
         configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
         saveConfigsToPrefs()
+        Log.i(TAG, "主动模式启动 persona=$personaId interval=$intervalMin conv=$convId")
         // 间隔后首次心跳，不立即触发
         updateNotification(fgId, fullName, "${intervalMin}分钟后首次心跳")
         scheduleAlarm(personaId)
@@ -279,6 +300,7 @@ class ActiveModeService : Service() {
 
 /** 闹钟唤醒时执行心跳 */
     private fun handleHeartbeat(personaId: String) {
+        Log.i(TAG, "收到心跳 persona=$personaId")
         val cfg = configs[personaId]
         if (cfg == null || personaId !in runningPersonas) {
             // 配置已被停止但闹钟仍到点：结束这个孤儿前台服务
@@ -293,9 +315,7 @@ class ActiveModeService : Service() {
         val fullName = "${persona.emoji} ${persona.name}"
 
         // 闹钟拉起服务时确保前台状态
-        try {
-            startForeground(fgId, buildNotification(fullName + " 正在陪伴", "心跳中...", fgId))
-        } catch (_: Exception) {}
+        ensureForeground(personaId, "心跳中...")
 
         jobs[personaId]?.cancel()
         // 先注册下一次闹钟再发请求：即使进程在请求中途被杀，心跳链也不断

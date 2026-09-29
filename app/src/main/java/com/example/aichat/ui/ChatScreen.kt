@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.view.ViewGroup
+import android.widget.Toast
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -44,6 +45,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationManagerCompat
 import androidx.compose.ui.viewinterop.AndroidView
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
@@ -98,24 +100,40 @@ fun ChatScreen(
     // 工作区文件删除确认
     var deleteFile by remember { mutableStateOf<java.io.File?>(null) }
 
-    val startNow: () -> Unit = {
-        val i = Intent(context, com.example.aichat.service.ActiveModeService::class.java).apply {
-            action = com.example.aichat.service.ActiveModeService.ACTION_START
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_PERSONA_ID, viewModel.activePersonaId)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_CONV_ID, conversationId)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_INTERVAL_MIN, pmFrequency)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_IMMERSIVE, pmImmersive)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_SHOW_THINKING, !pmHideThink)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_START_HOUR, 0)
-            putExtra(com.example.aichat.service.ActiveModeService.EXTRA_END_HOUR, 24)
+    // 返回 true 表示系统已接受启动请求（FGS 可能仍然被厂商后台策略杀掉）
+    val startNow: () -> Boolean = {
+        try {
+            val i = Intent(context, com.example.aichat.service.ActiveModeService::class.java).apply {
+                action = com.example.aichat.service.ActiveModeService.ACTION_START
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_PERSONA_ID, viewModel.activePersonaId)
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_CONV_ID, conversationId)
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_INTERVAL_MIN, pmFrequency)
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_IMMERSIVE, pmImmersive)
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_SHOW_THINKING, !pmHideThink)
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_START_HOUR, 0)
+                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_END_HOUR, 24)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i)
+            else context.startService(i)
+            true
+        } catch (e: Exception) {
+            Toast.makeText(context, "主动模式启动失败：${e.message}", Toast.LENGTH_LONG).show()
+            false
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i)
-        else context.startService(i)
     }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { granted -> if (granted) startNow() }
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(
+                context,
+                "通知权限被拒绝：主动模式仍会运行，但通知栏看不到消息。建议到系统设置里允许本应用通知。",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
     var workspaceFiles by remember { mutableStateOf<List<java.io.File>>(emptyList()) }
     // 文件查看器浮层状态
     var viewerFile by remember { mutableStateOf<java.io.File?>(null) }
@@ -1092,6 +1110,45 @@ fun ChatScreen(
                         Checkbox(checked = pmHideThink, onCheckedChange = { pmHideThink = it })
                         Text("隐藏思考过程", style = MaterialTheme.typography.labelSmall)
                     }
+                    val notifPermissionDialog = Build.VERSION.SDK_INT < 33 ||
+                        ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                    val channelBlockedDialog = Build.VERSION.SDK_INT >= 26 &&
+                        NotificationManagerCompat.from(ctx)
+                            .getNotificationChannel("active_mode_fg")?.importance ==
+                        android.app.NotificationManager.IMPORTANCE_NONE
+                    val notifEnabledDialog = NotificationManagerCompat.from(ctx).areNotificationsEnabled() &&
+                        notifPermissionDialog && !channelBlockedDialog
+                    Text(
+                        when {
+                            notifEnabledDialog -> "通知权限：已开启"
+                            channelBlockedDialog -> "通知权限：主动模式通知频道被关闭，主动消息不会显示"
+                            else -> "通知权限：未开启，主动消息不会显示在通知栏"
+                        },
+                        color = if (notifEnabledDialog) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                    if (!notifEnabledDialog) {
+                        TextButton(onClick = {
+                            try {
+                                val intent = if (channelBlockedDialog) {
+                                    Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+                                        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                                        .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, "active_mode_fg")
+                                } else {
+                                    Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                                        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, ctx.packageName)
+                                }
+                                ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            } catch (_: Exception) {}
+                        }) { Text("去开启通知", style = MaterialTheme.typography.labelSmall) }
+                    }
+                    TextButton(onClick = {
+                        try {
+                            ctx.startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        } catch (_: Exception) {}
+                    }) { Text("后台被限制？打开电池优化设置", style = MaterialTheme.typography.labelSmall) }
                     if (isRunning) {
                         Text("✅ 正在运行", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
                     }
@@ -1108,14 +1165,27 @@ fun ChatScreen(
                         showActiveModeDialog = false
                         return@TextButton
                     }
-                    // 检查通知权限 —— 若被拒绝，授权后启动器会自动启动
-                    if (Build.VERSION.SDK_INT >= 33 && ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
-                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                        notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
-                        showActiveModeDialog = false
-                        return@TextButton
+                    // 关键：无论通知权限是否开启，都先把服务启动起来，避免点了没反应
+                    val started = startNow()
+                    if (started) {
+                        val notifPermission = Build.VERSION.SDK_INT < 33 ||
+                            ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                        val channelBlocked = Build.VERSION.SDK_INT >= 26 &&
+                            NotificationManagerCompat.from(ctx)
+                                .getNotificationChannel("active_mode_fg")?.importance ==
+                            android.app.NotificationManager.IMPORTANCE_NONE
+                        val notifEnabled = NotificationManagerCompat.from(ctx).areNotificationsEnabled() &&
+                            notifPermission && !channelBlocked
+                        if (notifEnabled) {
+                            Toast.makeText(ctx, "主动模式已启动，${pmFrequency} 分钟后首次心跳", Toast.LENGTH_LONG).show()
+                        } else {
+                            Toast.makeText(ctx, "主动模式已启动，但通知被系统关闭/频道被关闭，通知栏不会显示。请在设置中允许通知。", Toast.LENGTH_LONG).show()
+                        }
+                        if (Build.VERSION.SDK_INT >= 33 && !notifPermission) {
+                            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                        }
                     }
-                    startNow()
                     showActiveModeDialog = false
                 }) { Text(if (isRunning) "停止" else "开始主动陪伴") }
             },
