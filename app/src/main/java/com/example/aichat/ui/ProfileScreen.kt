@@ -198,6 +198,13 @@ fun ProfileCard(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                if (baseUrl.startsWith("http://", ignoreCase = true)) {
+                    Text(
+                        " 当前使用 HTTP 明文，API Key 和聊天内容可能在网络中被窃听，建议改用 HTTPS。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(8.dp))
 

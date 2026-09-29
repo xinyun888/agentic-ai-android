@@ -4,7 +4,7 @@
 
 ## 1. 下载运行时
 
-当前 APK 默认不包含 proot 和 Alpine rootfs，需要先在有网络的机器上运行：
+仓库源码构建前需要运行下面的脚本获取 proot 和 Alpine rootfs；本仓库已经构建好的 APK 已内置这些资源，安装时无需联网下载。
 
 ```powershell
 cd 项目根目录

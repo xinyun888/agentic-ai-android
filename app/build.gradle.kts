@@ -11,10 +11,11 @@ val localProps = Properties().apply {
     val f = rootProject.file("local.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
+val defaultPython = if (System.getProperty("os.name").lowercase().contains("win")) "python.exe" else "python3"
 val pythonExecutable: String = (project.findProperty("pythonExecutable") as? String)
     ?: System.getenv("PYTHON_EXECUTABLE")
     ?: localProps.getProperty("pythonExecutable")
-    ?: "C:/Users/Lenovo/.workbuddy/binaries/python/versions/3.13.12/python.exe"
+    ?: defaultPython
 
 // PRoot 在 Android 10+ targetSdk>=29 的 W^X 限制下可能无法执行 rootfs 内二进制。
 // 侧载构建 Linux 环境时可加 -PtargetSdk=28 绕过；默认仍保持现代 target。
@@ -28,8 +29,8 @@ android {
         applicationId = "com.example.aichat"
         minSdk = 26
         targetSdk = targetSdkVersion
-        versionCode = 261
-        versionName = "2.59.2"
+        versionCode = 262
+        versionName = "2.59.3"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

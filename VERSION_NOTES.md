@@ -1,3 +1,14 @@
+## v2.59.3（GitHub 发布前安全清理）
+
+- 移除源码里的个人绝对路径 `C:/Users/Lenovo/...` fallback，Python 解释器改为按平台自动选择
+- 移除未使用的 `SYSTEM_ALERT_WINDOW` 权限
+- 新增 `THIRD_PARTY_NOTICES.md`，列明 PRoot/QEMU/Alpine/Chaquopy 等许可证与 GPL 义务
+- 新增 `SECURITY.md`，说明 API Key 存储、无障碍/Python/Linux 高权限风险和网络注意事项
+- ProfileScreen 对 `http://` Base URL 显示明文传输风险警告
+- 修正 LICENSE 编码并补全 MIT + Commons Clause 文本
+- 更新 README / LINUX_RUNTIME 过时说明
+- versionCode 262 / versionName 2.59.3
+
 ## v2.59.2（默认 Flash + 内置 rootfs 复验）
 
 - 按用户要求默认模型改为 `deepseek-flash`，默认不再使用 `deepseek-v4-pro`

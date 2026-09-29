@@ -35,9 +35,11 @@ replay_pid*.log
 
 # Linux runtime assets (run fetch-linux-runtime.ps1 to download)
 app/src/main/jniLibs/
+app/src/main/assets/linux/*.tar
 app/src/main/assets/linux/*.tar.gz
 
 # Local built APKs
 dist/
 app/src/main/assets/qemu/
+app/src/main/assets/qemu-x86_64/
 app/src/main/assets/vm/

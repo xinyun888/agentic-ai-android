@@ -122,6 +122,12 @@ AI 可以自主调用的工具：
 | `screen_gesture` | 模拟点击/滑动 |
 | `python_close` | 关闭 Python 会话释放资源 |
 
+## 安全
+
+API Key 本地保存，不上传服务器；支持自定义 Base URL。无障碍、Python、Linux、文件/URL 工具属于高权限能力，使用前请阅读 `SECURITY.md`。
+
 ## License
 
-MIT
+MIT License with Commons Clause（禁止未授权商业售卖/SaaS）。
+
+第三方组件（PRoot、QEMU、Alpine、Chaquopy 等）的许可证与合规要求见 `THIRD_PARTY_NOTICES.md`。
