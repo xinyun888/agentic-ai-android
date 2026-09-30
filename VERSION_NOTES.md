@@ -1,3 +1,24 @@
+## v2.59.7（QEMU 桥限制全部补齐）
+
+- guest 自动安装手机桥，不再每次冷启动手动粘贴命令：
+  - QemuManager 监听串口输出
+  - 检测 `login:` 自动输入 `root`
+  - 检测 shell 提示符后自动执行 `PhoneBridgeHttpServer.guestSetupCommand()`
+  - 自动配置 eth0/DHCP、下载 `/usr/local/bin/phone`、执行 `phone available`
+- 新增截屏桥：
+  - `ScreenControlService.captureScreenshotJpeg()` 基于无障碍 `takeScreenshot`（Android 11+）
+  - HTTP 端点 `GET /phone/screenshot` 返回 JPEG
+  - guest 命令 `phone screenshot [文件名]` 可直接保存截图
+  - 供 guest 里的视觉 harness 使用
+- 新增模型代理，API Key 不下放 guest：
+  - HTTP 端点 `POST /model/chat`
+  - 使用宿主当前激活 Profile 的 baseUrl/apiKey/model
+  - guest 只发 OpenAI Chat Completions JSON，宿主负责注入 Key、强制 active model、`stream=false`
+  - guest 被攻破也拿不到 Key；模型选择仍由宿主控制
+- 之前版本已有的 `phone dump/tap/swipe/text/find/back/home` 保持
+- 新增 `phone screenshot` 用法提示
+- versionCode 266 / versionName 2.59.7
+
 ## v2.59.6（QEMU 手机桥 + VM 页面退出不中断）
 
 - QEMU guest 手机控制桥：

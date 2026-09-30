@@ -4,7 +4,12 @@ import android.content.Context
 import android.os.Build
 import com.example.aichat.linux.LinuxRuntimeManager
 import com.example.aichat.linux.PhoneBridgeHttpServer
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -247,6 +252,9 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     )
 
     private var activeSession: QemuSession? = null
+    private val setupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var setupJob: Job? = null
+    @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
     fun currentSession(): QemuSession? = activeSession
@@ -264,12 +272,43 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                 it.start()
                 // 给 guest 打开设备能力 HTTP 桥
                 PhoneBridgeHttpServer.start(context)
+                // 自动登录 guest 并安装 phone 桥，免去每次启动手动粘贴
+                startGuestSetup(it)
                 // 保持进程不被系统回收，退出页面/退到后台 VM 继续跑
                 QemuKeepAliveService.start(context)
             }
         } catch (_: Exception) {
             stopSession()
             null
+        }
+    }
+
+    private fun startGuestSetup(session: QemuSession) {
+        setupJob?.cancel()
+        setupJob = setupScope.launch {
+            val cmd = PhoneBridgeHttpServer.guestSetupCommand()
+            if (cmd.isBlank()) return@launch
+            var loginSent = false
+            var sent = false
+            session.output.collect { output ->
+                if (sent || guestSetupDone) return@collect
+                val tail = output.takeLast(6000)
+                val hasLogin = tail.contains("login:", ignoreCase = true)
+                val hasPrompt = tail.contains("~ #") ||
+                    tail.contains("localhost:~#") ||
+                    tail.lines().lastOrNull()?.trimEnd()?.endsWith("#") == true
+                if (hasLogin && !loginSent) {
+                    loginSent = true
+                    session.write("root")
+                }
+                // 如果镜像自动登录 root，也会直接出现提示符
+                if (hasPrompt && (loginSent || !hasLogin)) {
+                    sent = true
+                    guestSetupDone = true
+                    delay(300)
+                    session.write(cmd)
+                }
+            }
         }
     }
 
@@ -287,6 +326,9 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     }
 
     fun stopSession() {
+        setupJob?.cancel()
+        setupJob = null
+        guestSetupDone = false
         activeSession?.shutdown()
         activeSession = null
         QemuKeepAliveService.stop(context)

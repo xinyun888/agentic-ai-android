@@ -1,6 +1,10 @@
 package com.example.aichat.linux
 
 import android.content.Context
+import com.example.aichat.data.HttpClient
+import com.example.aichat.data.StorageManager
+import com.example.aichat.service.ScreenControlService
+import com.google.gson.JsonParser
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +18,9 @@ import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.UUID
 
 /**
@@ -32,6 +39,7 @@ object PhoneBridgeHttpServer {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var serverSocket: ServerSocket? = null
     private var acceptJob: Job? = null
+    private var appContext: Context? = null
 
     @Volatile
     private var tokenValue: String = ""
@@ -44,6 +52,7 @@ object PhoneBridgeHttpServer {
 
     fun start(context: Context): Boolean {
         if (isRunning) return true
+        appContext = context.applicationContext
         val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         tokenValue = prefs.getString(KEY_TOKEN, null)
             ?: UUID.randomUUID().toString().replace("-", "").also {
@@ -72,6 +81,7 @@ object PhoneBridgeHttpServer {
 
     fun stop() {
         isRunning = false
+        appContext = null
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
         acceptJob?.cancel()
@@ -147,9 +157,23 @@ object PhoneBridgeHttpServer {
                 method == "GET" && path == "/phone.sh" -> {
                     writeResponse(socket, 200, guestScript())
                 }
+                method == "GET" && path == "/phone/screenshot" -> {
+                    val bytes = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                        ScreenControlService.instance?.captureScreenshotJpeg()
+                    } else null
+                    if (bytes == null || bytes.isEmpty()) {
+                        writeResponse(socket, 503, "screenshot unavailable (need Android 11+ and accessibility service connected)")
+                    } else {
+                        writeBytesResponse(socket, 200, bytes, "image/jpeg")
+                    }
+                }
                 method == "POST" && path == "/phone/exec" -> {
                     val result = PhoneBridgeManager.executeRemote(body)
                     writeResponse(socket, 200, result)
+                }
+                method == "POST" && path == "/model/chat" -> {
+                    val result = proxyModelChat(body)
+                    writeResponse(socket, result.first, result.second)
                 }
                 else -> writeResponse(socket, 404, "not found")
             }
@@ -160,6 +184,38 @@ object PhoneBridgeHttpServer {
         }
     }
 
+    /** 用宿主保存的 API Key 代理模型请求，guest 不需要也不应该拿 Key。 */
+    private fun proxyModelChat(body: String): Pair<Int, String> {
+        val ctx = appContext ?: return 503 to "app context not ready"
+        val profile = try {
+            StorageManager(ctx).getActiveProfile() ?: StorageManager(ctx).getProfiles().firstOrNull()
+        } catch (_: Exception) { null } ?: return 502 to "no active profile"
+        if (profile.apiKey.isBlank()) return 502 to "active profile has empty API key"
+        val requestJson = try {
+            val obj = JsonParser.parseString(body).asJsonObject
+            obj.addProperty("model", profile.model)
+            obj.addProperty("stream", false)
+            obj.toString()
+        } catch (_: Exception) {
+            return 400 to "body must be a JSON object"
+        }
+        val url = profile.baseUrl.trim().trimEnd('/') + "/chat/completions"
+        return try {
+            val req = Request.Builder()
+                .url(url)
+                .addHeader("Authorization", "Bearer ${profile.apiKey}")
+                .addHeader("Content-Type", "application/json")
+                .post(requestJson.toRequestBody("application/json".toMediaType()))
+                .build()
+            HttpClient.instance.newCall(req).execute().use { resp ->
+                val text = resp.body?.string() ?: ""
+                if (resp.isSuccessful) 200 to text else resp.code to text
+            }
+        } catch (e: Exception) {
+            502 to "model proxy error: ${e.message}"
+        }
+    }
+
     private fun guestScript(): String {
         val dollar = "$"
         return """#!/bin/sh
@@ -167,9 +223,20 @@ object PhoneBridgeHttpServer {
 TOKEN='$tokenValue'
 BASE='http://10.0.2.2:$PORT'
 if [ ${dollar}# -eq 0 ]; then
-  echo '用法: phone available|dump|find 文本|tap x y|swipe x1 y1 x2 y2 [ms]|text 内容|back|home'
+  echo '用法: phone available|dump|find 文本|tap x y|swipe x1 y1 x2 y2 [ms]|text 内容|back|home|screenshot [文件]'
   exit 2
 fi
+case "${dollar}1" in
+  screenshot)
+    OUT="${dollar}{2:-/tmp/phone-screen.jpg}"
+    wget -qO "${dollar}OUT" "${dollar}BASE/phone/screenshot?token=${dollar}TOKEN" || {
+      echo 'ERR: 截图失败，需要 Android 11+ 且无障碍服务已连接'
+      exit 3
+    }
+    echo "saved ${dollar}OUT"
+    exit 0
+    ;;
+esac
 BODY="$(printf '%s\n' "${dollar}@")"
 OUT="$(wget -qO- --post-data="${dollar}BODY" "${dollar}BASE/phone/exec?token=${dollar}TOKEN" 2>/dev/null)" || {
   echo 'ERR: 无法连接宿主，请先执行: ip link set eth0 up; udhcpc -i eth0'
@@ -180,20 +247,27 @@ echo "${dollar}OUT"
     }
 
     private fun writeResponse(socket: Socket, code: Int, body: String) {
-        val bytes = body.toByteArray(Charsets.UTF_8)
+        writeBytesResponse(socket, code, body.toByteArray(Charsets.UTF_8), "text/plain; charset=utf-8")
+    }
+
+    private fun writeBytesResponse(socket: Socket, code: Int, body: ByteArray, contentType: String) {
+        if (socket.isClosed) return
         val reason = when (code) {
             200 -> "OK"
             403 -> "Forbidden"
             404 -> "Not Found"
+            400 -> "Bad Request"
+            502 -> "Bad Gateway"
+            503 -> "Service Unavailable"
             else -> "Error"
         }
         val header = "HTTP/1.1 $code $reason\r\n" +
-            "Content-Type: text/plain; charset=utf-8\r\n" +
-            "Content-Length: ${bytes.size}\r\n" +
+            "Content-Type: $contentType\r\n" +
+            "Content-Length: ${body.size}\r\n" +
             "Connection: close\r\n\r\n"
         socket.getOutputStream().use { out ->
             out.write(header.toByteArray(Charsets.UTF_8))
-            out.write(bytes)
+            out.write(body)
             out.flush()
         }
     }

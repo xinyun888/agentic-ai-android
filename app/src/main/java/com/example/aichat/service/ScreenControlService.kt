@@ -2,14 +2,17 @@ package com.example.aichat.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.util.DisplayMetrics
+import android.view.Display
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -147,6 +150,54 @@ class ScreenControlService : AccessibilityService() {
             root?.recycle()
         }
         return false
+    }
+
+    /** 截屏并压缩为 JPEG。Android 11+ 的无障碍服务支持 takeScreenshot，返回 null 表示不可用/失败。 */
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.R)
+    fun captureScreenshotJpeg(maxWidth: Int = 1280, quality: Int = 80): ByteArray? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val latch = CountDownLatch(1)
+        var bitmap: Bitmap? = null
+        try {
+            takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor,
+                object : TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: ScreenshotResult) {
+                        try {
+                            val hb = screenshot.hardwareBuffer
+                            val raw = Bitmap.wrapHardwareBuffer(hb, screenshot.colorSpace)
+                            hb.close()
+                            if (raw != null) {
+                                bitmap = raw.copy(Bitmap.Config.ARGB_8888, false)
+                                raw.recycle()
+                            }
+                        } catch (_: Exception) {
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        latch.countDown()
+                    }
+                })
+            latch.await(6, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            return null
+        }
+        val bmp = bitmap ?: return null
+        val scaled = if (bmp.width > maxWidth) {
+            val h = (bmp.height.toLong() * maxWidth / bmp.width).toInt().coerceAtLeast(1)
+            Bitmap.createScaledBitmap(bmp, maxWidth, h, true).also { bmp.recycle() }
+        } else bmp
+        return try {
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            out.toByteArray()
+        } catch (_: Exception) {
+            null
+        } finally {
+            scaled.recycle()
+        }
     }
 
     /** 按返回键 */
