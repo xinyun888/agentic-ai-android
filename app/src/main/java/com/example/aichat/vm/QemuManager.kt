@@ -267,7 +267,9 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
             "-kernel", "/vm/vmlinuz-virt",
             "-initrd", "/vm/initramfs-virt",
             "-append", if (bootFromDisk) {
-                "root=/dev/vda3 rw console=ttyAMA0 nowatchdog"
+                // VM 实测：安装到磁盘后 root 在 /dev/vda3；
+                // 主机内核的 initramfs 需要显式 rootfstype + ext4 模块才能挂载磁盘根分区
+                "root=/dev/vda3 rw rootfstype=ext4 modules=virtio_blk,virtio_pci,ext4 rootwait console=ttyAMA0 nowatchdog"
             } else {
                 "console=ttyAMA0 ip=dhcp nowatchdog"
             },

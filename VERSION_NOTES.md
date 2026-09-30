@@ -1,3 +1,42 @@
+## v2.60.6（磁盘安装 VM 实测通过）
+
+- 在 Windows QEMU aarch64 里完整跑通：
+  1. 直接内核启动进入 `localhost login:`
+  2. 执行新版 `/disk-install.sh`
+  3. `setup-disk -m sys -k virt` 成功：
+     ```text
+     Installation is complete. Please reboot.
+     AICHAT_DISK_EXIT_0
+     ```
+  4. 磁盘布局：
+     ```text
+     /dev/vda1  300MB  boot
+     /dev/vda2    1GB  swap
+     /dev/vda3 2771MB  ext4 root
+     ```
+  5. 从磁盘启动：
+     ```text
+     Kernel command line:
+       root=/dev/vda3 rw rootfstype=ext4
+       modules=virtio_blk,virtio_pci,ext4
+       rootwait console=ttyAMA0 nowatchdog
+     ```
+     再次进入：
+     ```text
+     Welcome to Alpine Linux 3.24
+     localhost login:
+     ```
+- 修复磁盘启动参数：
+  - 增加 `rootfstype=ext4`
+  - 增加 `modules=virtio_blk,virtio_pci,ext4`
+  - 增加 `rootwait`
+- v2.60.5 的 `/disk-install.sh` 修复已被 VM 证明有效：
+  - 移除 `u-boot` world 依赖
+  - 自动补 main/community 仓库
+  - `apk update`
+  - 再执行 `setup-disk -m sys -k virt /dev/vda`
+- versionCode 275 / versionName 2.60.6
+
 ## v2.60.5（真机/VM 磁盘安装修复）
 
 - 在 Windows QEMU aarch64 里实际启动 guest，并执行了 /disk-install.sh
