@@ -1,3 +1,16 @@
+## v2.59.8（截屏能力声明修复）
+
+- 修复无障碍配置缺少 `android:canTakeScreenshot="true"` 导致 `/phone/screenshot` 一直 503
+- 真机/模拟器验证：
+  - 打开无障碍后 `GET /phone/screenshot?token=...` 返回 200
+  - `Content-Type: image/jpeg`，约 160KB
+- 同时验证模型代理：
+  - guest 发送 `model=guest-tries-pro`
+  - 宿主注入 `Authorization: Bearer <host key>`，并强制替换为当前 Profile 的 `deepseek-flash`
+  - 请求体 `stream=false`
+  - 返回正常，guest 全程看不到 API Key
+- versionCode 267 / versionName 2.59.8
+
 ## v2.59.7（QEMU 桥限制全部补齐）
 
 - guest 自动安装手机桥，不再每次冷启动手动粘贴命令：
