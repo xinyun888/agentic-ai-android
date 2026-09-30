@@ -257,6 +257,12 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         val cpu = if (safeMode) "cortex-a53" else "cortex-a57"
         val mem = if (safeMode) minOf(memoryMb, 512) else memoryMb
         val cpus = if (safeMode) 1 else smp
+        val uploadedKernel = File(vmDir, "upload/vmlinuz-virt")
+        val uploadedInitrd = File(vmDir, "upload/initramfs-virt")
+        val useUploaded = bootFromDisk && uploadedKernel.exists() && uploadedKernel.length() > 0 &&
+            uploadedInitrd.exists() && uploadedInitrd.length() > 0
+        val kernelPath = if (useUploaded) "/vm/upload/vmlinuz-virt" else "/vm/vmlinuz-virt"
+        val initrdPath = if (useUploaded) "/vm/upload/initramfs-virt" else "/vm/initramfs-virt"
         val args = mutableListOf(
             QEMU_GUEST_PATH,
             "-accel", accel,
@@ -264,8 +270,8 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
             "-cpu", cpu,
             "-smp", cpus.toString(),
             "-m", mem.toString(),
-            "-kernel", "/vm/vmlinuz-virt",
-            "-initrd", "/vm/initramfs-virt",
+            "-kernel", kernelPath,
+            "-initrd", initrdPath,
             "-append", if (bootFromDisk) {
                 // VM 实测：安装到磁盘后 root 在 /dev/vda3；
                 // 主机内核的 initramfs 需要显式 rootfstype + ext4 模块才能挂载磁盘根分区

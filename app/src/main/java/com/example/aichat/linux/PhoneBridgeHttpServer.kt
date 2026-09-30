@@ -14,6 +14,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -134,7 +135,7 @@ object PhoneBridgeHttpServer {
                     line.substring(idx + 1).trim()
             }
             val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
-            val body = if (contentLength > 0) {
+            val bodyBytes = if (contentLength > 0) {
                 val bytes = ByteArray(contentLength)
                 var read = 0
                 while (read < contentLength) {
@@ -142,8 +143,9 @@ object PhoneBridgeHttpServer {
                     if (n < 0) break
                     read += n
                 }
-                String(bytes, 0, read, Charsets.UTF_8)
-            } else ""
+                bytes.copyOf(read)
+            } else ByteArray(0)
+            val body = String(bodyBytes, Charsets.UTF_8)
 
             val path = target.substringBefore('?')
             val query = target.substringAfter('?', "")
@@ -184,6 +186,20 @@ object PhoneBridgeHttpServer {
                 method == "POST" && path == "/model/chat" -> {
                     val result = proxyModelChat(body)
                     writeResponse(socket, result.first, result.second, "application/json; charset=utf-8")
+                }
+                method == "POST" && path == "/vm/upload" -> {
+                    val rawName = query.split('&')
+                        .mapNotNull { it.split('=', limit = 2).takeIf { p -> p.size == 2 } }
+                        .firstOrNull { it[0] == "name" }?.get(1).orEmpty()
+                    val safeName = rawName.filter { it.isLetterOrDigit() || it == '.' || it == '_' || it == '-' }.take(64)
+                    val ctx = appContext
+                    if (safeName.isBlank() || ctx == null || bodyBytes.isEmpty()) {
+                        writeResponse(socket, 400, "bad upload")
+                    } else {
+                        val dir = File(ctx.filesDir, "vm/upload").apply { mkdirs() }
+                        File(dir, safeName).writeBytes(bodyBytes)
+                        writeResponse(socket, 200, "OK")
+                    }
                 }
                 else -> writeResponse(socket, 404, "not found")
             }

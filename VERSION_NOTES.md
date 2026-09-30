@@ -1,3 +1,47 @@
+## v2.61.0（最终整合版）
+
+- 功能目标：集大成者，不砍任何能力
+  - 全 ABI QEMU（arm64 + x86_64）
+  - 全 Python 包（Chaquopy）
+  - PRoot Alpine Linux
+  - QEMU 全系统 VM
+  - 内置 Harness + QEMU Guest Harness
+  - 手机无障碍控制 / PhoneBridge / 截屏
+  - 主动陪伴模式
+  - 多模态图片 / 记忆 / 计划 / 工具循环
+  - 模型代理：API Key 不进入 guest
+  - 通知 / 文件 / 剪贴板
+- QEMU 直接内核启动：
+  ```text
+  -kernel /vm/vmlinuz-virt
+  -initrd /vm/initramfs-virt
+  -append "console=ttyAMA0 ip=dhcp nowatchdog"
+  -cdrom /vm/alpine-virt.iso
+  ```
+- 安全模式自动降级：
+  - 180 秒未进 login 自动用 512MB / cortex-a53 / tcg single 重试一次
+- 安装到磁盘 + 持久启动（VM 实测通过）：
+  - `setup-disk -m sys -k virt /dev/vda`
+  - 磁盘布局：vda1 boot / vda2 swap / vda3 ext4 root
+  - 磁盘启动：
+    ```text
+    root=/dev/vda3 rw rootfstype=ext4
+    modules=virtio_blk,virtio_pci,ext4
+    rootwait console=ttyAMA0 nowatchdog
+    ```
+  - VM 实测重新进入 `localhost login:`
+- 引擎优化：
+  - QemuSession 串口输出 150ms 节流
+  - QemuSession 输入 48 字节分块，防串口丢字符
+  - PhoneBridge 文件轮询 350ms
+  - Python 懒加载
+  - PARTIAL_WAKE_LOCK 保活
+- Guest 自动安装：
+  - phone 桥
+  - python3
+  - 内置 OpenAI 兼容 Harness（监听 0.0.0.0:8000）
+- 版本：versionCode 276 / versionName 2.61.0
+
 ## v2.60.6（磁盘安装 VM 实测通过）
 
 - 在 Windows QEMU aarch64 里完整跑通：
