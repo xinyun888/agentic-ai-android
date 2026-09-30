@@ -25,6 +25,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /** QEMU 虚拟机页面 */
     var showVm by mutableStateOf(false)
+    var showHarness by mutableStateOf(false)
 
     var activeConversationId by mutableStateOf(storage.getActiveConversationId())
         private set

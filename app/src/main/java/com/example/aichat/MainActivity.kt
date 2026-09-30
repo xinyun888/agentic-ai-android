@@ -8,6 +8,7 @@ import androidx.compose.runtime.*
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.aichat.linux.PhoneBridgeManager
 import com.example.aichat.ui.ChatScreen
+import com.example.aichat.ui.HarnessScreen
 import com.example.aichat.ui.LinuxScreen
 import com.example.aichat.ui.MainScreen
 import com.example.aichat.ui.VmScreen
@@ -41,6 +42,10 @@ class MainActivity : ComponentActivity() {
                     VmScreen(
                         manager = chatViewModel.qemuManager,
                         onBack = { mainViewModel.showVm = false }
+                    )
+                } else if (mainViewModel.showHarness) {
+                    HarnessScreen(
+                        onBack = { mainViewModel.showHarness = false }
                     )
                 } else if (mainViewModel.showChat && mainViewModel.activeConversationId.isNotEmpty()) {
                     val profile = mainViewModel.getActiveProfile()

@@ -1,3 +1,23 @@
+## v2.60.0（原生 DS Harness 界面）
+
+- 新增 Campose 原生 HarnessScreen：
+  - 不再依赖 WebView / 外部浏览器
+  - LazyColumn 聊天界面、流式输出、停止、清空
+  - 设置 Base URL / API Path / Model / Token
+  - 自动健康检查，未连接/已连接状态显示
+- 支持任何 OpenAI 兼容的 harness：
+  - `POST /v1/chat/completions`，`stream=true` SSE
+  - 兼容整包 JSON 返回
+  - 解析 `choices[0].delta.content` / `choices[0].message.content`
+- QEMU 增加 hostfwd：
+  ```text
+  user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000
+  ```
+  guest 里 harness 监听 `0.0.0.0:8000`，Android 通过 `127.0.0.1:18000` 直接访问
+- 主界面新增 DS Harness 入口（机器人图标）
+- 模型 Key 可留空由 guest 自己处理；也可以走 guest 里的 harness 自己的配置
+- versionCode 269 / versionName 2.60.0
+
 ## v2.59.9（交付前加固）
 
 - guest 自动安装命令更稳：

@@ -244,7 +244,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
         "-cdrom", "/vm/alpine-virt.iso",
         "-boot", "d",
-        "-netdev", "user,id=n0",
+        "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000",
         "-device", "virtio-net-pci,netdev=n0",
         "-nographic",
         "-monitor", "none",
