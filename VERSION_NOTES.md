@@ -1,3 +1,15 @@
+## v2.60.2（发布前 bug 修复）
+
+- 修复 QemuKeepAliveService 缺少 `android.permission.WAKE_LOCK`：
+  - 之前 `newWakeLock` 会抛 SecurityException，被 catch 后 `stopSelf()`
+  - 结果 VM 前台保活服务可能直接退出
+- 修复内置 Harness 模式可能把消息发到旧对话：
+  - HarnessScreen 现在接收专用 conversationId
+  - 发送前若 currentConversationId 不匹配，先 `loadConversation`
+- 内置 Harness 现在显示 ChatViewModel.errorMessage，API 报错不再静默
+- `ensureHarnessConversation()` 保证内置 Harness 有独立对话
+- versionCode 271 / versionName 2.60.2
+
 ## v2.60.1（直接内核启动 + 内置 Harness）
 
 - QEMU 改为直接内核启动，绕开 UEFI/pflash/GRUB：

@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
                     HarnessScreen(
                         chatViewModel = chatViewModel,
                         profile = mainViewModel.getActiveProfile() ?: com.example.aichat.data.ApiProfile(),
+                        conversationId = harnessConvId,
                         onBack = {
                             mainViewModel.showHarness = false
                             mainViewModel.refreshConversations()

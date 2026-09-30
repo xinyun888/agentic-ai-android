@@ -46,6 +46,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 fun HarnessScreen(
     chatViewModel: ChatViewModel,
     profile: ApiProfile,
+    conversationId: String,
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
@@ -75,7 +76,7 @@ fun HarnessScreen(
         }
     ) { padding ->
         if (mode == "builtin") {
-            BuiltinHarness(chatViewModel, profile, Modifier.padding(padding))
+            BuiltinHarness(chatViewModel, profile, conversationId, Modifier.padding(padding))
         } else {
             GuestHarness(Modifier.padding(padding))
         }
@@ -86,6 +87,7 @@ fun HarnessScreen(
 private fun BuiltinHarness(
     chatViewModel: ChatViewModel,
     profile: ApiProfile,
+    conversationId: String,
     modifier: Modifier = Modifier
 ) {
     var input by remember { mutableStateOf("") }
@@ -104,6 +106,16 @@ private fun BuiltinHarness(
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
             )
+        }
+        chatViewModel.errorMessage?.let { err ->
+            Surface(color = MaterialTheme.colorScheme.errorContainer, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    err.take(500),
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+            }
         }
         LazyColumn(
             state = listState,
@@ -154,6 +166,9 @@ private fun BuiltinHarness(
                         val text = input.trim()
                         if (text.isNotEmpty()) {
                             input = ""
+                            if (chatViewModel.currentConversationId() != conversationId) {
+                                chatViewModel.loadConversation(conversationId)
+                            }
                             chatViewModel.sendMessage(text, profile)
                         }
                     },
