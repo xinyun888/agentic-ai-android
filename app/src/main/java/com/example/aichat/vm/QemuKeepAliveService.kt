@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import com.example.aichat.MainActivity
 import com.example.aichat.R
@@ -31,14 +32,27 @@ class QemuKeepAliveService : Service() {
         }
     }
 
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
         try {
             startForeground(NOTIF_ID, buildNotification())
+            val pm = getSystemService(POWER_SERVICE) as? PowerManager
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "aichat:qemu")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
         } catch (_: Exception) {
             stopSelf()
         }
+    }
+
+    override fun onDestroy() {
+        try { wakeLock?.release() } catch (_: Exception) {}
+        wakeLock = null
+        super.onDestroy()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY

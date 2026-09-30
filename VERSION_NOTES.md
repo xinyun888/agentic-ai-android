@@ -1,3 +1,30 @@
+## v2.60.1（直接内核启动 + 内置 Harness）
+
+- QEMU 改为直接内核启动，绕开 UEFI/pflash/GRUB：
+  - `-kernel /vm/vmlinuz-virt`
+  - `-initrd /vm/initramfs-virt`
+  - `-append "console=ttyAMA0 ip=dhcp nowatchdog"`
+  - `-cdrom /vm/alpine-virt.iso` 提供 modloop 和本地软件仓库
+  - 去掉 `-drive if=pflash...` 和 `-boot d`
+- 效果：
+  - Windows QEMU 同参数实测约 5 秒进入：
+    ```text
+    localhost login:
+    ```
+  - `nowatchdog` 关闭 guest watchdog，避免 TCG 下 soft lockup 误报刷屏
+  - 不再依赖 edk2-aarch64-code.fd / efi-vars.fd
+- APK 新增内置：
+  - `assets/vm/vmlinuz-virt`
+  - `assets/vm/initramfs-virt`
+  - `fetch-vm-assets.py` 自动下载
+  - 构建检查 `checkBundledLinuxAssets` 一并检查
+- VM 保活服务增加 `PARTIAL_WAKE_LOCK`，降低真机后台被 CPU 休眠拖死的概率
+- HarnessScreen 增加内置模式：
+  - 直接复用 App 现有 Agent 循环（工具/手机控制/Python/Linux/记忆）
+  - QEMU模式继续使用 guest 里 OpenAI 兼容服务
+  - 两种模式切换，不需要 WebView/浏览器
+- versionCode 270 / versionName 2.60.1
+
 ## v2.60.0（原生 DS Harness 界面）
 
 - 新增 Campose 原生 HarnessScreen：

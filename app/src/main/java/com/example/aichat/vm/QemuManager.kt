@@ -33,7 +33,8 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         .build()
 
     val isoFile = File(vmDir, "alpine-virt.iso")
-    val efiVarsFile = File(vmDir, "efi-vars.fd")
+    val kernelFile = File(vmDir, "vmlinuz-virt")
+    val initrdFile = File(vmDir, "initramfs-virt")
     val diskFile = File(vmDir, "alpine.qcow2")
 
     fun rootfsInstalled(): Boolean = linux.rootfsInstalled()
@@ -53,7 +54,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     fun netbootAssetsReady(): Boolean {
         if (!abiSupported()) return false
         val names = context.assets.list("vm")?.toSet() ?: emptySet()
-        return names.contains("alpine-virt.iso")
+        return names.containsAll(setOf("alpine-virt.iso", "vmlinuz-virt", "initramfs-virt"))
     }
 
     suspend fun installRootfs(onProgress: (String) -> Unit): Result<Unit> =
@@ -112,7 +113,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
             }
         }
 
-    /** 完全离线：从 assets/vm 复制 Alpine virt ISO 到 /vm */
+    /** 完全离线：复制直接内核启动所需的 ISO / vmlinuz / initramfs 到 /vm */
     suspend fun installIsoFromAssets(onProgress: (String) -> Unit): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
@@ -120,18 +121,29 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                     return@withContext Result.failure(IllegalStateException("当前设备/ABI 不支持内置 arm64 VM 运行时"))
                 }
                 val names = context.assets.list("vm")?.toSet() ?: emptySet()
-                if ("alpine-virt.iso" !in names) {
-                    return@withContext Result.failure(IllegalStateException("缺少 assets/vm/alpine-virt.iso"))
+                val required = setOf("alpine-virt.iso", "vmlinuz-virt", "initramfs-virt")
+                if (!names.containsAll(required)) {
+                    return@withContext Result.failure(IllegalStateException("缺少 assets/vm 内核/ISO 资源"))
                 }
-                if (isoFile.exists() && isoFile.length() > 0) {
-                    onProgress("ISO 已存在")
+                if (isoFile.exists() && isoFile.length() > 0 &&
+                    kernelFile.exists() && kernelFile.length() > 0 &&
+                    initrdFile.exists() && initrdFile.length() > 0
+                ) {
+                    onProgress("内核/ISO 已存在")
                     return@withContext Result.success(Unit)
                 }
-                onProgress("释放 Alpine virt ISO ...")
-                context.assets.open("vm/alpine-virt.iso").use { input ->
-                    isoFile.outputStream().use { output -> input.copyTo(output) }
+                onProgress("释放 vmlinuz / initramfs / ISO ...")
+                listOf(
+                    "vmlinuz-virt" to kernelFile,
+                    "initramfs-virt" to initrdFile,
+                    "alpine-virt.iso" to isoFile
+                ).forEach { (name, target) ->
+                    context.assets.open("vm/$name").use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    onProgress("  $name -> ${target.length() / 1024 / 1024}MB")
                 }
-                onProgress("Alpine ISO 已就绪 (${isoFile.length() / 1024 / 1024}MB)")
+                onProgress("内核/ISO 已就绪")
                 Result.success(Unit)
             } catch (e: Exception) {
                 Result.failure(e)
@@ -140,14 +152,17 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
 
     fun qemuInstalled(): Boolean = File(linux.rootfsDir, "usr/bin/qemu-system-aarch64").exists()
 
-    fun imagesReady(): Boolean = isoFile.exists() && isoFile.length() > 0
+    fun imagesReady(): Boolean = isoFile.exists() && isoFile.length() > 0 &&
+        kernelFile.exists() && kernelFile.length() > 0 &&
+        initrdFile.exists() && initrdFile.length() > 0
 
     fun diskReady(): Boolean = diskFile.exists() && diskFile.length() > 0
 
     fun statusText(): String = buildString {
         appendLine("rootfs: " + if (rootfsInstalled()) "\u2705 已安装" else "\u274C 未安装")
         appendLine("QEMU:   " + if (qemuInstalled()) "\u2705 已安装" else "\u274C 未安装")
-        appendLine("ISO:    " + if (imagesReady()) "\u2705 ${isoFile.length() / 1024 / 1024}MB" else "\u274C 未释放")
+        appendLine("内核:   " + if (kernelFile.exists() && initrdFile.exists()) "\u2705 已释放" else "\u274C 未释放")
+        appendLine("ISO:    " + if (isoFile.exists() && isoFile.length() > 0) "\u2705 ${isoFile.length() / 1024 / 1024}MB" else "\u274C 未释放")
         appendLine("磁盘:   " + if (diskReady()) "\u2705 ${diskFile.name} (${diskFile.length() / 1024 / 1024}MB)" else "\u274C 未创建")
         val assetDir = qemuAssetDir()
         val qemuApkCount = context.assets.list(assetDir)?.count { it.endsWith(".apk") } ?: 0
@@ -239,11 +254,11 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         "-cpu", "cortex-a57",
         "-smp", smp.toString(),
         "-m", memoryMb.toString(),
-        "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/qemu/edk2-aarch64-code.fd",
-        "-drive", "if=pflash,format=raw,file=/vm/efi-vars.fd",
+        "-kernel", "/vm/vmlinuz-virt",
+        "-initrd", "/vm/initramfs-virt",
+        "-append", "console=ttyAMA0 ip=dhcp nowatchdog",
         "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
         "-cdrom", "/vm/alpine-virt.iso",
-        "-boot", "d",
         "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000",
         "-device", "virtio-net-pci,netdev=n0",
         "-nographic",
@@ -264,7 +279,6 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? {
         if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
-        if (!ensureEfiVars()) return null
         stopSession()
         return try {
             QemuSession(linux, buildQemuArgs(memoryMb, smp)).also {
@@ -309,19 +323,6 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                     session.write(cmd)
                 }
             }
-        }
-    }
-
-    private fun ensureEfiVars(): Boolean {
-        return try {
-            val systemVars = File(linux.rootfsDir, "usr/share/qemu/edk2-arm-vars.fd")
-            if (!systemVars.exists()) return false
-            if (!efiVarsFile.exists() || efiVarsFile.length() != systemVars.length()) {
-                systemVars.copyTo(efiVarsFile, overwrite = true)
-            }
-            true
-        } catch (_: Exception) {
-            false
         }
     }
 

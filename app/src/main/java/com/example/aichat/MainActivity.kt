@@ -44,8 +44,15 @@ class MainActivity : ComponentActivity() {
                         onBack = { mainViewModel.showVm = false }
                     )
                 } else if (mainViewModel.showHarness) {
+                    val harnessConvId = remember { mainViewModel.ensureHarnessConversation() }
+                    LaunchedEffect(harnessConvId) { chatViewModel.loadConversation(harnessConvId) }
                     HarnessScreen(
-                        onBack = { mainViewModel.showHarness = false }
+                        chatViewModel = chatViewModel,
+                        profile = mainViewModel.getActiveProfile() ?: com.example.aichat.data.ApiProfile(),
+                        onBack = {
+                            mainViewModel.showHarness = false
+                            mainViewModel.refreshConversations()
+                        }
                     )
                 } else if (mainViewModel.showChat && mainViewModel.activeConversationId.isNotEmpty()) {
                     val profile = mainViewModel.getActiveProfile()

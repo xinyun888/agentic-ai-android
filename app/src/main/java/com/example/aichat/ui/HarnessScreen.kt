@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -11,7 +12,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -21,9 +21,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.aichat.data.ApiProfile
+import com.example.aichat.data.ChatMessage
 import com.example.aichat.data.HttpClient
+import com.example.aichat.viewmodel.ChatViewModel
+import com.google.gson.Gson
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -33,18 +36,138 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
-private data class HarnessMsg(val role: String, val content: String)
-
 /**
- * 原生 Compose DS Harness 客户端。
- *
- * QEMU guest 里启动 OpenAI 兼容服务（默认监听 0.0.0.0:8000），
- * QEMU user networking 通过 hostfwd=127.0.0.1:18000-:8000 暴露到手机本机。
+ * 两种模式：
+ *  - 内置 Agent：直接复用 App 现有 Agent 循环（工具、手机控制、Python、Linux、记忆）
+ *  - QEMU Guest：连接 guest 里 127.0.0.1:18000 的 OpenAI 兼容 Harness
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HarnessScreen(onBack: () -> Unit) {
+fun HarnessScreen(
+    chatViewModel: ChatViewModel,
+    profile: ApiProfile,
+    onBack: () -> Unit
+) {
     BackHandler { onBack() }
+    var mode by remember { mutableStateOf("builtin") }
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("DS Harness") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "返回") }
+                },
+                actions = {
+                    FilterChip(
+                        selected = mode == "builtin",
+                        onClick = { mode = "builtin" },
+                        label = { Text("内置") }
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = mode == "guest",
+                        onClick = { mode = "guest" },
+                        label = { Text("QEMU") }
+                    )
+                    Spacer(Modifier.width(6.dp))
+                }
+            )
+        }
+    ) { padding ->
+        if (mode == "builtin") {
+            BuiltinHarness(chatViewModel, profile, Modifier.padding(padding))
+        } else {
+            GuestHarness(Modifier.padding(padding))
+        }
+    }
+}
+
+@Composable
+private fun BuiltinHarness(
+    chatViewModel: ChatViewModel,
+    profile: ApiProfile,
+    modifier: Modifier = Modifier
+) {
+    var input by remember { mutableStateOf("") }
+    val listState = rememberLazyListState()
+    val visible = chatViewModel.messages.filter { it.role == "user" || it.role == "assistant" }
+    LaunchedEffect(visible.size) {
+        if (visible.isNotEmpty()) listState.animateScrollToItem(visible.lastIndex)
+    }
+    Column(modifier = modifier.fillMaxSize()) {
+        Surface(
+            color = MaterialTheme.colorScheme.secondaryContainer,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                "内置 Agent  模型 ${profile.model}  工具：手机控制/Python/Linux/文件/搜索",
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+            )
+        }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(visible) { msg ->
+                val isUser = msg.role == "user"
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+                ) {
+                    Surface(
+                        color = if (isUser) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.widthIn(max = 320.dp)
+                    ) {
+                        Text(
+                            msg.content.ifBlank { "..." },
+                            modifier = Modifier.padding(10.dp),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = input,
+                onValueChange = { input = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("输入消息，交给内置 Agent") },
+                maxLines = 4
+            )
+            Spacer(Modifier.width(6.dp))
+            if (chatViewModel.isLoading) {
+                FilledIconButton(onClick = { chatViewModel.cancelLoading() }) {
+                    Icon(Icons.Filled.Stop, contentDescription = "停止")
+                }
+            } else {
+                FilledIconButton(
+                    onClick = {
+                        val text = input.trim()
+                        if (text.isNotEmpty()) {
+                            input = ""
+                            chatViewModel.sendMessage(text, profile)
+                        }
+                    },
+                    enabled = input.isNotBlank()
+                ) {
+                    Icon(Icons.Filled.Send, contentDescription = "发送")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GuestHarness(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("harness_client", Context.MODE_PRIVATE) }
     var baseUrl by remember { mutableStateOf(prefs.getString("baseUrl", "http://127.0.0.1:18000") ?: "") }
@@ -67,11 +190,9 @@ fun HarnessScreen(onBack: () -> Unit) {
 
     fun checkHealth() {
         scope.launch(Dispatchers.IO) {
-            // 只要能建立 HTTP 连接，端口就算通了；不要求某个特定路径一定 200
             val ok = try {
                 val root = baseUrl.trim().trimEnd('/')
-                val candidates = listOf("$root/v1/models", "$root/health", root)
-                candidates.any { url ->
+                listOf("$root/v1/models", "$root/health", root).any { url ->
                     try {
                         val req = Request.Builder().url(url)
                             .apply { if (token.isNotBlank()) addHeader("Authorization", "Bearer $token") }
@@ -104,7 +225,7 @@ fun HarnessScreen(onBack: () -> Unit) {
                     "messages" to messages.dropLast(1).map { mapOf("role" to it.role, "content" to it.content) },
                     "stream" to true
                 )
-                val requestJson = com.google.gson.Gson().toJson(payload)
+                val requestJson = Gson().toJson(payload)
                 val url = baseUrl.trim().trimEnd('/') + if (apiPath.startsWith("/")) apiPath else "/$apiPath"
                 val req = Request.Builder().url(url)
                     .apply { if (token.isNotBlank()) addHeader("Authorization", "Bearer $token") }
@@ -122,7 +243,6 @@ fun HarnessScreen(onBack: () -> Unit) {
                     val body = resp.body ?: return@use
                     val contentType = resp.header("Content-Type") ?: ""
                     if (!contentType.contains("event-stream", ignoreCase = true)) {
-                        // 有些 harness 即使请求 stream=true 也返回整包 JSON
                         val bodyText = body.string()
                         val reply = try {
                             JsonParser.parseString(bodyText).asJsonObject
@@ -130,10 +250,7 @@ fun HarnessScreen(onBack: () -> Unit) {
                                 ?.getAsJsonObject("message")?.get("content")?.asString
                         } catch (_: Exception) { null }
                         withContext(Dispatchers.Main) {
-                            messages[assistantIndex] = HarnessMsg(
-                                "assistant",
-                                reply ?: bodyText.take(1000)
-                            )
+                            messages[assistantIndex] = HarnessMsg("assistant", reply ?: bodyText.take(1000))
                         }
                         return@use
                     }
@@ -156,11 +273,6 @@ fun HarnessScreen(onBack: () -> Unit) {
                             }
                         }
                     }
-                    if (sb.isEmpty()) {
-                        withContext(Dispatchers.Main) {
-                            messages[assistantIndex] = HarnessMsg("assistant", "(服务端没有返回流式内容)")
-                        }
-                    }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -172,82 +284,68 @@ fun HarnessScreen(onBack: () -> Unit) {
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("DS Harness") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, contentDescription = "返回") }
-                },
-                actions = {
-                    IconButton(onClick = { checkHealth() }) { Icon(Icons.Filled.Settings, contentDescription = null) }
-                }
-            )
-        }
-    ) { padding ->
-        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            Surface(
-                color = if (status == "已连接") MaterialTheme.colorScheme.secondaryContainer
-                else MaterialTheme.colorScheme.errorContainer,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("$status    $baseUrl", style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace)
-                    Spacer(Modifier.weight(1f))
-                    TextButton(onClick = { showSettings = true }) { Text("设置") }
-                    TextButton(onClick = { messages.clear(); streaming = false; streamJob?.cancel() }) { Text("清空") }
-                }
-            }
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                itemsIndexed(messages) { _, msg ->
-                    val isUser = msg.role == "user"
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
-                    ) {
-                        Surface(
-                            color = if (isUser) MaterialTheme.colorScheme.primaryContainer
-                            else MaterialTheme.colorScheme.surfaceVariant,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.widthIn(max = 320.dp)
-                        ) {
-                            Text(
-                                msg.content.ifBlank { "..." },
-                                modifier = Modifier.padding(10.dp),
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                        }
-                    }
-                }
-            }
+    Column(modifier = modifier.fillMaxSize()) {
+        Surface(
+            color = if (status == "已连接") MaterialTheme.colorScheme.secondaryContainer
+            else MaterialTheme.colorScheme.errorContainer,
+            modifier = Modifier.fillMaxWidth()
+        ) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(8.dp),
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("输入消息，发给 QEMU guest 里的 harness") },
-                    maxLines = 4
-                )
-                Spacer(Modifier.width(6.dp))
-                if (streaming) {
-                    FilledIconButton(onClick = { streamJob?.cancel(); streaming = false }) {
-                        Icon(Icons.Filled.Stop, contentDescription = "停止")
+                Text("$status    $baseUrl", style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { showSettings = true }) { Text("设置") }
+                TextButton(onClick = { messages.clear(); streaming = false; streamJob?.cancel() }) { Text("清空") }
+            }
+        }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            itemsIndexed(messages) { _, msg ->
+                val isUser = msg.role == "user"
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+                ) {
+                    Surface(
+                        color = if (isUser) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.widthIn(max = 320.dp)
+                    ) {
+                        Text(
+                            msg.content.ifBlank { "..." },
+                            modifier = Modifier.padding(10.dp),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
                     }
-                } else {
-                    FilledIconButton(onClick = { send() }, enabled = input.isNotBlank()) {
-                        Icon(Icons.Filled.Send, contentDescription = "发送")
-                    }
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = input,
+                onValueChange = { input = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("输入消息，发给 QEMU guest 里的 harness") },
+                maxLines = 4
+            )
+            Spacer(Modifier.width(6.dp))
+            if (streaming) {
+                FilledIconButton(onClick = { streamJob?.cancel(); streaming = false }) {
+                    Icon(Icons.Filled.Stop, contentDescription = "停止")
+                }
+            } else {
+                FilledIconButton(onClick = { send() }, enabled = input.isNotBlank()) {
+                    Icon(Icons.Filled.Send, contentDescription = "发送")
                 }
             }
         }
@@ -260,15 +358,15 @@ fun HarnessScreen(onBack: () -> Unit) {
         var eToken by remember { mutableStateOf(token) }
         AlertDialog(
             onDismissRequest = { showSettings = false },
-            title = { Text("Harness 连接设置") },
+            title = { Text("Guest Harness 设置") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
-                    OutlinedTextField(eBase, { eBase = it }, label = { Text("Base URL（默认 127.0.0.1:18000）") }, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(eBase, { eBase = it }, label = { Text("Base URL") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(ePath, { ePath = it }, label = { Text("API Path") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(eModel, { eModel = it }, label = { Text("Model") }, modifier = Modifier.fillMaxWidth())
                     OutlinedTextField(eToken, { eToken = it }, label = { Text("Token（可空）") }, modifier = Modifier.fillMaxWidth())
                     Text(
-                        "QEMU guest 里请让 harness 监听 0.0.0.0:8000；VM 会把 127.0.0.1:18000 转发到 guest:8000。",
+                        "guest 里让 harness 监听 0.0.0.0:8000；QEMU hostfwd 会把 127.0.0.1:18000 转发过去。",
                         style = MaterialTheme.typography.labelSmall
                     )
                 }
@@ -283,3 +381,5 @@ fun HarnessScreen(onBack: () -> Unit) {
         )
     }
 }
+
+private data class HarnessMsg(val role: String, val content: String)

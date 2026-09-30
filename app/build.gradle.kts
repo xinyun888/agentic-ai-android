@@ -29,8 +29,8 @@ android {
         applicationId = "com.example.aichat"
         minSdk = 26
         targetSdk = targetSdkVersion
-        versionCode = 269
-        versionName = "2.60.0"
+        versionCode = 270
+        versionName = "2.60.1"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -105,7 +105,9 @@ android {
 val requiredBundledAssets = listOf(
     "src/main/assets/linux/alpine-aarch64.tar.gz",
     "src/main/assets/linux/alpine-x86_64.tar.gz",
-    "src/main/assets/vm/alpine-virt.iso"
+    "src/main/assets/vm/alpine-virt.iso",
+    "src/main/assets/vm/vmlinuz-virt",
+    "src/main/assets/vm/initramfs-virt"
 )
 
 tasks.register("checkBundledLinuxAssets") {

@@ -126,6 +126,9 @@ def main() -> int:
     fetch_qemu("aarch64", ASSETS / "qemu")
     fetch_qemu("x86_64", ASSETS / "qemu-x86_64")
     fetch(ISO_URL, ASSETS / "vm/alpine-virt.iso")
+    netboot = f"{BASE}/releases/aarch64/netboot"
+    fetch(f"{netboot}/vmlinuz-virt", ASSETS / "vm/vmlinuz-virt")
+    fetch(f"{netboot}/initramfs-virt", ASSETS / "vm/initramfs-virt")
     print("\n完成")
     return 0
 

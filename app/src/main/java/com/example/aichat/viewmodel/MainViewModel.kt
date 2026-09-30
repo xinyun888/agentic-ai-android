@@ -41,6 +41,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return conv.id
     }
 
+    /** 用于原生 DS Harness 的专用对话，不存在时创建。 */
+    fun ensureHarnessConversation(): String {
+        val saved = storage.getStringPref("harness_conv_id", "")
+        if (saved.isNotBlank() && storage.getConversation(saved) != null) return saved
+        val conv = Conversation(title = "DS Harness")
+        val list = conversations.toMutableList()
+        list.add(0, conv)
+        conversations = list
+        storage.saveConversations(list)
+        storage.setStringPref("harness_conv_id", conv.id)
+        return conv.id
+    }
+
     fun selectConversation(id: String) {
         activeConversationId = id
         storage.setActiveConversationId(id)
