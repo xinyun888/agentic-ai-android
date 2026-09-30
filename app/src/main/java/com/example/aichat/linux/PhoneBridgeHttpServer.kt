@@ -95,7 +95,7 @@ object PhoneBridgeHttpServer {
 
     fun guestSetupCommand(): String {
         if (tokenValue.isBlank()) return ""
-        return "mkdir -p /usr/local/bin && (ip link set eth0 up 2>/dev/null; udhcpc -i eth0 -n -q 2>/dev/null) && " +
+        return "mkdir -p /usr/local/bin && (ip link set eth0 up 2>/dev/null || true; udhcpc -i eth0 -n -q 2>/dev/null || true) && " +
             "wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && " +
             "chmod +x /usr/local/bin/phone && phone available"
     }
@@ -173,7 +173,7 @@ object PhoneBridgeHttpServer {
                 }
                 method == "POST" && path == "/model/chat" -> {
                     val result = proxyModelChat(body)
-                    writeResponse(socket, result.first, result.second)
+                    writeResponse(socket, result.first, result.second, "application/json; charset=utf-8")
                 }
                 else -> writeResponse(socket, 404, "not found")
             }
@@ -246,8 +246,8 @@ echo "${dollar}OUT"
 """
     }
 
-    private fun writeResponse(socket: Socket, code: Int, body: String) {
-        writeBytesResponse(socket, code, body.toByteArray(Charsets.UTF_8), "text/plain; charset=utf-8")
+    private fun writeResponse(socket: Socket, code: Int, body: String, contentType: String = "text/plain; charset=utf-8") {
+        writeBytesResponse(socket, code, body.toByteArray(Charsets.UTF_8), contentType)
     }
 
     private fun writeBytesResponse(socket: Socket, code: Int, body: ByteArray, contentType: String) {

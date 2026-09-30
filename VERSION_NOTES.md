@@ -1,3 +1,13 @@
+## v2.59.9（交付前加固）
+
+- guest 自动安装命令更稳：
+  - eth0 up / udhcpc 任一失败都不再中断后续 wget
+  - 网络已配置时不会因为 DHCP 返回非 0 导致桥安装失败
+- `/model/chat` 返回 `application/json; charset=utf-8`
+- 用 Git Bash `sh -n` 验证 guest `phone` 脚本语法通过
+- 重新跑 lint + release/debug 构建
+- versionCode 268 / versionName 2.59.9
+
 ## v2.59.8（截屏能力声明修复）
 
 - 修复无障碍配置缺少 `android:canTakeScreenshot="true"` 导致 `/phone/screenshot` 一直 503
