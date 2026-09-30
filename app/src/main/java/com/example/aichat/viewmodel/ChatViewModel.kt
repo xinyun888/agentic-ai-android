@@ -51,7 +51,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     val storage = StorageManager(application)
     val workspace = Workspace(application)
-    val pyManager = PythonSessionManager(application)
+    val pyManager by lazy { PythonSessionManager(application) }
     val linuxManager = LinuxRuntimeManager(application)
     val qemuManager = com.example.aichat.vm.QemuManager(application, linuxManager)
 

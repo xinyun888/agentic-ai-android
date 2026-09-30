@@ -51,6 +51,7 @@ class QemuSession(
 
         readerJob = scope.launch {
             val sb = StringBuilder()
+            var lastEmit = 0L
             try {
                 p.inputStream.use { input ->
                     val buf = ByteArray(4096)
@@ -61,11 +62,17 @@ class QemuSession(
                         if (sb.length > MAX_OUTPUT) {
                             sb.delete(0, sb.length - TRIM_TO)
                         }
-                        _output.value = sb.toString()
+                        // 节流：QEMU 串口输出量大，避免每 4KB 就触发一次 Compose 重绘
+                        val now = System.currentTimeMillis()
+                        if (now - lastEmit >= 150L) {
+                            lastEmit = now
+                            _output.value = sb.toString()
+                        }
                     }
                 }
             } catch (_: Exception) {
             } finally {
+                try { _output.value = sb.toString() } catch (_: Exception) {}
                 _running.value = false
             }
         }

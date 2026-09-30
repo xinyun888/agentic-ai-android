@@ -97,7 +97,11 @@ object PhoneBridgeHttpServer {
         if (tokenValue.isBlank()) return ""
         return "mkdir -p /usr/local/bin && (ip link set eth0 up 2>/dev/null || true; udhcpc -i eth0 -n -q 2>/dev/null || true) && " +
             "wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && " +
-            "chmod +x /usr/local/bin/phone && phone available"
+            "chmod +x /usr/local/bin/phone && phone available; " +
+            "apk add --no-cache python3 >/tmp/ds-harness-install.log 2>&1; " +
+            "wget -qO /usr/local/bin/ds-harness.py 'http://10.0.2.2:$PORT/harness.py?token=$tokenValue' && " +
+            "chmod +x /usr/local/bin/ds-harness.py && " +
+            "(nohup python3 /usr/local/bin/ds-harness.py >/tmp/ds-harness.log 2>&1 &); echo harness-started"
     }
 
     private fun handle(socket: Socket) {
@@ -157,6 +161,9 @@ object PhoneBridgeHttpServer {
                 method == "GET" && path == "/phone.sh" -> {
                     writeResponse(socket, 200, guestScript())
                 }
+                method == "GET" && path == "/harness.py" -> {
+                    writeResponse(socket, 200, harnessScript())
+                }
                 method == "GET" && path == "/phone/screenshot" -> {
                     val bytes = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                         ScreenControlService.instance?.captureScreenshotJpeg()
@@ -214,6 +221,68 @@ object PhoneBridgeHttpServer {
         } catch (e: Exception) {
             502 to "model proxy error: ${e.message}"
         }
+    }
+
+    private fun harnessScript(): String {
+        return """#!/usr/bin/env python3
+# Ai Chat 内置 guest harness：OpenAI 兼容入口，模型请求走宿主 /model/chat，Key 不离开宿主。
+import json
+import urllib.request
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BASE = 'http://10.0.2.2:$PORT'
+TOKEN = '$tokenValue'
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, content_type='application/json'):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path.startswith('/health'):
+            self._send(200, {'ok': True})
+        elif self.path.startswith('/v1/models'):
+            self._send(200, {'object': 'list', 'data': [{'id': 'ds-harness', 'object': 'model'}]})
+        else:
+            self._send(404, {'error': 'not found'})
+
+    def do_POST(self):
+        if not self.path.startswith('/v1/chat/completions'):
+            self._send(404, {'error': 'not found'})
+            return
+        try:
+            n = int(self.headers.get('Content-Length', '0'))
+            body = self.rfile.read(n)
+        except Exception:
+            body = b'{}'
+        try:
+            req = urllib.request.Request(
+                BASE + '/model/chat?token=' + TOKEN,
+                data=body,
+                headers={'Content-Type': 'application/json'},
+                method='POST')
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = resp.read()
+                code = resp.status
+        except urllib.error.HTTPError as e:
+            data = e.read()
+            code = e.code
+        except Exception as e:
+            data = json.dumps({'error': str(e)}).encode('utf-8')
+            code = 502
+        self._send(code, data)
+
+    def log_message(self, *args):
+        pass
+
+if __name__ == '__main__':
+    ThreadingHTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
+"""
     }
 
     private fun guestScript(): String {

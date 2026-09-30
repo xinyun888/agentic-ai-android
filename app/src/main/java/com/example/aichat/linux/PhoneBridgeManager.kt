@@ -49,7 +49,7 @@ object PhoneBridgeManager {
                 } catch (_: Exception) {
                     // 单次异常不能让 bridge 线程死掉
                 }
-                delay(120)
+                delay(350)
             }
         }
     }

@@ -1,3 +1,25 @@
+## v2.60.3（引擎优化，不砍功能）
+
+- QemuSession 输出节流：
+  - 串口输出 150ms 合并刷新一次，减少 Compose 重绘和 O(n) 字符串复制
+  - 进程退出仍会刷新最终内容
+- PhoneBridge 文件轮询从 120ms 降到 350ms，降低电量/CPU
+- PythonSessionManager 改为懒加载，冷启动不初始化 Python
+- QEMU 安全模式自动降级：
+  - 默认参数 180 秒未进入 login
+  - 自动用 `-m 512 -smp 1 -cpu cortex-a53 -accel tcg,thread=single` 重启一次
+- Guest Harness 自动安装：
+  - 宿主新增 `/harness.py`
+  - guest 自动装 `python3`、下载并后台启动内置 OpenAI 兼容 Harness
+  - Harness 的模型请求走宿主 `/model/chat`，API Key 不离开宿主
+  - Android HarnessScreen QEMU 模式可直接连接 `127.0.0.1:18000`
+- 保留：
+  - 全 ABI QEMU 资源
+  - 全 Python 包
+  - 全 Linux/QEMU/ISO/内核
+  - Universal 完整包
+- versionCode 272 / versionName 2.60.3
+
 ## v2.60.2（发布前 bug 修复）
 
 - 修复 QemuKeepAliveService 缺少 `android.permission.WAKE_LOCK`：

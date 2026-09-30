@@ -2,6 +2,7 @@ package com.example.aichat.vm
 
 import android.content.Context
 import android.os.Build
+import android.util.Log
 import com.example.aichat.linux.LinuxRuntimeManager
 import com.example.aichat.linux.PhoneBridgeHttpServer
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +20,7 @@ import java.util.concurrent.TimeUnit
 class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) {
 
     companion object {
+        private const val TAG = "QemuManager"
         const val ALPINE_VERSION = "v3.24"
         const val NETBOOT_BASE =
             "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/releases/aarch64/netboot"
@@ -247,13 +249,18 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
             }
         }
 
-    fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 1): List<String> = listOf(
+    fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 1, safeMode: Boolean = false): List<String> {
+        val accel = if (safeMode) "tcg,thread=single" else "tcg"
+        val cpu = if (safeMode) "cortex-a53" else "cortex-a57"
+        val mem = if (safeMode) minOf(memoryMb, 512) else memoryMb
+        val cpus = if (safeMode) 1 else smp
+        return listOf(
         QEMU_GUEST_PATH,
-        "-accel", "tcg",
+        "-accel", accel,
         "-M", "virt",
-        "-cpu", "cortex-a57",
-        "-smp", smp.toString(),
-        "-m", memoryMb.toString(),
+        "-cpu", cpu,
+        "-smp", cpus.toString(),
+        "-m", mem.toString(),
         "-kernel", "/vm/vmlinuz-virt",
         "-initrd", "/vm/initramfs-virt",
         "-append", "console=ttyAMA0 ip=dhcp nowatchdog",
@@ -264,11 +271,14 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         "-nographic",
         "-monitor", "none",
         "-no-reboot"
-    )
+        )
+    }
 
     private var activeSession: QemuSession? = null
     private val setupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var setupJob: Job? = null
+    private var bootWatchdogJob: Job? = null
+    @Volatile private var safeModeAttempted = false
     @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
@@ -276,24 +286,47 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
 
     fun phoneBridgeSetupCommand(): String = PhoneBridgeHttpServer.guestSetupCommand()
 
-    fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? {
+    fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? =
+        startSessionInternal(memoryMb, smp, safeMode = false)
+
+    private fun startSessionInternal(memoryMb: Int, smp: Int, safeMode: Boolean): QemuSession? {
         if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
+        if (!safeMode) safeModeAttempted = false
         stopSession()
         return try {
-            QemuSession(linux, buildQemuArgs(memoryMb, smp)).also {
+            QemuSession(linux, buildQemuArgs(memoryMb, smp, safeMode)).also {
                 activeSession = it
                 it.start()
                 // 给 guest 打开设备能力 HTTP 桥
                 PhoneBridgeHttpServer.start(context)
-                // 自动登录 guest 并安装 phone 桥，免去每次启动手动粘贴
+                // 自动登录 guest 并安装 phone 桥 / 内置 harness
                 startGuestSetup(it)
+                // 首次启动失败时自动降级到安全模式
+                startBootWatchdog(it, safeMode)
                 // 保持进程不被系统回收，退出页面/退到后台 VM 继续跑
                 QemuKeepAliveService.start(context)
             }
         } catch (_: Exception) {
             stopSession()
             null
+        }
+    }
+
+    private fun startBootWatchdog(session: QemuSession, safeMode: Boolean) {
+        bootWatchdogJob?.cancel()
+        bootWatchdogJob = setupScope.launch {
+            delay(180_000)
+            if (activeSession !== session) return@launch
+            val out = session.output.value
+            val booted = out.contains("login:") || out.contains("~ #") || out.contains("localhost:~#")
+            if (!booted && !safeMode && !safeModeAttempted) {
+                safeModeAttempted = true
+                Log.w(TAG, "guest 180s 未进入 login，尝试安全模式重启")
+                bootWatchdogJob = null
+                // 独立协程里重启，避免 stopSession 取消当前 watchdog 自己
+                setupScope.launch { startSessionInternal(512, 1, safeMode = true) }
+            }
         }
     }
 
@@ -329,6 +362,8 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     fun stopSession() {
         setupJob?.cancel()
         setupJob = null
+        bootWatchdogJob?.cancel()
+        bootWatchdogJob = null
         guestSetupDone = false
         activeSession?.shutdown()
         activeSession = null
