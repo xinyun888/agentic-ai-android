@@ -1,3 +1,25 @@
+## v2.59.6（QEMU 手机桥 + VM 页面退出不中断）
+
+- QEMU guest 手机控制桥：
+  - 新增 `PhoneBridgeHttpServer`，只监听 `127.0.0.1:48879`
+  - 随机 token 鉴权，错误 token 返回 403
+  - QEMU user networking 下 guest 通过 `10.0.2.2:48879` 访问
+  - 接口：`/phone/ping`、`/phone.sh`、`/phone/exec`
+  - `/phone/exec` body 每行一个参数，直接复用 `PhoneBridgeManager` -> 无障碍
+  - guest 用 `wget --post-data` 调用，支持 `available/dump/find/tap/swipe/text/back/home`
+  - VM 页面新增复制 QEMU guest 手机桥命令，粘贴到 VM 串口执行即可安装 `phone`
+- Linux VM 稳定性：
+  - 退出 VM 页面不再调用 `stopSession`
+  - 重新进入时通过 `QemuManager.currentSession()` 直接接管正在运行的会话
+  - 串口输出、running 状态保留，不会重启 QEMU
+  - 新增 `QemuKeepAliveService` 前台服务，保持 App 进程和 QEMU 不被系统过早回收
+- 已验证：
+  - 返回主界面后 QEMU 进程仍运行，KeepAlive 前台服务仍在
+  - 重新进入 VM 页面串口输出仍在
+  - 通过 `adb forward` 访问桥：`/phone/ping` 200，错误 token 403
+  - `/phone/exec` 的 `available` 返回 `1`，`dump` 返回当前 Android 无障碍树
+- versionCode 265 / versionName 2.59.6
+
 ## v2.59.5（主动模式点了没反应修复）
 
 - 真机反馈：点开始主动陪伴后无通知、无声望，退出后通知栏也没有

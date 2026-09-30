@@ -1,5 +1,8 @@
 package com.example.aichat.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -31,9 +34,11 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
     var busy by remember { mutableStateOf(false) }
     var log by remember { mutableStateOf("") }
     var input by remember { mutableStateOf("") }
-    var session by remember { mutableStateOf<QemuSession?>(null) }
-    var running by remember { mutableStateOf(false) }
-    var vmOutput by remember { mutableStateOf("") }
+    val appContext = androidx.compose.ui.platform.LocalContext.current
+    val existingSession = remember { manager.currentSession() }
+    var session by remember { mutableStateOf<QemuSession?>(existingSession) }
+    var running by remember { mutableStateOf(existingSession?.running?.value ?: false) }
+    var vmOutput by remember { mutableStateOf(existingSession?.output?.value ?: "") }
 
     LaunchedEffect(session) {
         val s = session ?: return@LaunchedEffect
@@ -50,9 +55,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
         log = (log + text + "\n").takeLast(12_000)
     }
 
-    DisposableEffect(Unit) {
-        onDispose { manager.stopSession() }
-    }
+    // 退出页面不再停止 QEMU；由 QemuKeepAliveService 保持运行，重新进入时自动接管当前会话。
 
     LaunchedEffect(Unit) { refreshStatus() }
     LaunchedEffect(vmOutput) {
@@ -194,6 +197,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                             session = s
                             appendLog("QEMU 已启动，等待内核/initramfs 输出...")
                         }
+                        refreshStatus()
                     }
                 ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null)
@@ -203,8 +207,11 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 OutlinedButton(
                     enabled = running,
                     onClick = {
-                        session?.stop()
-                        appendLog("已请求停止 QEMU")
+                        manager.stopSession()
+                        session = null
+                        running = false
+                        appendLog("已停止 QEMU")
+                        refreshStatus()
                     }
                 ) {
                     Icon(Icons.Filled.Stop, contentDescription = null)
@@ -212,6 +219,21 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                     Text("停止")
                 }
             }
+
+            Spacer(Modifier.height(6.dp))
+            OutlinedButton(
+                onClick = {
+                    val cmd = manager.phoneBridgeSetupCommand()
+                    if (cmd.isBlank()) {
+                        appendLog("手机桥还没启动：请先启动 VM")
+                    } else {
+                        val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cm?.setPrimaryClip(ClipData.newPlainText("phone bridge", cmd))
+                        appendLog("已复制 QEMU guest 手机桥安装命令，粘贴到 VM 串口执行：\n$cmd")
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("复制 QEMU guest 手机桥命令", maxLines = 1) }
 
             Spacer(Modifier.height(8.dp))
 

@@ -79,6 +79,21 @@ object PhoneBridgeManager {
         request.delete()
     }
 
+    /**
+     * QEMU guest HTTP 桥入口：body 每行一个参数，返回 "OK\n结果" 或 "ERR\n原因"。
+     * 与文件桥共用同一套 UIAutomator/无障碍执行逻辑。
+     */
+    fun executeRemote(commandText: String): String {
+        val lines = commandText.replace("\r\n", "\n").replace('\r', '\n')
+            .split('\n').map { it.trim() }.filter { it.isNotEmpty() }
+        val result = try {
+            execute(lines)
+        } catch (e: Exception) {
+            BridgeResult(false, "bridge 异常: ${e.message}")
+        }
+        return (if (result.ok) "OK\n" else "ERR\n") + result.data
+    }
+
     private fun execute(lines: List<String>): BridgeResult {
         val cmd = lines.firstOrNull()?.trim()?.lowercase().orEmpty()
         if (cmd.isEmpty()) return BridgeResult(false, "空命令")

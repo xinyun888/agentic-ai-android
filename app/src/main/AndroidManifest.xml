@@ -58,6 +58,11 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <service
+            android:name=".vm.QemuKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <receiver
             android:name=".service.BootReceiver"
             android:exported="true">

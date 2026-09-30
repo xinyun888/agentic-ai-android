@@ -3,6 +3,7 @@ package com.example.aichat.vm
 import android.content.Context
 import android.os.Build
 import com.example.aichat.linux.LinuxRuntimeManager
+import com.example.aichat.linux.PhoneBridgeHttpServer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -148,6 +149,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 $qemuApkCount 个 ($assetDir)" else "\u274C 缺失")
         appendLine("ISO 包: " + if (netbootAssetsReady()) "\u2705 已内置" else "\u274C 缺失")
         appendLine("架构: " + if (abiSupported()) "\u2705 ${hostAbi()}" else "\u274C 当前仅支持 arm64 / x86_64 VM 运行时")
+        appendLine("手机桥: " + if (PhoneBridgeHttpServer.isRunning) "\u2705 guest -> 10.0.2.2:${PhoneBridgeHttpServer.PORT}" else "\u274C 未启动")
         appendLine("VM 目录: ${vmDir.absolutePath}")
     }
 
@@ -246,6 +248,11 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
 
     private var activeSession: QemuSession? = null
 
+    /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
+    fun currentSession(): QemuSession? = activeSession
+
+    fun phoneBridgeSetupCommand(): String = PhoneBridgeHttpServer.guestSetupCommand()
+
     fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? {
         if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
@@ -255,6 +262,10 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
             QemuSession(linux, buildQemuArgs(memoryMb, smp)).also {
                 activeSession = it
                 it.start()
+                // 给 guest 打开设备能力 HTTP 桥
+                PhoneBridgeHttpServer.start(context)
+                // 保持进程不被系统回收，退出页面/退到后台 VM 继续跑
+                QemuKeepAliveService.start(context)
             }
         } catch (_: Exception) {
             stopSession()
@@ -278,10 +289,13 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     fun stopSession() {
         activeSession?.shutdown()
         activeSession = null
+        QemuKeepAliveService.stop(context)
+        PhoneBridgeHttpServer.stop()
     }
 
     fun shutdown() {
         stopSession()
+        PhoneBridgeHttpServer.stop()
         linux.shutdown()
     }
 
