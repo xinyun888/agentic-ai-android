@@ -234,9 +234,20 @@ if [ ! -b /dev/vda ]; then
   echo AICHAT_DISK_NO_DISK
   exit 1
 fi
-yes | setup-disk -m sys -k virt /dev/vda >/tmp/aichat-disk.log 2>&1
-echo AICHAT_DISK_EXIT_${dollar}?
-tail -40 /tmp/aichat-disk.log
+# setup-disk 在 aarch64 可能把 u-boot 作为 world 依赖；先移除，避免没有该包时直接失败
+sed -i '/^u-boot${dollar}/d' /etc/apk/world 2>/dev/null || true
+# 确保 main/community 仓库可用，setup-disk 需要安装 kernel/bootloader 依赖
+for repo in main community; do
+  url="https://dl-cdn.alpinelinux.org/alpine/v3.24/${dollar}repo"
+  grep -q "${dollar}url" /etc/apk/repositories 2>/dev/null || echo "${dollar}url" >> /etc/apk/repositories
+done
+apk update >/tmp/aichat-apk-update.log 2>&1 || true
+if yes | setup-disk -m sys -k virt /dev/vda >/tmp/aichat-disk.log 2>&1; then
+  echo AICHAT_DISK_EXIT_0
+else
+  echo AICHAT_DISK_EXIT_FAIL
+fi
+tail -60 /tmp/aichat-disk.log
 echo AICHAT_DISK_DONE
 """
     }

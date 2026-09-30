@@ -1,3 +1,22 @@
+## v2.60.5（真机/VM 磁盘安装修复）
+
+- 在 Windows QEMU aarch64 里实际启动 guest，并执行了 /disk-install.sh
+- 发现真问题：
+  - `setup-disk -m sys -k virt /dev/vda` 失败：
+    ```text
+    ERROR: unable to select packages: u-boot (no such package): required by world[u-boot]
+    ```
+  - `setup-disk -m data` 能成功，但生成的是 vda1 swap + vda2 ext4 root，
+    不是完整可 switch_root 的系统，直接内核启动会 init panic
+- v2.60.5 修复：
+  - 安装前从 `/etc/apk/world` 移除 `u-boot`
+  - 自动补 main/community Alpine 仓库
+  - 执行 `apk update`
+  - 再执行 `setup-disk -m sys -k virt /dev/vda`
+  - 保留 vda3 作为 sys 模式 root 的默认假设
+- 说明：磁盘安装目前属于实验性，Live 启动仍是稳定默认
+- versionCode 274 / versionName 2.60.5
+
 ## v2.60.4（安装到磁盘 + 持久启动）
 
 - QEMU 新增安装到磁盘流程：
