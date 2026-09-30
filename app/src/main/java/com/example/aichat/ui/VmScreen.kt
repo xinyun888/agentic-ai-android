@@ -221,6 +221,41 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
             }
 
             Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    enabled = !busy && running && !manager.isDiskBootEnabled(),
+                    onClick = {
+                        val s = manager.currentSession()
+                        if (s == null) {
+                            appendLog("VM 没有运行")
+                        } else {
+                            busy = true
+                            scope.launch {
+                                val r = manager.installToDisk(s) { msg -> scope.launch { appendLog(msg) } }
+                                busy = false
+                                refreshStatus()
+                                if (r.isFailure) appendLog("安装到磁盘失败: ${r.exceptionOrNull()?.message}")
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("安装到磁盘", maxLines = 1) }
+                OutlinedButton(
+                    enabled = !busy && !running,
+                    onClick = {
+                        val next = !manager.isDiskBootEnabled()
+                        manager.setDiskBootEnabled(next)
+                        refreshStatus()
+                        appendLog(if (next) "已切换为磁盘启动，下次启动生效" else "已切换为 Live 启动，下次启动生效")
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text(if (manager.isDiskBootEnabled()) "当前:磁盘" else "当前:Live", maxLines = 1) }
+            }
+
+            Spacer(Modifier.height(6.dp))
             OutlinedButton(
                 onClick = {
                     val cmd = manager.phoneBridgeSetupCommand()

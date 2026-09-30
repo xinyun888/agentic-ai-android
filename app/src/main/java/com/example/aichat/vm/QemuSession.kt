@@ -81,8 +81,16 @@ class QemuSession(
     fun write(text: String) {
         val p = process ?: return
         try {
-            p.outputStream.write((text + "\r").toByteArray(Charsets.UTF_8))
-            p.outputStream.flush()
+            // guest 串口没有流控，长命令一次性写入可能丢字符；分块慢发更稳
+            val bytes = (text + "\r").toByteArray(Charsets.UTF_8)
+            var offset = 0
+            while (offset < bytes.size) {
+                val n = minOf(48, bytes.size - offset)
+                p.outputStream.write(bytes, offset, n)
+                p.outputStream.flush()
+                offset += n
+                try { Thread.sleep(25) } catch (_: InterruptedException) {}
+            }
         } catch (_: Exception) {
         }
     }

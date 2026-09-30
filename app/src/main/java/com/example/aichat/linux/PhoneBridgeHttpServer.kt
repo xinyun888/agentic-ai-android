@@ -164,6 +164,9 @@ object PhoneBridgeHttpServer {
                 method == "GET" && path == "/harness.py" -> {
                     writeResponse(socket, 200, harnessScript())
                 }
+                method == "GET" && path == "/disk-install.sh" -> {
+                    writeResponse(socket, 200, diskInstallScript())
+                }
                 method == "GET" && path == "/phone/screenshot" -> {
                     val bytes = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                         ScreenControlService.instance?.captureScreenshotJpeg()
@@ -221,6 +224,21 @@ object PhoneBridgeHttpServer {
         } catch (e: Exception) {
             502 to "model proxy error: ${e.message}"
         }
+    }
+
+    private fun diskInstallScript(): String {
+        val dollar = "$"
+        return """#!/bin/sh
+echo AICHAT_DISK_INSTALL_BEGIN
+if [ ! -b /dev/vda ]; then
+  echo AICHAT_DISK_NO_DISK
+  exit 1
+fi
+yes | setup-disk -m sys -k virt /dev/vda >/tmp/aichat-disk.log 2>&1
+echo AICHAT_DISK_EXIT_${dollar}?
+tail -40 /tmp/aichat-disk.log
+echo AICHAT_DISK_DONE
+"""
     }
 
     private fun harnessScript(): String {

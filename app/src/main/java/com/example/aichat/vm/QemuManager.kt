@@ -10,7 +10,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -171,6 +173,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 $qemuApkCount 个 ($assetDir)" else "\u274C 缺失")
         appendLine("ISO 包: " + if (netbootAssetsReady()) "\u2705 已内置" else "\u274C 缺失")
         appendLine("架构: " + if (abiSupported()) "\u2705 ${hostAbi()}" else "\u274C 当前仅支持 arm64 / x86_64 VM 运行时")
+        appendLine("启动模式: " + if (bootFromDisk) "\u2705 磁盘启动" else "\u2705 Live ISO")
         appendLine("手机桥: " + if (PhoneBridgeHttpServer.isRunning) "\u2705 guest -> 10.0.2.2:${PhoneBridgeHttpServer.PORT}" else "\u274C 未启动")
         appendLine("VM 目录: ${vmDir.absolutePath}")
     }
@@ -254,24 +257,89 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         val cpu = if (safeMode) "cortex-a53" else "cortex-a57"
         val mem = if (safeMode) minOf(memoryMb, 512) else memoryMb
         val cpus = if (safeMode) 1 else smp
-        return listOf(
-        QEMU_GUEST_PATH,
-        "-accel", accel,
-        "-M", "virt",
-        "-cpu", cpu,
-        "-smp", cpus.toString(),
-        "-m", mem.toString(),
-        "-kernel", "/vm/vmlinuz-virt",
-        "-initrd", "/vm/initramfs-virt",
-        "-append", "console=ttyAMA0 ip=dhcp nowatchdog",
-        "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
-        "-cdrom", "/vm/alpine-virt.iso",
-        "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000",
-        "-device", "virtio-net-pci,netdev=n0",
-        "-nographic",
-        "-monitor", "none",
-        "-no-reboot"
+        val args = mutableListOf(
+            QEMU_GUEST_PATH,
+            "-accel", accel,
+            "-M", "virt",
+            "-cpu", cpu,
+            "-smp", cpus.toString(),
+            "-m", mem.toString(),
+            "-kernel", "/vm/vmlinuz-virt",
+            "-initrd", "/vm/initramfs-virt",
+            "-append", if (bootFromDisk) {
+                "root=/dev/vda3 rw console=ttyAMA0 nowatchdog"
+            } else {
+                "console=ttyAMA0 ip=dhcp nowatchdog"
+            },
+            "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2"
         )
+        if (!bootFromDisk) {
+            args.addAll(listOf("-cdrom", "/vm/alpine-virt.iso"))
+        }
+        args.addAll(listOf(
+            "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000",
+            "-device", "virtio-net-pci,netdev=n0",
+            "-nographic",
+            "-monitor", "none",
+            "-no-reboot"
+        ))
+        return args
+    }
+
+    fun isDiskBootEnabled(): Boolean = bootFromDisk
+
+    fun setDiskBootEnabled(enabled: Boolean) {
+        bootFromDisk = enabled
+        vmPrefs.edit().putBoolean("boot_from_disk", enabled).apply()
+    }
+
+    /** 在 guest 里执行 setup-disk 安装到 /dev/vda，之后可切到磁盘启动。 */
+    suspend fun installToDisk(
+        session: QemuSession,
+        onProgress: (String) -> Unit
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        try {
+            if (!session.running.value) {
+                return@withContext Result.failure(IllegalStateException("QEMU 没有运行"))
+            }
+            val token = PhoneBridgeHttpServer.token
+            if (token.isBlank()) {
+                return@withContext Result.failure(IllegalStateException("手机桥未启动"))
+            }
+            onProgress("等待 guest 进入 shell ...")
+            val ready = withTimeoutOrNull(180_000) {
+                session.output.first { out ->
+                    out.contains("login:") || out.contains("~ #") || out.contains("localhost:~#")
+                }
+            }
+            if (ready == null) {
+                return@withContext Result.failure(IllegalStateException("guest 未在 180 秒内进入 shell"))
+            }
+            if (ready.contains("login:")) {
+                session.write("root")
+                withTimeoutOrNull(60_000) {
+                    session.output.first { it.contains("~ #") || it.contains("localhost:~#") }
+                }
+            }
+            onProgress("开始安装 Alpine 到 /dev/vda（后台，可能需要几分钟）...")
+            val cmd = "wget -qO /tmp/aichat-disk.sh 'http://10.0.2.2:${PhoneBridgeHttpServer.PORT}/disk-install.sh?token=$token'; sh /tmp/aichat-disk.sh"
+            session.write(cmd)
+            val done = withTimeoutOrNull(1_200_000) {
+                session.output.first { it.contains("AICHAT_DISK_DONE") }
+            }
+            if (done == null) {
+                return@withContext Result.failure(IllegalStateException("setup-disk 超时，请查看 VM 串口日志"))
+            }
+            if (done.contains("AICHAT_DISK_EXIT_0")) {
+                setDiskBootEnabled(true)
+                onProgress("安装完成，已切换为磁盘启动。停止 VM 后重新启动即可生效。")
+                Result.success(Unit)
+            } else {
+                Result.failure(IllegalStateException("setup-disk 返回非 0，请查看串口日志"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 
     private var activeSession: QemuSession? = null
@@ -279,6 +347,8 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     private var setupJob: Job? = null
     private var bootWatchdogJob: Job? = null
     @Volatile private var safeModeAttempted = false
+    private val vmPrefs = context.getSharedPreferences("qemu_vm", Context.MODE_PRIVATE)
+    @Volatile private var bootFromDisk = vmPrefs.getBoolean("boot_from_disk", false)
     @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */

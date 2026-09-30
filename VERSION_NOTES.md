@@ -1,3 +1,24 @@
+## v2.60.4（安装到磁盘 + 持久启动）
+
+- QEMU 新增安装到磁盘流程：
+  - VM 页面新增安装到磁盘按钮
+  - 宿主提供 `/disk-install.sh`
+  - guest 通过 `setup-disk -m sys -k virt /dev/vda` 安装到 qcow2
+  - 安装完成后自动切换为磁盘启动
+- 新增当前: Live / 当前: 磁盘切换按钮，持久化到 SharedPreferences
+- 磁盘启动参数：
+  ```text
+  -kernel /vm/vmlinuz-virt
+  -initrd /vm/initramfs-virt
+  -append "root=/dev/vda3 rw console=ttyAMA0 nowatchdog"
+  ```
+  不再需要 `-cdrom`
+- QemuSession 写入改为分块发送（48 字节 + 25ms），避免 guest 串口长命令丢字符
+- 磁盘安装脚本已通过 `sh -n`
+- 说明：root 分区按 Alpine `setup-disk -m sys -k virt` 默认布局 /dev/vda3；
+  如果真机安装后发现分区不同，把 `/tmp/aichat-disk.log` 发出来再调
+- versionCode 273 / versionName 2.60.4
+
 ## v2.60.3（引擎优化，不砍功能）
 
 - QemuSession 输出节流：
