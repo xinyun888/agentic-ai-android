@@ -415,12 +415,25 @@ class QemuManager private constructor(private val context: Context, val linux: L
     private fun resolveUpstreamDns(): String {
         return try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            val network = cm?.activeNetwork
-            val servers = cm?.getLinkProperties(network)?.dnsServers
-            servers?.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }?.hostAddress
-                ?: "1.1.1.1"
+            val active = cm?.activeNetwork
+            val candidates = cm?.allNetworks.orEmpty().sortedWith(
+                compareBy(
+                    { if (it == active) 0 else 1 },
+                    { network ->
+                        val caps = cm?.getNetworkCapabilities(network)
+                        if (caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true) 0 else 1
+                    }
+                )
+            )
+            for (network in candidates) {
+                val dns = cm?.getLinkProperties(network)?.dnsServers
+                    ?.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
+                    ?.hostAddress
+                if (!dns.isNullOrBlank() && dns != "0.0.0.0") return dns
+            }
+            "223.5.5.5"
         } catch (_: Exception) {
-            "1.1.1.1"
+            "223.5.5.5"
         }
     }
 

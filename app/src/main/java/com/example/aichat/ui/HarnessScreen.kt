@@ -322,6 +322,14 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
                 TextButton(onClick = { messages.clear(); streaming = false; streamJob?.cancel() }) { Text("清空") }
             }
         }
+        if (status != "已连接") {
+            Text(
+                "等待 Guest Harness 启动：VM 启动后通常需要 1-3 分钟自动安装；页面每 4 秒自动重试。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+            )
+        }
         LazyColumn(
             state = listState,
             modifier = Modifier.weight(1f).fillMaxWidth(),

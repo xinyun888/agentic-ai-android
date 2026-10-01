@@ -119,6 +119,17 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Guest Harness: " + when {
+                            vmOutput.contains("AICHAT_HARNESS_OK") -> " 已就绪，可以打开 DS Harness"
+                            vmOutput.contains("AICHAT_HARNESS_FAIL") -> " 安装失败，请看下方串口日志"
+                            vmOutput.contains("AICHAT_HARNESS_NO_PYTHON") -> " Python 安装失败，请看串口日志"
+                            else -> " 等待 guest 自动安装（通常 1-3 分钟）"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(10.dp))
                     if (busy) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)

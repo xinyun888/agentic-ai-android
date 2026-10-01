@@ -1,3 +1,23 @@
+## v2.61.4（Guest Harness 状态可见 + DNS 兜底增强）
+
+- VM 页面新增 Guest Harness 状态提示：
+  -  等待 guest 自动安装（通常 1-3 分钟）
+  -  已就绪，可以打开 DS Harness
+  -  安装失败 / Python 安装失败，请看串口日志
+- HarnessScreen 未连接时显示等待提示，并继续每 4 秒自动重试
+- DNS 继承增强：
+  - 遍历 `ConnectivityManager.allNetworks`
+  - 优先 active network 和 WiFi 网络
+  - 取第一个 IPv4 DNS
+  - 读不到时回退 `223.5.5.5`（国内可达，替代之前的 1.1.1.1）
+- 说明：VM 启动后请不要立刻停在 Harness 页面等；先看 VM 终端是否出现：
+  ```text
+  AICHAT_HARNESS_OK
+  AICHAT_SETUP_DONE
+  ```
+  出现后再打开 Harness，或直接留在 Harness 页面，它会自动重试连上。
+- versionCode 280 / versionName 2.61.4
+
 ## v2.61.3（QEMU Guest 真正继承手机 WiFi/DNS）
 
 - 定位 guest 网络不通根因：
