@@ -1,3 +1,28 @@
+## v2.61.3（QEMU Guest 真正继承手机 WiFi/DNS）
+
+- 定位 guest 网络不通根因：
+  - QEMU user networking（slirp）不是直接把 WiFi 网卡桥接给 guest
+  - guest 的以太网是 QEMU 在 App 进程里虚拟出来的 NAT
+  - guest 出站 TCP 会走 App 的 Android socket，因此能继承手机 WiFi
+  - 但 QEMU 启动时需要用 host 的 `/etc/resolv.conf` 找上游 DNS
+  - Android 没有传统 `/etc/resolv.conf`，QEMU 拿不到手机 WiFi 的 DNS
+  - 结果：guest 能连 `10.0.2.2`（App 自身），但无法解析 `dl-cdn.alpinelinux.org`
+- 修复：
+  - `QemuManager` 通过 `ConnectivityManager.getLinkProperties(activeNetwork).dnsServers`
+    读取手机当前 WiFi/数据网络的 DNS
+  - 把 IPv4 DNS 通过 QEMU 参数显式传入：
+    ```text
+    -netdev user,id=n0,hostfwd=...,dns=<手机当前DNS>
+    ```
+  - 读不到时回退 `1.1.1.1`
+  - guest 自动配置写入：
+    ```sh
+    echo "nameserver 10.0.2.3" > /etc/resolv.conf
+    ```
+    其中 `10.0.2.3` 是 QEMU slirp 的虚拟 DNS，再转发到上面显式传入的手机 DNS
+- 保留 v2.61.2 的内置离线 Python 仓库作为断网/受限网络兜底
+- versionCode 279 / versionName 2.61.3
+
 ## v2.61.2（Guest Harness 离线可用）
 
 - 修复部分设备/网络下 Guest Harness 仍然未连接：

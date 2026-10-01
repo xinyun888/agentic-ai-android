@@ -278,6 +278,7 @@ for repo in main community; do
   url="https://dl-cdn.alpinelinux.org/alpine/v3.24/${dollar}repo"
   grep -q "${dollar}url" /etc/apk/repositories 2>/dev/null || echo "${dollar}url" >> /etc/apk/repositories
 done
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
 echo "http://10.0.2.2:$PORT/guest-apks" > /etc/apk/repositories
 apk update --allow-untrusted >/tmp/aichat-apk-update.log 2>&1 || true
 wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && chmod +x /usr/local/bin/phone && phone available || echo phone-bridge-failed

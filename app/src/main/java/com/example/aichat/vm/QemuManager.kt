@@ -1,6 +1,7 @@
 package com.example.aichat.vm
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.os.Build
 import android.util.Log
 import com.example.aichat.linux.LinuxRuntimeManager
@@ -18,6 +19,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.net.Inet4Address
 import java.util.concurrent.TimeUnit
 
 class QemuManager private constructor(private val context: Context, val linux: LinuxRuntimeManager) {
@@ -288,6 +290,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
             uploadedInitrd.exists() && uploadedInitrd.length() > 0
         val kernelPath = if (useUploaded) "/vm/upload/vmlinuz-virt" else "/vm/vmlinuz-virt"
         val initrdPath = if (useUploaded) "/vm/upload/initramfs-virt" else "/vm/initramfs-virt"
+        val upstreamDns = resolveUpstreamDns()
         val args = mutableListOf(
             QEMU_GUEST_PATH,
             "-accel", accel,
@@ -310,7 +313,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
             args.addAll(listOf("-cdrom", "/vm/alpine-virt.iso"))
         }
         args.addAll(listOf(
-            "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000",
+            "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000,dns=" + upstreamDns,
             "-device", "virtio-net-pci,netdev=n0",
             "-nographic",
             "-monitor", "none",
@@ -406,6 +409,19 @@ class QemuManager private constructor(private val context: Context, val linux: L
         } catch (_: Exception) {
         }
         try { Thread.sleep(400) } catch (_: InterruptedException) {}
+    }
+
+    /** 把手机当前 WiFi/数据的 DNS 显式喂给 QEMU slirp，guest 才能真正继承手机网络。 */
+    private fun resolveUpstreamDns(): String {
+        return try {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val network = cm?.activeNetwork
+            val servers = cm?.getLinkProperties(network)?.dnsServers
+            servers?.firstOrNull { it is Inet4Address && !it.isLoopbackAddress }?.hostAddress
+                ?: "1.1.1.1"
+        } catch (_: Exception) {
+            "1.1.1.1"
+        }
     }
 
     fun isRunning(): Boolean = activeSession?.running?.value == true
