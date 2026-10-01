@@ -48,6 +48,13 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
         launch { s.output.collect { vmOutput = it } }
     }
     val scrollState = rememberScrollState()
+    val pageScroll = rememberScrollState()
+    var showTerminalDialog by remember { mutableStateOf(false) }
+    val terminalText = buildString {
+        if (vmOutput.isNotBlank()) append(vmOutput)
+        if (vmOutput.isNotBlank() && log.isNotBlank()) append('\n')
+        if (log.isNotBlank()) append(log)
+    }.ifBlank { "串口输出和安装日志会显示在这里。" }
 
     fun refreshStatus() {
         status = manager.statusText()
@@ -102,6 +109,7 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(padding)
                 .padding(12.dp)
+                .verticalScroll(pageScroll)
         ) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(12.dp)) {
@@ -139,7 +147,6 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                         Spacer(Modifier.height(8.dp))
                     }
                 }
-            }
 
             Spacer(Modifier.height(8.dp))
 
@@ -302,26 +309,33 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
+                    .height(360.dp),
                 shape = MaterialTheme.shapes.medium,
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
             ) {
-                val terminalText = buildString {
-                    if (vmOutput.isNotBlank()) append(vmOutput)
-                    if (vmOutput.isNotBlank() && log.isNotBlank()) append('\n')
-                    if (log.isNotBlank()) append(log)
+                Column(Modifier.fillMaxSize()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("串口终端", style = MaterialTheme.typography.labelMedium)
+                        Spacer(Modifier.weight(1f))
+                        Text(vmOutput.length.toString() + " 字符", style = MaterialTheme.typography.labelSmall)
+                        TextButton(onClick = { showTerminalDialog = true }) { Text("放大") }
+                    }
+                    SelectionContainer {
+                        Text(
+                            text = terminalText,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(scrollState)
+                                .padding(10.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
                 }
-                SelectionContainer {
-                    Text(
-                        text = terminalText.ifBlank { "串口输出和安装日志会显示在这里。" },
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .verticalScroll(scrollState)
-                            .padding(10.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
+            }
             }
 
             Spacer(Modifier.height(8.dp))
@@ -346,5 +360,31 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 ) { Text("发送") }
             }
         }
+    }
+
+    if (showTerminalDialog) {
+        AlertDialog(
+            onDismissRequest = { showTerminalDialog = false },
+            title = { Text("串口终端") },
+            text = {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(480.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = terminalText,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showTerminalDialog = false }) { Text("关闭") }
+            }
+        )
     }
 }

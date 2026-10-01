@@ -1,3 +1,18 @@
+## v2.61.5（VM 终端显示修复）
+
+- 修复 Linux VM 页面看不到终端的问题：
+  - 之前页面 Column 不可滚动，按钮占满屏幕时终端区域可能被压到 0 高度/屏幕外
+  - 现在整页可滚动
+  - 终端固定最小 360dp 高度
+  - 终端标题栏显示当前输出字符数
+  - 新增放大按钮：全屏 AlertDialog 查看串口输出
+  - 即使没有串口输出，也会显示安装日志/状态提示
+- Guest Harness 状态仍显示在 VM 页面：
+  -  等待 guest 自动安装
+  -  已就绪
+  -  安装失败/Python 安装失败
+- versionCode 281 / versionName 2.61.5
+
 ## v2.61.4（Guest Harness 状态可见 + DNS 兜底增强）
 
 - VM 页面新增 Guest Harness 状态提示：
