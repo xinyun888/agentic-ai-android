@@ -254,6 +254,20 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                     Spacer(Modifier.width(6.dp))
                     Text("停止")
                 }
+                OutlinedButton(
+                    enabled = !running && manager.abiSupported() && manager.qemuInstalled() && manager.imagesReady() && manager.diskReady(),
+                    onClick = {
+                        val s = manager.startSafeSession()
+                        if (s == null) {
+                            appendLog("安全模式启动失败：环境不完整")
+                        } else {
+                            log = ""
+                            session = s
+                            appendLog("QEMU 安全模式已启动（512MB / 1 CPU / tcg single）...")
+                        }
+                        refreshStatus()
+                    }
+                ) { Text("安全模式", maxLines = 1) }
             }
 
             Spacer(Modifier.height(6.dp))

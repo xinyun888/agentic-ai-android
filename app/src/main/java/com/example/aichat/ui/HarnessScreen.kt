@@ -25,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import com.example.aichat.data.ApiProfile
 import com.example.aichat.data.ChatMessage
 import com.example.aichat.data.HttpClient
+import com.example.aichat.linux.PhoneBridgeHttpServer
 import com.example.aichat.viewmodel.ChatViewModel
 import com.google.gson.Gson
 import com.google.gson.JsonParser
@@ -192,6 +193,9 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
     var token by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
     var showSettings by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("检测中...") }
+    var effectiveBase by remember { mutableStateOf(baseUrl) }
+    var effectivePath by remember { mutableStateOf(apiPath) }
+    var hostFallback by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf("") }
     val messages = remember { mutableStateListOf<HarnessMsg>() }
     var streaming by remember { mutableStateOf(false) }
@@ -206,9 +210,10 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
 
     fun checkHealth() {
         scope.launch(Dispatchers.IO) {
-            val ok = try {
+            var primaryOk = false
+            try {
                 val root = baseUrl.trim().trimEnd('/')
-                listOf("$root/v1/models", "$root/health", root).any { url ->
+                primaryOk = listOf("$root/v1/models", "$root/health", root).any { url ->
                     try {
                         val req = Request.Builder().url(url)
                             .apply { if (token.isNotBlank()) addHeader("Authorization", "Bearer $token") }
@@ -216,8 +221,37 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
                         HttpClient.instance.newCall(req).execute().use { true }
                     } catch (_: Exception) { false }
                 }
+            } catch (_: Exception) { primaryOk = false }
+            if (primaryOk) {
+                withContext(Dispatchers.Main) {
+                    status = "已连接"
+                    effectiveBase = baseUrl
+                    effectivePath = apiPath
+                    hostFallback = false
+                }
+                return@launch
+            }
+            val fb = "http://127.0.0.1:" + PhoneBridgeHttpServer.PORT
+            val fbToken = PhoneBridgeHttpServer.token
+            val fbOk = try {
+                if (fbToken.isBlank()) false else {
+                    val url = fb + "/v1/models?token=" + fbToken
+                    HttpClient.instance.newCall(Request.Builder().url(url).get().build()).execute().use { true }
+                }
             } catch (_: Exception) { false }
-            withContext(Dispatchers.Main) { status = if (ok) "已连接" else "未连接" }
+            withContext(Dispatchers.Main) {
+                if (fbOk) {
+                    status = "已连接（宿主 Harness）"
+                    effectiveBase = fb
+                    effectivePath = "/v1/chat/completions"
+                    hostFallback = true
+                } else {
+                    status = "未连接"
+                    effectiveBase = baseUrl
+                    effectivePath = apiPath
+                    hostFallback = false
+                }
+            }
         }
     }
 
@@ -248,7 +282,13 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
                     "stream" to true
                 )
                 val requestJson = Gson().toJson(payload)
-                val url = baseUrl.trim().trimEnd('/') + if (apiPath.startsWith("/")) apiPath else "/$apiPath"
+                val root = effectiveBase.trim().trimEnd('/')
+                val path = if (effectivePath.startsWith("/")) effectivePath else "/" + effectivePath
+                val fallbackToken = if (hostFallback) {
+                    val t = PhoneBridgeHttpServer.token
+                    if (t.isBlank()) "" else "?token=" + t
+                } else ""
+                val url = root + path + fallbackToken
                 val req = Request.Builder().url(url)
                     .apply { if (token.isNotBlank()) addHeader("Authorization", "Bearer $token") }
                     .addHeader("Content-Type", "application/json")

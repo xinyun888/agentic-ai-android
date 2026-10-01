@@ -448,6 +448,9 @@ class QemuManager private constructor(private val context: Context, val linux: L
     fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? =
         startSessionInternal(memoryMb, smp, safeMode = false)
 
+    fun startSafeSession(): QemuSession? =
+        startSessionInternal(512, 1, safeMode = true)
+
     @Synchronized
     private fun startSessionInternal(memoryMb: Int, smp: Int, safeMode: Boolean): QemuSession? {
         if (!abiSupported()) return null

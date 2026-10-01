@@ -206,6 +206,20 @@ object PhoneBridgeHttpServer {
                     val result = proxyModelChat(body)
                     writeResponse(socket, result.first, result.second, "application/json; charset=utf-8")
                 }
+                method == "GET" && path == "/health" -> {
+                    writeResponse(socket, 200, "OK")
+                }
+                method == "GET" && path == "/v1/models" -> {
+                    writeResponse(
+                        socket, 200,
+                        "{\"object\":\"list\",\"data\":[{\"id\":\"host-harness\",\"object\":\"model\"}]}",
+                        "application/json; charset=utf-8"
+                    )
+                }
+                method == "POST" && path == "/v1/chat/completions" -> {
+                    val result = proxyModelChat(body)
+                    writeResponse(socket, result.first, result.second, "application/json; charset=utf-8")
+                }
                 method == "POST" && path == "/vm/upload" -> {
                     val rawName = query.split('&')
                         .mapNotNull { it.split('=', limit = 2).takeIf { p -> p.size == 2 } }

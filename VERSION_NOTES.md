@@ -1,3 +1,25 @@
+## v2.61.8（Guest 未就绪时 Harness 也可用）
+
+- 用户实测：guest 内核起来了，但有时停在 OpenRC/登录前，导致 Harness 永远未连接
+- 新增宿主兜底 Harness：
+  - `PhoneBridgeHttpServer` 增加 OpenAI 兼容端点：
+    ```text
+    GET  /v1/models?token=...
+    POST /v1/chat/completions?token=...
+    GET  /health?token=...
+    ```
+  - HarnessScreen 先连 guest `127.0.0.1:18000`
+  - guest 未就绪时自动回退到宿主 `127.0.0.1:48879`
+  - 状态显示：
+    - `已连接`
+    - `已连接（宿主 Harness）`
+  - guest Harness 一旦就绪，会自动切回 guest
+- VM 页面新增安全模式按钮：
+  - `-m 512 -smp 1 -cpu cortex-a53 -accel tcg,thread=single`
+  - 用于 guest 卡在 OpenRC/登录前时快速重试
+- 保留 v2.61.7 的自动登录重试
+- versionCode 284 / versionName 2.61.8
+
 ## v2.61.7（Guest 自动登录/Harness 安装修复）
 
 - 用户实测日志：guest 已正常启动到：
