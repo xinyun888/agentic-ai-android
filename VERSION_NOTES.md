@@ -1,3 +1,49 @@
+## v2.61.10（修复把 apk 进度条误判成 shell 提示符）
+
+- Android 模拟器实测发现：
+  - Alpine 安装 base 包时会输出大量进度条，末尾也是 `#`
+  - 旧逻辑把最后一行以 `#` 结尾当成 shell 提示符
+  - 于是在 login 之前就把 guest 配置命令输入了串口
+  - 终端表现为反复出现启动前的命令，然后 login 后再也不自动登录
+- 修复：
+  - 只认真正提示符：
+    ```text
+    :~#
+    ~ #
+    :/#
+    ```
+  - 必须已经检测到 `login:` 后才发送 root
+  - 必须已检测到 login 且出现真正提示符后，才发送 guest 配置命令
+  - apk 进度条 `#` 不再误触发
+- Android 模拟器验证：
+  - VM 终端可见
+  - 退出 VM 页面再进入，会话和输出保留
+  - QEMU 单实例 + pidfile + 180s 不再重复启动
+  - HarnessScreen 在 guest 未就绪时显示：
+    ```text
+    已连接（宿主 Harness）
+    ```
+- versionCode 286 / versionName 2.61.10
+
+## v2.61.9（QEMU 单实例保护）
+
+- 修复 Android 模拟器实测发现的严重问题：
+  - guest 启动较慢时，180 秒 watchdog 会启动第二个 QEMU
+  - 第一个 QEMU 还活着并锁着 alpine.qcow2
+  - 第二个 QEMU 报：
+    ```text
+    Failed to get "write" lock
+    Is another process using the image [/vm/alpine.qcow2]?
+    ```
+  - 终端只剩第二个 QEMU 的错误，看起来像卡住/重复输出
+- 修复：
+  - QEMU 启动参数新增 `-pidfile /vm/qemu.pid`
+  - `stopSession` 直接读取 pidfile 并向该 PID 发送 SIGKILL
+  - watchdog 只有在 QEMU 进程已经退出时才自动切安全模式
+  - 如果进程还活着只是慢，不再启动第二个 QEMU，只在终端提示
+  - 保留安全模式按钮由用户手动选择
+- versionCode 285 / versionName 2.61.9
+
 ## v2.61.8（Guest 未就绪时 Harness 也可用）
 
 - 用户实测：guest 内核起来了，但有时停在 OpenRC/登录前，导致 Harness 永远未连接

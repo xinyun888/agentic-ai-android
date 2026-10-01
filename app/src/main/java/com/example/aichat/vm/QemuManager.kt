@@ -308,7 +308,8 @@ class QemuManager private constructor(private val context: Context, val linux: L
             } else {
                 "console=ttyAMA0 ip=dhcp nowatchdog"
             },
-            "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2"
+            "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
+            "-pidfile", "/vm/qemu.pid"
         )
         if (!bootFromDisk) {
             args.addAll(listOf("-cdrom", "/vm/alpine-virt.iso"))
@@ -401,6 +402,23 @@ class QemuManager private constructor(private val context: Context, val linux: L
         }
     }
 
+    private fun killPidFileQemu() {
+        try {
+            val f = File(vmDir, "qemu.pid")
+            if (f.exists()) {
+                val pid = f.readText().trim().toIntOrNull()
+                if (pid != null && pid > 0) {
+                    try {
+                        android.os.Process.sendSignal(pid, 9)
+                    } catch (_: Exception) {
+                    }
+                }
+                f.delete()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun killStaleQemu() {
         try {
             runBlocking(Dispatchers.IO) {
@@ -457,6 +475,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
         if (!safeMode) safeModeAttempted = false
         stopSession()
+        killPidFileQemu()
         killStaleQemu()
         return try {
             QemuSession(linux, buildQemuArgs(memoryMb, smp, safeMode)).also {
@@ -494,12 +513,19 @@ class QemuManager private constructor(private val context: Context, val linux: L
             if (activeSession !== session) return@launch
             val out = session.output.value
             val booted = out.contains("login:") || out.contains("~ #") || out.contains("localhost:~#")
-            if (!booted && !safeMode && !safeModeAttempted) {
-                safeModeAttempted = true
-                Log.w(TAG, "guest 180s 未进入 login，尝试安全模式重启")
-                bootWatchdogJob = null
-                // 独立协程里重启，避免 stopSession 取消当前 watchdog 自己
-                setupScope.launch { startSessionInternal(512, 1, safeMode = true) }
+            if (!booted) {
+                if (session.running.value) {
+                    // 进程还活着说明只是慢，不能再启动第二个 QEMU 抢 qcow2 锁
+                    session.appendSynthetic(
+                        "[App] QEMU 已运行 180 秒仍未检测到 login；为避免两个 QEMU 争抢磁盘，" +
+                            "不再自动重启。可点停止，再点安全模式。"
+                    )
+                } else if (!safeMode && !safeModeAttempted) {
+                    safeModeAttempted = true
+                    Log.w(TAG, "guest 180s 未进入 login 且进程已退出，尝试安全模式重启")
+                    bootWatchdogJob = null
+                    setupScope.launch { startSessionInternal(512, 1, safeMode = true) }
+                }
             }
         }
     }
@@ -510,14 +536,20 @@ class QemuManager private constructor(private val context: Context, val linux: L
             val cmd = PhoneBridgeHttpServer.guestSetupCommand()
             var rootAttempts = 0
             var setupSent = false
+            var sawLogin = false
             while (isActive && activeSession === session) {
                 val out = session.output.value
-                val hasLogin = out.contains("login:", ignoreCase = true)
-                val hasPrompt = out.contains("~ #") ||
-                    out.contains("localhost:~#") ||
-                    out.contains(":~#") ||
-                    out.lines().lastOrNull()?.trimEnd()?.endsWith("#") == true
-                if (hasLogin && !hasPrompt && rootAttempts < 5) {
+                val tail = out.takeLast(12000)
+                val hasLogin = tail.contains("login:", ignoreCase = true)
+                if (hasLogin) sawLogin = true
+                // 只认真正的 shell 提示符，不能把 apk 进度条末尾的 # 误判成提示符
+                val lastLine = tail.lines().lastOrNull { it.isNotBlank() }?.trimEnd().orEmpty()
+                val hasPrompt = lastLine.endsWith(":~#") ||
+                    lastLine.endsWith("~ #") ||
+                    lastLine.endsWith(":/#") ||
+                    lastLine.endsWith(": #") ||
+                    lastLine == "#"
+                if (sawLogin && !hasPrompt && rootAttempts < 5) {
                     // login: 出现后 getty 可能还没完全就绪，稍等并重试
                     rootAttempts++
                     session.appendSynthetic("[App] 检测到 login，发送 root（第 " + rootAttempts + " 次）")
@@ -525,7 +557,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
                     session.write("root")
                     delay(5000)
                 }
-                if (hasPrompt && !setupSent) {
+                if (sawLogin && hasPrompt && !setupSent) {
                     setupSent = true
                     guestSetupDone = true
                     if (cmd.isBlank()) {
@@ -551,6 +583,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
         guestSetupDone = false
         activeSession?.shutdown()
         activeSession = null
+        killPidFileQemu()
         killStaleQemu()
         QemuKeepAliveService.stop(context)
         PhoneBridgeHttpServer.stop()
