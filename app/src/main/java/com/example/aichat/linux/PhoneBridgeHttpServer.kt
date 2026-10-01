@@ -153,6 +153,22 @@ object PhoneBridgeHttpServer {
                 .mapNotNull { it.split('=', limit = 2).takeIf { p -> p.size == 2 } }
                 .firstOrNull { it[0] == "token" }?.get(1).orEmpty()
 
+            // App 内置 Alpine Python 仓库：公开包，无需 token
+            if (method == "GET" && path.startsWith("/guest-apks/")) {
+                val rel = path.removePrefix("/guest-apks/").trimStart('/').replace("..", "")
+                val bytes = try {
+                    appContext?.assets?.open("guest-apks/" + rel)?.use { it.readBytes() }
+                } catch (_: Exception) { null }
+                if (bytes == null) {
+                    writeResponse(socket, 404, "not found")
+                } else {
+                    writeBytesResponse(
+                        socket, 200, bytes,
+                        if (rel.endsWith(".apk")) "application/octet-stream" else "application/gzip"
+                    )
+                }
+                return
+            }
             when {
                 requestToken != tokenValue || tokenValue.isBlank() -> {
                     writeResponse(socket, 403, "forbidden")
@@ -262,11 +278,12 @@ for repo in main community; do
   url="https://dl-cdn.alpinelinux.org/alpine/v3.24/${dollar}repo"
   grep -q "${dollar}url" /etc/apk/repositories 2>/dev/null || echo "${dollar}url" >> /etc/apk/repositories
 done
-apk update >/tmp/aichat-apk-update.log 2>&1 || true
+echo "http://10.0.2.2:$PORT/guest-apks" > /etc/apk/repositories
+apk update --allow-untrusted >/tmp/aichat-apk-update.log 2>&1 || true
 wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && chmod +x /usr/local/bin/phone && phone available || echo phone-bridge-failed
 wget -qO /usr/local/bin/ds-harness.py 'http://10.0.2.2:$PORT/harness.py?token=$tokenValue' && chmod +x /usr/local/bin/ds-harness.py || echo harness-download-failed
 if ! command -v python3 >/dev/null 2>&1; then
-  apk add --no-cache python3 >/tmp/ds-harness-install.log 2>&1 || true
+  apk add --no-cache --allow-untrusted python3 >/tmp/ds-harness-install.log 2>&1 || true
 fi
 if command -v python3 >/dev/null 2>&1; then
   (nohup python3 /usr/local/bin/ds-harness.py >/tmp/ds-harness.log 2>&1 &)

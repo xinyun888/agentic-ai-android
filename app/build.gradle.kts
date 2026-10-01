@@ -29,8 +29,8 @@ android {
         applicationId = "com.example.aichat"
         minSdk = 26
         targetSdk = targetSdkVersion
-        versionCode = 277
-        versionName = "2.61.1"
+        versionCode = 278
+        versionName = "2.61.2"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -107,7 +107,8 @@ val requiredBundledAssets = listOf(
     "src/main/assets/linux/alpine-x86_64.tar.gz",
     "src/main/assets/vm/alpine-virt.iso",
     "src/main/assets/vm/vmlinuz-virt",
-    "src/main/assets/vm/initramfs-virt"
+    "src/main/assets/vm/initramfs-virt",
+    "src/main/assets/guest-apks/aarch64/APKINDEX.tar.gz"
 )
 
 tasks.register("checkBundledLinuxAssets") {
@@ -120,6 +121,12 @@ tasks.register("checkBundledLinuxAssets") {
             )
         }
         requiredBundledAssets.forEach { println("bundled: $it (${file(it).length()} bytes)") }
+        val apkDir = file("src/main/assets/guest-apks/aarch64")
+        val apkCount = apkDir.listFiles { f -> f.extension == "apk" }?.size ?: 0
+        if (apkCount < 10) {
+            throw GradleException("内置 guest Python APK 仓库为空；请运行 fetch-vm-assets.py 重新生成")
+        }
+        println("bundled: guest python apks ($apkCount files)")
     }
 }
 

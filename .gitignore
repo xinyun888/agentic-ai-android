@@ -43,3 +43,4 @@ dist/
 app/src/main/assets/qemu/
 app/src/main/assets/qemu-x86_64/
 app/src/main/assets/vm/
+app/src/main/assets/guest-apks/

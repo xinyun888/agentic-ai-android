@@ -1,3 +1,36 @@
+## v2.61.2（Guest Harness 离线可用）
+
+- 修复部分设备/网络下 Guest Harness 仍然未连接：
+  - guest 的 Python3 之前需要访问外网 `dl-cdn.alpinelinux.org`
+  - 现在 APK 内置 aarch64 Alpine Python3 APK 仓库：
+    ```text
+    assets/guest-apks/aarch64/
+      APKINDEX.tar.gz
+      libexpat / libbz2 / libffi / gdbm / xz-libs
+      libgcc / libstdc++ / mpdecimal
+      ncurses-terminfo-base / libncursesw / libpanelw
+      readline / sqlite-libs / python3
+      python3-pycache-pyc0 / pyc / python3-pyc
+    ```
+  - 宿主 `PhoneBridgeHttpServer` 增加 `/guest-apks/*`，guest 通过 `10.0.2.2` 本地仓库安装 python3，完全不用外网
+  - guest 自动配置改为：
+    ```sh
+    echo "http://10.0.2.2:PORT/guest-apks" > /etc/apk/repositories
+    apk update --allow-untrusted
+    apk add --no-cache --allow-untrusted python3
+    ```
+- 新增 `fetch-guest-python.py`，干净 clone 时可重新下载 guest Python 仓库
+- VM 实测：
+  - 使用内置 APK 仓库，guest 离线安装 python3 成功
+  - 自动配置输出 `AICHAT_HARNESS_OK`
+  - hostfwd 后宿主访问：
+    ```text
+    http://127.0.0.1:18000/v1/models
+    {"object": "list", "data": [{"id": "ds-harness", "object": "model"}]}
+    ```
+- 保留 v2.61.1 全部修复：lo、import json、FastHTTPServer、单例会话、孤儿 QEMU 清理、原子资源写入
+- versionCode 278 / versionName 2.61.2
+
 ## v2.61.1（修复 Harness 不通 + 退出加载页损坏 VM）
 
 - 修复 Guest Harness 不通：
