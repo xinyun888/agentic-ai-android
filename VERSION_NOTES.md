@@ -1,3 +1,34 @@
+## v2.61.1（修复 Harness 不通 + 退出加载页损坏 VM）
+
+- 修复 Guest Harness 不通：
+  - 根因 1：guest 的 `lo` 回环网卡未启用，harness 健康检查连 `127.0.0.1:8000` 失败
+    - guest 自动配置现在先 `ip link set lo up`
+  - 根因 2：harness Python 脚本首行注释和 `import json` 被写成同一行，`json` 未导入，请求处理器启动后报 NameError
+    - 已改成独立行，并编译校验通过
+  - 根因 3：`HTTPServer.server_bind()` 会做反向 DNS，guest 网络下可能卡住
+    - 内置 harness 改用 `FastHTTPServer`，跳过 `getfqdn`
+  - guest 自动配置改为下载执行 `/guest-setup.sh`：
+    - 等待 DHCP / 宿主 ping
+    - 自动补 main/community 仓库
+    - 安装 python3
+    - 安装 phone 桥和 harness
+    - 最多 30 秒重试健康检查，输出 `AICHAT_HARNESS_OK` / `AICHAT_HARNESS_FAIL`
+  - HarnessScreen 连接状态改为每 4 秒自动重试
+- 修复等待 VM 加载时退出会搞坏 VM、之后能启动但没有输出：
+  - `QemuManager` 改为进程级单例，Activity/ViewModel 重建后复用同一会话
+  - `ChatViewModel.onCleared()` 不再停止 QEMU；VM 由 `QemuKeepAliveService` 保持
+  - 启动/停止加锁；启动前 `pkill` 残留 `qemu-system-*`，避免孤儿 QEMU 锁住 qcow2 和 18000 端口
+  - 停止时等待 QEMU 进程退出，再清理残留
+  - VmScreen 重新进入时轮询 `currentSession()`，自动接管正在运行的会话和输出
+- 加固半截文件损坏：
+  - ISO / vmlinuz / initramfs 改为 `.part` 写入后重命名
+  - qcow2 改为 `alpine.qcow2.part` 创建后重命名
+  - `imagesReady()` 增加最小文件大小校验，半截文件不再被当成可用
+- VM 实测：
+  - guest 执行自动配置脚本：phone-ok / AICHAT_HARNESS_OK
+  - `http://127.0.0.1:8000/v1/models` 返回 JSON
+- versionCode 277 / versionName 2.61.1
+
 ## v2.61.0（最终整合版）
 
 - 功能目标：集大成者，不砍任何能力

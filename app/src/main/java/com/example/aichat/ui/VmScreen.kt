@@ -22,6 +22,8 @@ import androidx.compose.ui.unit.dp
 import com.example.aichat.vm.QemuManager
 import com.example.aichat.vm.QemuSession
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -57,7 +59,21 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
 
     // 退出页面不再停止 QEMU；由 QemuKeepAliveService 保持运行，重新进入时自动接管当前会话。
 
-    LaunchedEffect(Unit) { refreshStatus() }
+    LaunchedEffect(Unit) {
+        refreshStatus()
+        while (isActive) {
+            val cur = manager.currentSession()
+            if (cur != null && session !== cur) {
+                session = cur
+                running = cur.running.value
+                vmOutput = cur.output.value
+            } else if (cur == null && session != null && !running) {
+                session = null
+                vmOutput = ""
+            }
+            delay(1500)
+        }
+    }
     LaunchedEffect(vmOutput) {
         if (vmOutput.isNotEmpty()) {
             scrollState.animateScrollTo(scrollState.maxValue)

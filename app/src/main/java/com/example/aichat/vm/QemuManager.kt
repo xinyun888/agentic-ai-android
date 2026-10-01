@@ -12,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -19,10 +20,21 @@ import okhttp3.Request
 import java.io.File
 import java.util.concurrent.TimeUnit
 
-class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) {
+class QemuManager private constructor(private val context: Context, val linux: LinuxRuntimeManager) {
 
     companion object {
         private const val TAG = "QemuManager"
+
+        @Volatile
+        private var instance: QemuManager? = null
+
+        fun get(context: Context, linux: LinuxRuntimeManager): QemuManager =
+            instance ?: synchronized(this) {
+                instance ?: QemuManager(context.applicationContext, linux).also {
+                    instance = it
+                    it.cleanupStaleProcesses()
+                }
+            }
         const val ALPINE_VERSION = "v3.24"
         const val NETBOOT_BASE =
             "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/releases/aarch64/netboot"
@@ -142,8 +154,14 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                     "initramfs-virt" to initrdFile,
                     "alpine-virt.iso" to isoFile
                 ).forEach { (name, target) ->
+                    // 先写 .part 再原子改名，避免退出/被杀时留下半截文件却通过 imagesReady
+                    val tmp = File(target.parentFile, target.name + ".part")
                     context.assets.open("vm/$name").use { input ->
-                        target.outputStream().use { output -> input.copyTo(output) }
+                        tmp.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    if (target.exists()) target.delete()
+                    if (!tmp.renameTo(target)) {
+                        throw IllegalStateException("无法重命名 ${tmp.name}")
                     }
                     onProgress("  $name -> ${target.length() / 1024 / 1024}MB")
                 }
@@ -156,9 +174,10 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
 
     fun qemuInstalled(): Boolean = File(linux.rootfsDir, "usr/bin/qemu-system-aarch64").exists()
 
-    fun imagesReady(): Boolean = isoFile.exists() && isoFile.length() > 0 &&
-        kernelFile.exists() && kernelFile.length() > 0 &&
-        initrdFile.exists() && initrdFile.length() > 0
+    fun imagesReady(): Boolean =
+        isoFile.exists() && isoFile.length() > 10_000_000 &&
+        kernelFile.exists() && kernelFile.length() > 1_000_000 &&
+        initrdFile.exists() && initrdFile.length() > 1_000_000
 
     fun diskReady(): Boolean = diskFile.exists() && diskFile.length() > 0
 
@@ -236,14 +255,20 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
                     return@withContext Result.success(Unit)
                 }
                 onProgress("创建 qcow2 磁盘（${sizeGb}G）...")
+                val tmp = File(vmDir, "alpine.qcow2.part")
+                if (tmp.exists()) tmp.delete()
                 val r = linux.exec(
-                    "qemu-img create -f qcow2 /vm/alpine.qcow2 ${sizeGb}G",
+                    "qemu-img create -f qcow2 /vm/alpine.qcow2.part ${sizeGb}G",
                     timeoutSec = 300
                 )
                 if (r.exitCode != 0) {
                     return@withContext Result.failure(
                         IllegalStateException("qemu-img 失败:\n${r.output.takeLast(2000)}")
                     )
+                }
+                if (diskFile.exists()) diskFile.delete()
+                if (!tmp.renameTo(diskFile)) {
+                    return@withContext Result.failure(IllegalStateException("无法重命名 ${tmp.name}"))
                 }
                 onProgress("磁盘创建完成")
                 Result.success(Unit)
@@ -360,6 +385,31 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
+    private fun cleanupStaleProcesses() {
+        setupScope.launch {
+            try {
+                // 上一进程如果被杀，PRoot 子进程可能残留；残留 QEMU 会锁住 qcow2 和 hostfwd 端口
+                linux.exec("pkill -9 -f qemu-system-aarch64 2>/dev/null || true", timeoutSec = 15)
+                linux.exec("pkill -9 -f qemu-system-x86_64 2>/dev/null || true", timeoutSec = 15)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun killStaleQemu() {
+        try {
+            runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(15_000) {
+                    linux.exec("pkill -9 -f qemu-system-aarch64 2>/dev/null || true", timeoutSec = 15)
+                }
+            }
+        } catch (_: Exception) {
+        }
+        try { Thread.sleep(400) } catch (_: InterruptedException) {}
+    }
+
+    fun isRunning(): Boolean = activeSession?.running?.value == true
+
     fun currentSession(): QemuSession? = activeSession
 
     fun phoneBridgeSetupCommand(): String = PhoneBridgeHttpServer.guestSetupCommand()
@@ -367,11 +417,13 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
     fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? =
         startSessionInternal(memoryMb, smp, safeMode = false)
 
+    @Synchronized
     private fun startSessionInternal(memoryMb: Int, smp: Int, safeMode: Boolean): QemuSession? {
         if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
         if (!safeMode) safeModeAttempted = false
         stopSession()
+        killStaleQemu()
         return try {
             QemuSession(linux, buildQemuArgs(memoryMb, smp, safeMode)).also {
                 activeSession = it
@@ -437,6 +489,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         }
     }
 
+    @Synchronized
     fun stopSession() {
         setupJob?.cancel()
         setupJob = null
@@ -445,6 +498,7 @@ class QemuManager(private val context: Context, val linux: LinuxRuntimeManager) 
         guestSetupDone = false
         activeSession?.shutdown()
         activeSession = null
+        killStaleQemu()
         QemuKeepAliveService.stop(context)
         PhoneBridgeHttpServer.stop()
     }

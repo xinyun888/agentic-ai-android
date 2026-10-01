@@ -12,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.lang.StringBuilder
+import java.util.concurrent.TimeUnit
 
 /**
  * QEMU 交互式串口会话。-nographic 的输入输出直接接在 PRoot / QEMU 进程上。
@@ -100,7 +101,17 @@ class QemuSession(
     }
 
     fun shutdown() {
-        stop()
+        val p = process
+        try {
+            p?.destroy()
+            if (p != null && !p.waitFor(2, TimeUnit.SECONDS)) {
+                p.destroyForcibly()
+                p.waitFor(2, TimeUnit.SECONDS)
+            }
+        } catch (_: Exception) {
+            try { p?.destroyForcibly() } catch (_: Exception) {}
+        }
+        process = null
         scope.cancel()
     }
 }

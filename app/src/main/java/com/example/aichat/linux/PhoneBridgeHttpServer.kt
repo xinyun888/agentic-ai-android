@@ -96,13 +96,13 @@ object PhoneBridgeHttpServer {
 
     fun guestSetupCommand(): String {
         if (tokenValue.isBlank()) return ""
-        return "mkdir -p /usr/local/bin && (ip link set eth0 up 2>/dev/null || true; udhcpc -i eth0 -n -q 2>/dev/null || true) && " +
-            "wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && " +
-            "chmod +x /usr/local/bin/phone && phone available; " +
-            "apk add --no-cache python3 >/tmp/ds-harness-install.log 2>&1; " +
-            "wget -qO /usr/local/bin/ds-harness.py 'http://10.0.2.2:$PORT/harness.py?token=$tokenValue' && " +
-            "chmod +x /usr/local/bin/ds-harness.py && " +
-            "(nohup python3 /usr/local/bin/ds-harness.py >/tmp/ds-harness.log 2>&1 &); echo harness-started"
+        val dollar = "$"
+        val url = "http://10.0.2.2:$PORT/guest-setup.sh?token=$tokenValue"
+        return "i=0; while [ ${dollar}i -lt 60 ]; do " +
+            "ip link set lo up 2>/dev/null || true; ip link set eth0 up 2>/dev/null || true; " +
+            "udhcpc -i eth0 -n -q 2>/dev/null || true; " +
+            "wget -qO /tmp/aichat-setup.sh '${url}' && break; " +
+            "i=${dollar}((i+1)); sleep 2; done; sh /tmp/aichat-setup.sh"
     }
 
     private fun handle(socket: Socket) {
@@ -168,6 +168,9 @@ object PhoneBridgeHttpServer {
                 }
                 method == "GET" && path == "/disk-install.sh" -> {
                     writeResponse(socket, 200, diskInstallScript())
+                }
+                method == "GET" && path == "/guest-setup.sh" -> {
+                    writeResponse(socket, 200, guestSetupScript())
                 }
                 method == "GET" && path == "/phone/screenshot" -> {
                     val bytes = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
@@ -242,6 +245,51 @@ object PhoneBridgeHttpServer {
         }
     }
 
+    /** guest 自动配置脚本：等网络、加仓库、装 python3、装 phone 桥和内置 harness。 */
+    private fun guestSetupScript(): String {
+        val dollar = "$"
+        return """#!/bin/sh
+echo AICHAT_SETUP_BEGIN
+mkdir -p /usr/local/bin
+ip link set lo up 2>/dev/null || true
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  ip link set eth0 up 2>/dev/null || true
+  udhcpc -i eth0 -n -q 2>/dev/null || true
+  wget -qO- "http://10.0.2.2:$PORT/phone/ping?token=$tokenValue" >/dev/null 2>&1 && break
+  sleep 2
+done
+for repo in main community; do
+  url="https://dl-cdn.alpinelinux.org/alpine/v3.24/${dollar}repo"
+  grep -q "${dollar}url" /etc/apk/repositories 2>/dev/null || echo "${dollar}url" >> /etc/apk/repositories
+done
+apk update >/tmp/aichat-apk-update.log 2>&1 || true
+wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && chmod +x /usr/local/bin/phone && phone available || echo phone-bridge-failed
+wget -qO /usr/local/bin/ds-harness.py 'http://10.0.2.2:$PORT/harness.py?token=$tokenValue' && chmod +x /usr/local/bin/ds-harness.py || echo harness-download-failed
+if ! command -v python3 >/dev/null 2>&1; then
+  apk add --no-cache python3 >/tmp/ds-harness-install.log 2>&1 || true
+fi
+if command -v python3 >/dev/null 2>&1; then
+  (nohup python3 /usr/local/bin/ds-harness.py >/tmp/ds-harness.log 2>&1 &)
+  i=0
+  while [ ${dollar}i -lt 30 ]; do
+    sleep 1
+    if wget -qO- http://127.0.0.1:8000/health >/dev/null 2>&1; then
+      echo AICHAT_HARNESS_OK
+      break
+    fi
+    i=${dollar}((i+1))
+  done
+  if [ ${dollar}i -ge 30 ]; then
+    echo AICHAT_HARNESS_FAIL
+    tail -20 /tmp/ds-harness.log 2>/dev/null || true
+  fi
+else
+  echo AICHAT_HARNESS_NO_PYTHON
+fi
+echo AICHAT_SETUP_DONE
+"""
+    }
+
     private fun diskInstallScript(): String {
         val dollar = "$"
         return """#!/bin/sh
@@ -270,14 +318,25 @@ echo AICHAT_DISK_DONE
 
     private fun harnessScript(): String {
         return """#!/usr/bin/env python3
-# Ai Chat 内置 guest harness：OpenAI 兼容入口，模型请求走宿主 /model/chat，Key 不离开宿主。
+# Ai Chat guest harness: OpenAI-compatible; forwards model calls to host /model/chat.
 import json
+import socketserver
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = 'http://10.0.2.2:$PORT'
 TOKEN = '$tokenValue'
+
+class FastHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        # HTTPServer.server_bind performs getfqdn reverse DNS, which can hang in guest network
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = '0.0.0.0'
+        self.server_port = 8000
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, content_type='application/json'):
@@ -326,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 if __name__ == '__main__':
-    ThreadingHTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
+    FastHTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
 """
     }
 

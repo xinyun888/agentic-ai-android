@@ -29,6 +29,7 @@ import com.example.aichat.viewmodel.ChatViewModel
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -220,7 +221,13 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
         }
     }
 
-    LaunchedEffect(baseUrl) { checkHealth() }
+    LaunchedEffect(baseUrl, apiPath) {
+        // guest 自动装 harness 需要时间；打开页面后持续探测，连上后继续轮询保活
+        while (true) {
+            checkHealth()
+            delay(4000)
+        }
+    }
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
     }

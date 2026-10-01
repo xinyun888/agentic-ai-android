@@ -53,7 +53,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     val workspace = Workspace(application)
     val pyManager by lazy { PythonSessionManager(application) }
     val linuxManager = LinuxRuntimeManager(application)
-    val qemuManager = com.example.aichat.vm.QemuManager(application, linuxManager)
+    val qemuManager = com.example.aichat.vm.QemuManager.get(application, linuxManager)
 
     init {
         ToolRegistry.init({ pyManager }, { linuxManager })
@@ -61,8 +61,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
-        linuxManager.shutdown()
-        qemuManager.shutdown()
+        // VM 由 QemuKeepAliveService + QemuManager 单例持有；
+        // 退出页面/Activity 销毁时不 stop QEMU，避免加载中被半关闭后留下锁住 qcow2 的孤儿进程。
         super.onCleared()
     }
 
