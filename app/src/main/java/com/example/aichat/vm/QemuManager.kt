@@ -315,7 +315,8 @@ class QemuManager private constructor(private val context: Context, val linux: L
         args.addAll(listOf(
             "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:18000-:8000,dns=" + upstreamDns,
             "-device", "virtio-net-pci,netdev=n0",
-            "-nographic",
+            "-display", "none",
+            "-serial", "stdio",
             "-monitor", "none",
             "-no-reboot"
         ))
@@ -463,6 +464,16 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 startGuestSetup(it)
                 // 首次启动失败时自动降级到安全模式
                 startBootWatchdog(it, safeMode)
+                // 20 秒无任何串口输出时，在终端里显示诊断，便于真机定位
+                setupScope.launch {
+                    delay(20_000)
+                    if (activeSession === it && it.output.value.isBlank()) {
+                        it.appendSynthetic(
+                            "[App] QEMU 启动 20 秒没有任何串口输出。" +
+                                "请检查：资源是否完整、18000 端口是否被占用、QEMU 是否需要安全模式。"
+                        )
+                    }
+                }
                 // 保持进程不被系统回收，退出页面/退到后台 VM 继续跑
                 QemuKeepAliveService.start(context)
             }

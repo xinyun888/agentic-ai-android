@@ -1,3 +1,22 @@
+## v2.61.6（QEMU 串口输出诊断）
+
+- QEMU 启动参数从：
+  ```text
+  -nographic
+  ```
+  改为更明确的：
+  ```text
+  -display none -serial stdio
+  ```
+  避免 App 管道环境下 `-nographic` 把串口/监视器混在一起导致看不到内核输出
+- QemuSession 新增 exitCode：
+  - QEMU 退出时 VM 终端显示 `QEMU 进程退出，exit=...`
+- 新增启动诊断：
+  - 启动 20 秒没有任何输出时，终端自动打印诊断
+  - 每次启动显示内核/initramfs/磁盘大小和完整 QEMU 参数
+  - 重复点启动会先清空上一次日志，不再刷屏
+- versionCode 282 / versionName 2.61.6
+
 ## v2.61.5（VM 终端显示修复）
 
 - 修复 Linux VM 页面看不到终端的问题：

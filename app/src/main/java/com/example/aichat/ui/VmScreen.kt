@@ -228,8 +228,10 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                         if (s == null) {
                             appendLog("启动失败：环境不完整")
                         } else {
+                            log = ""
                             session = s
                             appendLog("QEMU 已启动，等待内核/initramfs 输出...")
+                            appendLog("QEMU 参数: " + manager.buildQemuArgs().joinToString(" "))
                         }
                         refreshStatus()
                     }

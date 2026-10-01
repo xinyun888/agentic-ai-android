@@ -36,6 +36,9 @@ class QemuSession(
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
 
+    private val _exitCode = MutableStateFlow<Int?>(null)
+    val exitCode: StateFlow<Int?> = _exitCode.asStateFlow()
+
     fun start() {
         if (_running.value) return
         val payload = listOf(
@@ -75,7 +78,16 @@ class QemuSession(
             } finally {
                 try { _output.value = sb.toString() } catch (_: Exception) {}
                 _running.value = false
+                _exitCode.value = try { p.exitValue() } catch (_: Exception) { null }
             }
+        }
+    }
+
+    /** 给终端追加一条 App 诊断信息，不经过 QEMU 串口。 */
+    fun appendSynthetic(text: String) {
+        try {
+            _output.value = (_output.value + "\n" + text + "\n").takeLast(MAX_OUTPUT)
+        } catch (_: Exception) {
         }
     }
 
