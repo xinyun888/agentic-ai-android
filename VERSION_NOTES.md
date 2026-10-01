@@ -1,3 +1,24 @@
+## v2.61.7（Guest 自动登录/Harness 安装修复）
+
+- 用户实测日志：guest 已正常启动到：
+  ```text
+  localhost login:
+  ```
+  但自动登录和 Harness 安装没有触发
+- 修复 `startGuestSetup`：
+  - 不再依赖 StateFlow collect 的一次性判断
+  - 全新轮询循环：
+    - 检测到 `login:` 后发送 `root`
+    - 如果 5 秒内没有 shell 提示符，最多重试 5 次
+    - 检测到 `~ #` / `localhost:~#` 后发送完整 guest 配置命令
+  - App 会在终端显示：
+    ```text
+    [App] 检测到 login，发送 root（第 1 次）
+    [App] guest shell 已就绪，开始安装 phone bridge + Guest Harness
+    ```
+- 修复 Guest Harness 在有内核输出但没有自动登录场景下永远不连接的问题
+- versionCode 283 / versionName 2.61.7
+
 ## v2.61.6（QEMU 串口输出诊断）
 
 - QEMU 启动参数从：

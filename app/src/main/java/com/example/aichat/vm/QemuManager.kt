@@ -12,6 +12,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -504,27 +505,36 @@ class QemuManager private constructor(private val context: Context, val linux: L
         setupJob?.cancel()
         setupJob = setupScope.launch {
             val cmd = PhoneBridgeHttpServer.guestSetupCommand()
-            if (cmd.isBlank()) return@launch
-            var loginSent = false
-            var sent = false
-            session.output.collect { output ->
-                if (sent || guestSetupDone) return@collect
-                val tail = output.takeLast(6000)
-                val hasLogin = tail.contains("login:", ignoreCase = true)
-                val hasPrompt = tail.contains("~ #") ||
-                    tail.contains("localhost:~#") ||
-                    tail.lines().lastOrNull()?.trimEnd()?.endsWith("#") == true
-                if (hasLogin && !loginSent) {
-                    loginSent = true
+            var rootAttempts = 0
+            var setupSent = false
+            while (isActive && activeSession === session) {
+                val out = session.output.value
+                val hasLogin = out.contains("login:", ignoreCase = true)
+                val hasPrompt = out.contains("~ #") ||
+                    out.contains("localhost:~#") ||
+                    out.contains(":~#") ||
+                    out.lines().lastOrNull()?.trimEnd()?.endsWith("#") == true
+                if (hasLogin && !hasPrompt && rootAttempts < 5) {
+                    // login: 出现后 getty 可能还没完全就绪，稍等并重试
+                    rootAttempts++
+                    session.appendSynthetic("[App] 检测到 login，发送 root（第 " + rootAttempts + " 次）")
+                    delay(600)
                     session.write("root")
+                    delay(5000)
                 }
-                // 如果镜像自动登录 root，也会直接出现提示符
-                if (hasPrompt && (loginSent || !hasLogin)) {
-                    sent = true
+                if (hasPrompt && !setupSent) {
+                    setupSent = true
                     guestSetupDone = true
-                    delay(300)
-                    session.write(cmd)
+                    if (cmd.isBlank()) {
+                        session.appendSynthetic("[App] 手机桥未启动，无法自动安装 Guest Harness；请点复制 QEMU guest 手机桥命令手动执行。")
+                    } else {
+                        session.appendSynthetic("[App] guest shell 已就绪，开始安装 phone bridge + Guest Harness")
+                        delay(300)
+                        session.write(cmd)
+                    }
+                    break
                 }
+                delay(1200)
             }
         }
     }
