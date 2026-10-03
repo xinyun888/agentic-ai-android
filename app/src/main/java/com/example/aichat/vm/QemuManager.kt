@@ -196,6 +196,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
         appendLine("ISO 包: " + if (netbootAssetsReady()) "\u2705 已内置" else "\u274C 缺失")
         appendLine("架构: " + if (abiSupported()) "\u2705 ${hostAbi()}" else "\u274C 当前仅支持 arm64 / x86_64 VM 运行时")
         appendLine("启动模式: " + if (bootFromDisk) "\u2705 磁盘启动" else "\u2705 Live ISO")
+        appendLine("快速模式: " + if (fastBoot && !bootFromDisk) "\u2705 init=/bin/sh（推荐）" else "\u274C 完整 OpenRC")
         appendLine("手机桥: " + if (PhoneBridgeHttpServer.isRunning) "\u2705 guest -> 10.0.2.2:${PhoneBridgeHttpServer.PORT}" else "\u274C 未启动")
         appendLine("VM 目录: ${vmDir.absolutePath}")
     }
@@ -306,7 +307,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 // 主机内核的 initramfs 需要显式 rootfstype + ext4 模块才能挂载磁盘根分区
                 "root=/dev/vda3 rw rootfstype=ext4 modules=virtio_blk,virtio_pci,ext4 rootwait console=ttyAMA0 nowatchdog"
             } else {
-                "console=ttyAMA0 ip=dhcp nowatchdog"
+                "console=ttyAMA0 ip=dhcp nowatchdog" + if (fastBoot) " init=/bin/sh" else ""
             },
             "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
             "-pidfile", "/vm/qemu.pid"
@@ -330,6 +331,13 @@ class QemuManager private constructor(private val context: Context, val linux: L
     fun setDiskBootEnabled(enabled: Boolean) {
         bootFromDisk = enabled
         vmPrefs.edit().putBoolean("boot_from_disk", enabled).apply()
+    }
+
+    fun isFastBoot(): Boolean = fastBoot
+
+    fun setFastBoot(enabled: Boolean) {
+        fastBoot = enabled
+        vmPrefs.edit().putBoolean("fast_boot", enabled).apply()
     }
 
     /** 在 guest 里执行 setup-disk 安装到 /dev/vda，之后可切到磁盘启动。 */
@@ -388,6 +396,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
     @Volatile private var safeModeAttempted = false
     private val vmPrefs = context.getSharedPreferences("qemu_vm", Context.MODE_PRIVATE)
     @Volatile private var bootFromDisk = vmPrefs.getBoolean("boot_from_disk", false)
+    @Volatile private var fastBoot = vmPrefs.getBoolean("fast_boot", true)
     @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
@@ -537,9 +546,31 @@ class QemuManager private constructor(private val context: Context, val linux: L
             var rootAttempts = 0
             var setupSent = false
             var sawLogin = false
+            val fast = fastBoot && !bootFromDisk
             while (isActive && activeSession === session) {
                 val out = session.output.value
                 val tail = out.takeLast(12000)
+                val lastLineForFast = tail.lines().lastOrNull { it.isNotBlank() }?.trimEnd().orEmpty()
+                val fastPrompt = lastLineForFast.endsWith("~ #") ||
+                    lastLineForFast.endsWith("/ #") ||
+                    lastLineForFast == "#"
+                if (fast && fastPrompt && !setupSent) {
+                    setupSent = true
+                    guestSetupDone = true
+                    if (cmd.isBlank()) {
+                        session.appendSynthetic("[App] 快速模式已进入 root shell，但手机桥未启动，无法自动安装 Guest Harness。")
+                    } else {
+                        session.appendSynthetic("[App] 快速模式 root shell 已就绪，开始安装 phone bridge + Guest Harness")
+                        val prefix = "mount -t proc proc /proc 2>/dev/null || true; " +
+                            "mount -t sysfs sysfs /sys 2>/dev/null || true; " +
+                            "mount -t devtmpfs devtmpfs /dev 2>/dev/null || true; " +
+                            "modprobe virtio_net 2>/dev/null || true; " +
+                            "modprobe virtio_pci 2>/dev/null || true; "
+                        delay(400)
+                        session.write(prefix + cmd)
+                    }
+                    break
+                }
                 val hasLogin = tail.contains("login:", ignoreCase = true)
                 if (hasLogin) sawLogin = true
                 // 只认真正的 shell 提示符，不能把 apk 进度条末尾的 # 误判成提示符

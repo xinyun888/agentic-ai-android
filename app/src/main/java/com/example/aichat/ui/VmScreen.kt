@@ -307,6 +307,18 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
 
             Spacer(Modifier.height(6.dp))
             OutlinedButton(
+                enabled = !busy && !running,
+                onClick = {
+                    val next = !manager.isFastBoot()
+                    manager.setFastBoot(next)
+                    refreshStatus()
+                    appendLog(if (next) "已切换为快速模式(init=/bin/sh)，下次启动生效" else "已切换为完整 OpenRC 模式，下次启动生效")
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text(if (manager.isFastBoot()) "快速模式: init=/bin/sh（推荐）" else "完整模式: OpenRC", maxLines = 1) }
+
+            Spacer(Modifier.height(6.dp))
+            OutlinedButton(
                 onClick = {
                     val cmd = manager.phoneBridgeSetupCommand()
                     if (cmd.isBlank()) {

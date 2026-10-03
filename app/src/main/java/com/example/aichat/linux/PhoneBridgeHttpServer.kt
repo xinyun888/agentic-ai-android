@@ -295,7 +295,7 @@ done
 echo "nameserver 10.0.2.3" > /etc/resolv.conf
 echo "http://10.0.2.2:$PORT/guest-apks" > /etc/apk/repositories
 apk update --allow-untrusted >/tmp/aichat-apk-update.log 2>&1 || true
-wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && chmod +x /usr/local/bin/phone && phone available || echo phone-bridge-failed
+wget -qO /usr/local/bin/phone 'http://10.0.2.2:$PORT/phone.sh?token=$tokenValue' && chmod +x /usr/local/bin/phone && /usr/local/bin/phone available || echo phone-bridge-failed
 wget -qO /usr/local/bin/ds-harness.py 'http://10.0.2.2:$PORT/harness.py?token=$tokenValue' && chmod +x /usr/local/bin/ds-harness.py || echo harness-download-failed
 if ! command -v python3 >/dev/null 2>&1; then
   apk add --no-cache --allow-untrusted python3 >/tmp/ds-harness-install.log 2>&1 || true

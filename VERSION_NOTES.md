@@ -1,3 +1,25 @@
+## v2.61.11（快速模式默认启用）
+
+- 真机/模拟器实测：Alpine 完整 OpenRC 启动在部分环境会停在 firstboot 后，不再出现 login
+- 新增并默认启用快速模式：
+  - QEMU 内核参数：
+    ```text
+    init=/bin/sh
+    ```
+  - 直接进入 root shell，绕过 OpenRC / getty / login
+  - 通常几秒进入 `~ #`
+  - Guest 自动安装 phone 桥 + Python + Harness 仍正常执行
+- Windows QEMU 用快速模式实测通过：
+  - `~ #` root shell          
+  - `AICHAT_HARNESS_OK`       
+  - hostfwd `/v1/models` JSON 
+- 修复快速模式下 `phone` 不在 PATH 的问题：
+  - 改用绝对路径 `/usr/local/bin/phone available`
+- VM 页面保留快速模式 / 完整模式切换：
+  - 快速模式：默认，推荐，用于 Harness/手机控制
+  - 完整模式：完整 OpenRC，用于需要完整 Alpine 系统的场景
+- versionCode 287 / versionName 2.61.11
+
 ## v2.61.10（修复把 apk 进度条误判成 shell 提示符）
 
 - Android 模拟器实测发现：
