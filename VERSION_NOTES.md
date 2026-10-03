@@ -1,3 +1,30 @@
+## v2.61.12（定位 OpenRC 卡死：单线程 TCG）
+
+- 用户实测：Alpine 完整 OpenRC 在部分设备卡在：
+  ```text
+  * Starting firstboot ... [ ok ]
+  ```
+  之后不再出现 Welcome/login
+- 对照测试：
+  - 同一 guest、同一内核、同一 ISO
+  - `-accel tcg,thread=multi` + cortex-a57：部分环境 OpenRC 卡死
+  - `-accel tcg,thread=single` + cortex-a53：完整 OpenRC 正常到 login
+- 结论：
+  - Android + PRoot 下 QEMU TCG 多线程和 OpenRC 并行服务启动存在兼容问题
+  - 这不是 Harness 问题，是 TCG 线程模型问题
+- v2.61.12 修复：
+  - 完整模式默认改为：
+    ```text
+    -accel tcg,thread=single
+    -cpu cortex-a53
+    ```
+  - 快速模式 `init=/bin/sh` 保留为备用
+  - 默认改回完整模式（fast_boot 默认 false）
+- Windows QEMU 验证：
+  - 单线程完整 OpenRC 启动到 login
+  - phone 桥 + AICHAT_HARNESS_OK 正常
+- versionCode 288 / versionName 2.61.12
+
 ## v2.61.11（快速模式默认启用）
 
 - 真机/模拟器实测：Alpine 完整 OpenRC 启动在部分环境会停在 firstboot 后，不再出现 login

@@ -282,8 +282,9 @@ class QemuManager private constructor(private val context: Context, val linux: L
         }
 
     fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 1, safeMode: Boolean = false): List<String> {
-        val accel = if (safeMode) "tcg,thread=single" else "tcg"
-        val cpu = if (safeMode) "cortex-a53" else "cortex-a57"
+        // Android + PRoot 下 TCG 多线程 + OpenRC 并行服务会卡死；统一用单线程 TCG 和 cortex-a53
+        val accel = "tcg,thread=single"
+        val cpu = "cortex-a53"
         val mem = if (safeMode) minOf(memoryMb, 512) else memoryMb
         val cpus = if (safeMode) 1 else smp
         val uploadedKernel = File(vmDir, "upload/vmlinuz-virt")
@@ -396,7 +397,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
     @Volatile private var safeModeAttempted = false
     private val vmPrefs = context.getSharedPreferences("qemu_vm", Context.MODE_PRIVATE)
     @Volatile private var bootFromDisk = vmPrefs.getBoolean("boot_from_disk", false)
-    @Volatile private var fastBoot = vmPrefs.getBoolean("fast_boot", true)
+    @Volatile private var fastBoot = vmPrefs.getBoolean("fast_boot", false)
     @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
