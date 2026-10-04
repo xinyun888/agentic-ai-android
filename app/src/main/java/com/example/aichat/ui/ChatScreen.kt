@@ -88,6 +88,7 @@ fun ChatScreen(
     }
     var showWorkspaceFiles by remember { mutableStateOf(false) }
     var showPersonaEditor by remember { mutableStateOf(false) }
+    var showCardPanel by remember { mutableStateOf(false) }
     var editingPersona by remember { mutableStateOf<Persona?>(null) }
     var showActiveModeDialog by remember { mutableStateOf(false) }
     var pmFrequency by remember { mutableStateOf(15) }
@@ -453,6 +454,29 @@ fun ChatScreen(
                         }
                     }
                     Spacer(modifier = Modifier.height(4.dp))
+                }
+
+                // 命理师：人物卡入口（有卡才显示；点开可 对/不对/删除/导出导入）
+                if (viewModel.activePersonaId == "fortune") {
+                    val cardRev = viewModel.personCardRevision
+                    val pc = remember(cardRev) { viewModel.personCard() }
+                    val cnt = pc?.entries?.count { it.state == "active" } ?: 0
+                    val pend = pc?.entries?.count { it.state == "conflict" || it.strength == "待确认" } ?: 0
+                    if (cnt + pend > 0) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(onClick = { showCardPanel = true }) {
+                                Text(
+                                    " 人物卡  " + cnt + " 条" + (if (pend > 0) "（" + pend + " 待确认）" else ""),
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
+                        }
+                    }
                 }
 
                 Surface(
@@ -1605,4 +1629,115 @@ fun HtmlPreview(filePath: String, modifier: Modifier = Modifier) {
             update = { it.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null) }
         )
     }
+}
+
+/** 人物卡面板：查看 / 确认(对) / 否定(不对) / 删除 / 导出导入。只有命理师角色会出现入口。 */
+@Composable
+fun PersonCardPanel(viewModel: ChatViewModel, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val rev = viewModel.personCardRevision
+    val card = remember(rev) { viewModel.personCard() }
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+    val entries = card?.entries ?: emptyList()
+    val activeCnt = entries.count { it.state == "active" }
+    val pendingCnt = entries.count { it.state == "conflict" || it.strength == "待确认" }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                " 人物卡  " + activeCnt + " 条" +
+                    (if (pendingCnt > 0) "（" + pendingCnt + " 待确认）" else "")
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                if (entries.isEmpty()) {
+                    Text(
+                        "还没有人物卡：排完盘、确认八字后会自动建卡，之后每轮自动补充（性格/处事/职业）。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                entries.groupBy { it.cat }.forEach { (cat, list) ->
+                    Text(
+                        "【" + cat + "】",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    list.forEach { e ->
+                        val label = when (e.state) {
+                            "rejected" -> "已否定"
+                            "conflict" -> "冲突"
+                            else -> e.strength
+                        }
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                        ) {
+                            Text(" " + e.text + "　[" + e.type + "" + label + "]", style = MaterialTheme.typography.bodyMedium)
+                            if (e.quote.isNotBlank()) {
+                                Text(
+                                    "原句「" + e.quote + "」" + (if (e.turn > 0) "  轮" + e.turn else ""),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            if (e.chain.isNotBlank()) {
+                                Text("链：" + e.chain, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            if (e.counter.isNotEmpty()) {
+                                Text("反例「" + e.counter.first() + "」", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                            }
+                            Row {
+                                TextButton(onClick = { viewModel.cardConfirm(e.id) }) { Text("对") }
+                                TextButton(onClick = { viewModel.cardReject(e.id) }) { Text("不对") }
+                                TextButton(onClick = { viewModel.cardRemove(e.id) }) { Text("删除") }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Row {
+                TextButton(onClick = {
+                    // 面相报告：markdown，直接弹分享（同时复制到剪贴板）
+                    val rep = viewModel.faceReport()
+                    if (rep.isBlank()) {
+                        android.widget.Toast.makeText(context, "还没有面相观测：先发一张照片吧", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("face_report", rep))
+                        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(android.content.Intent.EXTRA_SUBJECT, "面相报告")
+                            putExtra(android.content.Intent.EXTRA_TEXT, rep)
+                        }
+                        context.startActivity(android.content.Intent.createChooser(send, "分享面相报告"))
+                    }
+                }) { Text("面相报告") }
+                TextButton(onClick = {
+                    val payload = viewModel.cardExport()
+                    if (payload.isNotBlank()) {
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("person_card", payload))
+                    }
+                    onDismiss()
+                }) { Text("导出卡片") }
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = {
+                    val text = clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                    if (text.isNotBlank()) viewModel.cardImport(text)
+                }) { Text("导入") }
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+        }
+    )
 }

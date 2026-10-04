@@ -29,8 +29,8 @@ android {
         applicationId = "com.example.aichat"
         minSdk = 26
         targetSdk = targetSdkVersion
-        versionCode = 288
-        versionName = "2.61.12"
+        versionCode = 303
+        versionName = "2.61.27"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -93,6 +93,11 @@ android {
         kotlinCompilerExtensionVersion = "1.5.10"
     }
 
+    androidResources {
+        // 离线包本身已是 gzip/tar.gz，别再压一遍（会拖垮 compressAssets）
+        noCompress += listOf("gz", "tar", "bin")
+    }
+
     packaging {
         jniLibs {
             // 让 libproot_exec.so 实际解压到 nativeLibraryDir，便于以可执行文件方式启动
@@ -108,7 +113,9 @@ val requiredBundledAssets = listOf(
     "src/main/assets/vm/alpine-virt.iso",
     "src/main/assets/vm/vmlinuz-virt",
     "src/main/assets/vm/initramfs-virt",
-    "src/main/assets/guest-apks/aarch64/APKINDEX.tar.gz"
+    "src/main/assets/guest-apks/aarch64/APKINDEX.bin",
+    "src/main/assets/dsh/dsh-bundle.bin",
+    "src/main/assets/dsh/preinstall-disk.qcow2.bin"
 )
 
 tasks.register("checkBundledLinuxAssets") {

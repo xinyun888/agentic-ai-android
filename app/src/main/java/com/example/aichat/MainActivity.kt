@@ -23,6 +23,16 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         // 启动 guest Linux -> 无障碍 的文件桥
         PhoneBridgeManager.start(applicationContext)
+        // debug 构建：跑一遍人物卡回归自检（解析/合并/溢出/引用校验），失败只记日志不影响使用
+        if (BuildConfig.DEBUG) {
+            try {
+                val fails = com.example.aichat.data.CardStore.selfTest()
+                if (fails.isEmpty()) android.util.Log.i("CardSelfTest", "PASS (10 groups)")
+                else android.util.Log.e("CardSelfTest", "FAIL: " + fails.joinToString("; "))
+            } catch (e: Exception) {
+                android.util.Log.e("CardSelfTest", "crash: " + e.message)
+            }
+        }
         setContent {
             AiChatTheme {
                 val mainViewModel: MainViewModel = viewModel()

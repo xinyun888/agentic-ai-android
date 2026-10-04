@@ -42,6 +42,18 @@ class QemuManager private constructor(private val context: Context, val linux: L
         const val NETBOOT_BASE =
             "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/releases/aarch64/netboot"
         const val QEMU_GUEST_PATH = "/usr/bin/qemu-system-aarch64"
+
+        /** guest 启动看门狗：超过该时间还没进 shell 就自动用快速模式重试 */
+        private const val BOOT_WATCHDOG_MS = 240_000L
+        /** 磁盘启动要走完整 OpenRC（首次还有 ext4 journal 回放），给更宽的预算 */
+        private const val BOOT_WATCHDOG_DISK_MS = 900_000L
+        /** 发完安装命令后，等 guest 回显 AICHAT_SETUP_BEGIN 的时间 */
+        private const val SETUP_RETRY_MS = 60_000L
+        /** 安装命令最多重发次数（串口写入/网络偶发失败时自救） */
+        private const val MAX_SETUP_ATTEMPTS = 3
+
+        /** ANSI 转义序列：guest 的 busybox ash 在提示符后会发 ESC[6n 查询光标位置，必须剥掉才能识别提示符 */
+        private val ANSI_ESCAPE = Regex("\u001B\\[[0-9;?]*[A-Za-z]")
     }
 
     val vmDir: File = linux.vmDir
@@ -177,8 +189,17 @@ class QemuManager private constructor(private val context: Context, val linux: L
 
     fun qemuInstalled(): Boolean = File(linux.rootfsDir, "usr/bin/qemu-system-aarch64").exists()
 
+    /** 内置的"预装系统"磁盘镜像（node/pnpm/git/DeepSeek Harness 已装好） */
+    private val preinstallAsset = "dsh/preinstall-disk.qcow2.bin"
+    private val preinstallMarker = File(vmDir, ".preinstalled")
+
+    fun preinstallImageReady(): Boolean =
+        try { context.assets.open(preinstallAsset).use { true } } catch (_: Exception) { false }
+
+    fun preinstalledDiskLive(): Boolean = preinstallMarker.exists() && diskReady()
+
     fun imagesReady(): Boolean =
-        isoFile.exists() && isoFile.length() > 10_000_000 &&
+        (isoFile.exists() && isoFile.length() > 10_000_000 || preinstallImageReady()) &&
         kernelFile.exists() && kernelFile.length() > 1_000_000 &&
         initrdFile.exists() && initrdFile.length() > 1_000_000
 
@@ -190,6 +211,7 @@ class QemuManager private constructor(private val context: Context, val linux: L
         appendLine("内核:   " + if (kernelFile.exists() && initrdFile.exists()) "\u2705 已释放" else "\u274C 未释放")
         appendLine("ISO:    " + if (isoFile.exists() && isoFile.length() > 0) "\u2705 ${isoFile.length() / 1024 / 1024}MB" else "\u274C 未释放")
         appendLine("磁盘:   " + if (diskReady()) "\u2705 ${diskFile.name} (${diskFile.length() / 1024 / 1024}MB)" else "\u274C 未创建")
+        appendLine("预装包: " + if (preinstallImageReady()) "\u2705 内置 node/pnpm/git/DSH" else "\u274C 缺失")
         val assetDir = qemuAssetDir()
         val qemuApkCount = context.assets.list(assetDir)?.count { it.endsWith(".apk") } ?: 0
         appendLine("离线 QEMU 包: " + if (qemuApkAssetsReady()) "\u2705 $qemuApkCount 个 ($assetDir)" else "\u274C 缺失")
@@ -248,9 +270,46 @@ class QemuManager private constructor(private val context: Context, val linux: L
         }
     }
 
+    /**
+     * 展开内置预装系统镜像到 /vm/alpine.qcow2（已含 node/npm/pnpm/git/bash + DeepSeek Harness），
+     * 首次 30-60 秒，之后直接磁盘启动、无需任何安装。
+     */
+    suspend fun installPreinstalledDisk(onProgress: (String) -> Unit): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            try {
+                if (preinstalledDiskLive()) {
+                    setDiskBootEnabled(true)
+                    onProgress("预装系统已就绪")
+                    return@withContext Result.success(Unit)
+                }
+                val tmp = File(vmDir, "alpine.qcow2.part")
+                tmp.parentFile?.mkdirs()
+                if (tmp.exists()) tmp.delete()
+                onProgress("展开内置预装系统（首次 1-2 分钟）...")
+                // 资源是 gzip 过的未压缩 qcow2：这里解压一次，之后 guest 读写就是普通镜像
+                // （压缩 qcow2 在 PRoot 下逐簇解压会非常慢）
+                java.util.zip.GZIPInputStream(context.assets.open(preinstallAsset), 1 shl 20).use { input ->
+                    tmp.outputStream().use { out -> input.copyTo(out, 1 shl 20) }
+                }
+                if (diskFile.exists()) diskFile.delete()
+                if (!tmp.renameTo(diskFile)) {
+                    return@withContext Result.failure(IllegalStateException("无法重命名 " + tmp.name))
+                }
+                preinstallMarker.writeText("1")
+                setDiskBootEnabled(true)
+                onProgress("预装系统展开完成（node / pnpm / git / DeepSeek Harness 已内置）")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+
     suspend fun createDisk(sizeGb: Int = 8, onProgress: (String) -> Unit): Result<Unit> =
         withContext(Dispatchers.IO) {
             try {
+                if (preinstallImageReady() && !preinstalledDiskLive()) {
+                    return@withContext installPreinstalledDisk(onProgress)
+                }
                 if (!rootfsInstalled() || !qemuInstalled()) {
                     return@withContext Result.failure(IllegalStateException("请先安装 rootfs 和 QEMU"))
                 }
@@ -281,7 +340,12 @@ class QemuManager private constructor(private val context: Context, val linux: L
             }
         }
 
-    fun buildQemuArgs(memoryMb: Int = 1024, smp: Int = 1, safeMode: Boolean = false): List<String> {
+    fun buildQemuArgs(
+        memoryMb: Int = 1024,
+        smp: Int = 1,
+        safeMode: Boolean = false,
+        fastBootOverride: Boolean? = null
+    ): List<String> {
         // Android + PRoot 下 TCG 多线程 + OpenRC 并行服务会卡死；统一用单线程 TCG 和 cortex-a53
         val accel = "tcg,thread=single"
         val cpu = "cortex-a53"
@@ -308,7 +372,8 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 // 主机内核的 initramfs 需要显式 rootfstype + ext4 模块才能挂载磁盘根分区
                 "root=/dev/vda3 rw rootfstype=ext4 modules=virtio_blk,virtio_pci,ext4 rootwait console=ttyAMA0 nowatchdog"
             } else {
-                "console=ttyAMA0 ip=dhcp nowatchdog" + if (fastBoot) " init=/bin/sh" else ""
+                "console=ttyAMA0 ip=dhcp nowatchdog" +
+                    if (fastBootOverride ?: fastBoot) " init=/bin/sh" else ""
             },
             "-drive", "file=/vm/alpine.qcow2,if=virtio,format=qcow2",
             "-pidfile", "/vm/qemu.pid"
@@ -370,8 +435,9 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 }
             }
             onProgress("开始安装 Alpine 到 /dev/vda（后台，可能需要几分钟）...")
-            val cmd = "wget -qO /tmp/aichat-disk.sh 'http://10.0.2.2:${PhoneBridgeHttpServer.PORT}/disk-install.sh?token=$token'; sh /tmp/aichat-disk.sh"
-            session.write(cmd)
+            // 拆成两条短命令：串口上长行容易被丢字符写坏
+            session.write("wget -qO /tmp/aichat-disk.sh 'http://10.0.2.2:${PhoneBridgeHttpServer.PORT}/disk-install.sh?token=$token'")
+            session.write("sh /tmp/aichat-disk.sh")
             val done = withTimeoutOrNull(1_200_000) {
                 session.output.first { it.contains("AICHAT_DISK_DONE") }
             }
@@ -395,9 +461,15 @@ class QemuManager private constructor(private val context: Context, val linux: L
     private var setupJob: Job? = null
     private var bootWatchdogJob: Job? = null
     @Volatile private var safeModeAttempted = false
+    @Volatile private var fastFallbackAttempted = false
+    /** 首次运行自动"安装到磁盘"只做一次（成功后 bootFromDisk 会持久化为 true） */
+    @Volatile private var diskAutoInstallTriggered = false
     private val vmPrefs = context.getSharedPreferences("qemu_vm", Context.MODE_PRIVATE)
     @Volatile private var bootFromDisk = vmPrefs.getBoolean("boot_from_disk", false)
-    @Volatile private var fastBoot = vmPrefs.getBoolean("fast_boot", false)
+
+    // 默认快速模式（init=/bin/sh）：跳过 OpenRC/getty/login，慢设备上 harness 才能稳定装起来。
+    // 完整 OpenRC 模式仍可在 VM 页面手动切换。
+    @Volatile private var fastBoot = vmPrefs.getBoolean("fast_boot", true)
     @Volatile private var guestSetupDone = false
 
     /** 返回当前会话，页面重新进入时直接复用，不再重启 QEMU。 */
@@ -473,22 +545,35 @@ class QemuManager private constructor(private val context: Context, val linux: L
 
     fun phoneBridgeSetupCommand(): String = PhoneBridgeHttpServer.guestSetupCommand()
 
-    fun startSession(memoryMb: Int = 1024, smp: Int = 1): QemuSession? =
+    fun startSession(memoryMb: Int = 2048, smp: Int = 1): QemuSession? =
         startSessionInternal(memoryMb, smp, safeMode = false)
 
+    /** 安全模式：小内存 + 快速启动（init=/bin/sh），用于 guest 卡在 OpenRC/登录前时自救。 */
     fun startSafeSession(): QemuSession? =
-        startSessionInternal(512, 1, safeMode = true)
+        startSessionInternal(512, 1, safeMode = true, forceFastBoot = true)
 
     @Synchronized
-    private fun startSessionInternal(memoryMb: Int, smp: Int, safeMode: Boolean): QemuSession? {
+    private fun startSessionInternal(
+        memoryMb: Int,
+        smp: Int,
+        safeMode: Boolean,
+        forceFastBoot: Boolean = false
+    ): QemuSession? {
         if (!abiSupported()) return null
         if (!qemuInstalled() || !imagesReady() || !diskReady()) return null
-        if (!safeMode) safeModeAttempted = false
+        if (!safeMode) {
+            safeModeAttempted = false
+            fastFallbackAttempted = false
+        }
+        DshState.reset()
+        // 救援重启时把快速模式写回偏好，保证 VM 页面开关和真实启动参数一致
+        if (forceFastBoot && !bootFromDisk && !fastBoot) setFastBoot(true)
+        val fastOverride = if (forceFastBoot && !bootFromDisk) true else null
         stopSession()
         killPidFileQemu()
         killStaleQemu()
         return try {
-            QemuSession(linux, buildQemuArgs(memoryMb, smp, safeMode)).also {
+            QemuSession(linux, buildQemuArgs(memoryMb, smp, safeMode, fastOverride)).also {
                 activeSession = it
                 it.start()
                 // 给 guest 打开设备能力 HTTP 桥
@@ -518,24 +603,48 @@ class QemuManager private constructor(private val context: Context, val linux: L
 
     private fun startBootWatchdog(session: QemuSession, safeMode: Boolean) {
         bootWatchdogJob?.cancel()
+        val budgetMs = if (bootFromDisk) BOOT_WATCHDOG_DISK_MS else BOOT_WATCHDOG_MS
         bootWatchdogJob = setupScope.launch {
-            delay(180_000)
+            delay(budgetMs)
             if (activeSession !== session) return@launch
             val out = session.output.value
             val booted = out.contains("login:") || out.contains("~ #") || out.contains("localhost:~#")
-            if (!booted) {
-                if (session.running.value) {
-                    // 进程还活着说明只是慢，不能再启动第二个 QEMU 抢 qcow2 锁
+            if (booted) return@launch
+            val seconds = budgetMs / 1000
+            if (session.running.value) {
+                if (bootFromDisk) {
+                    // 磁盘启动在少数环境（PRoot 下磁盘 I/O 极慢）会卡在 "Mounting root"：
+                    // 自动切回已验证的 Live 模式重试（预装镜像仍留在 /vm，不影响下次）
+                    setDiskBootEnabled(false)
                     session.appendSynthetic(
-                        "[App] QEMU 已运行 180 秒仍未检测到 login；为避免两个 QEMU 争抢磁盘，" +
-                            "不再自动重启。可点停止，再点安全模式。"
+                        "[App] 磁盘启动 $seconds 秒仍未进 shell（PRoot 下磁盘 I/O 慢时可能发生）；" +
+                            "自动切回 Live 模式重试，稍后可用当前:磁盘切回。"
                     )
-                } else if (!safeMode && !safeModeAttempted) {
-                    safeModeAttempted = true
-                    Log.w(TAG, "guest 180s 未进入 login 且进程已退出，尝试安全模式重启")
-                    bootWatchdogJob = null
-                    setupScope.launch { startSessionInternal(512, 1, safeMode = true) }
+                    Log.w(TAG, "磁盘启动 ${seconds}s 未进 shell，回退 Live 模式")
+                    setupScope.launch { startSessionInternal(2048, 1, safeMode = false) }
+                    return@launch
                 }
+                // 进程还活着说明不是 QEMU 崩了，而是 guest 卡在 OpenRC/挂载阶段（部分机型会卡死在
+                // firstboot 之前）。此时不能直接再起第二个 QEMU 抢 qcow2 锁，必须先把旧的停掉。
+                if (!safeMode && !fastBoot && !fastFallbackAttempted) {
+                    fastFallbackAttempted = true
+                    session.appendSynthetic(
+                        "[App] QEMU 已运行 $seconds 秒仍未进入 shell，判定 guest 卡在 OpenRC；" +
+                            "自动改用快速模式（init=/bin/sh）重启，绕过 OpenRC 与 login。"
+                    )
+                    Log.w(TAG, "guest ${seconds}s 未进入 shell，自动切换快速模式重启")
+                    setupScope.launch { startSessionInternal(1024, 1, safeMode = false, forceFastBoot = true) }
+                } else {
+                    session.appendSynthetic(
+                        "[App] QEMU 已运行 $seconds 秒仍未检测到 shell；可点停止，再点安全模式" +
+                            "（安全模式会用 init=/bin/sh 快速启动）。"
+                    )
+                }
+            } else if (!safeMode && !safeModeAttempted) {
+                safeModeAttempted = true
+                Log.w(TAG, "guest ${seconds}s 未进入 shell 且进程已退出，尝试安全模式重启")
+                bootWatchdogJob = null
+                setupScope.launch { startSessionInternal(512, 1, safeMode = true, forceFastBoot = true) }
             }
         }
     }
@@ -543,37 +652,65 @@ class QemuManager private constructor(private val context: Context, val linux: L
     private fun startGuestSetup(session: QemuSession) {
         setupJob?.cancel()
         setupJob = setupScope.launch {
-            val cmd = PhoneBridgeHttpServer.guestSetupCommand()
+            val commands = PhoneBridgeHttpServer.guestSetupCommands()
             var rootAttempts = 0
-            var setupSent = false
             var sawLogin = false
+            var setupSent = false
+            var setupBegun = false
+            var attempts = 0
+            var sentAt = 0L
+            var rootfsReadyAt = 0L
             val fast = fastBoot && !bootFromDisk
             while (isActive && activeSession === session) {
-                val out = session.output.value
-                val tail = out.takeLast(12000)
-                val lastLineForFast = tail.lines().lastOrNull { it.isNotBlank() }?.trimEnd().orEmpty()
-                val fastPrompt = lastLineForFast.endsWith("~ #") ||
-                    lastLineForFast.endsWith("/ #") ||
-                    lastLineForFast == "#"
-                if (fast && fastPrompt && !setupSent) {
-                    setupSent = true
-                    guestSetupDone = true
-                    if (cmd.isBlank()) {
-                        session.appendSynthetic("[App] 快速模式已进入 root shell，但手机桥未启动，无法自动安装 Guest Harness。")
-                    } else {
-                        session.appendSynthetic("[App] 快速模式 root shell 已就绪，开始安装 phone bridge + Guest Harness")
-                        val prefix = "mount -t proc proc /proc 2>/dev/null || true; " +
-                            "mount -t sysfs sysfs /sys 2>/dev/null || true; " +
-                            "mount -t devtmpfs devtmpfs /dev 2>/dev/null || true; " +
-                            "modprobe virtio_net 2>/dev/null || true; " +
-                            "modprobe virtio_pci 2>/dev/null || true; "
-                        delay(400)
-                        session.write(prefix + cmd)
+                // busybox ash 的提示符后面会跟 ESC[6n（光标位置查询），不剥掉 ANSI 就永远匹配不到提示符
+                val tail = stripAnsi(session.output.value.takeLast(20000))
+                if (tail.contains("AICHAT_SETUP_BEGIN")) setupBegun = true
+                if (tail.contains("login:", ignoreCase = true)) sawLogin = true
+                // 捕获 Guest 里 dsh web 的启动 URL / 就绪状态，供 DS Harness 页直接内嵌
+                if (tail.contains("AICHAT_DSH_OK")) {
+                    DshState.ready = true
+                    // 首次运行（Live ISO）：自动把系统装到磁盘并切到磁盘启动，让 node/DSH/会话持久化
+                    if (!bootFromDisk && !diskAutoInstallTriggered) {
+                        diskAutoInstallTriggered = true
+                        session.appendSynthetic(
+                            "[App] 首次运行：正在把 Alpine 安装到磁盘以便持久化（约 2-5 分钟，请勿关闭）..."
+                        )
+                        setupScope.launch {
+                            if (activeSession !== session) return@launch
+                            val r = installToDisk(session) { msg ->
+                                session.appendSynthetic("[App] $msg")
+                            }
+                            if (r.isSuccess) {
+                                session.appendSynthetic("[App] 磁盘安装完成，正在切换到磁盘启动（DSH 与配置将持久保留）...")
+                                delay(2000)
+                                if (activeSession === session) {
+                                    startSessionInternal(2048, 1, safeMode = false)
+                                }
+                            } else {
+                                session.appendSynthetic(
+                                    "[App] 磁盘安装失败：" + (r.exceptionOrNull()?.message ?: "未知错误") +
+                                        "；继续使用内存模式（重启 VM 会重新解压 DSH）"
+                                )
+                            }
+                        }
                     }
-                    break
                 }
-                val hasLogin = tail.contains("login:", ignoreCase = true)
-                if (hasLogin) sawLogin = true
+                if (tail.contains("AICHAT_DSH_FAIL")) { DshState.ready = false; DshState.webUrl = null }
+                val dshIdx = tail.indexOf("AICHAT_DSH_URL=")
+                if (dshIdx >= 0) {
+                    val line = tail.substring(dshIdx).lineSequence().firstOrNull().orEmpty()
+                    val url = line.removePrefix("AICHAT_DSH_URL=").trim()
+                    if (url.startsWith("http")) {
+                        DshState.webUrl = url
+                        DshState.ready = true
+                    }
+                }
+                // 个别机型串口会把 /bin/sh 的提示符切成半行（只能看到 "/"），提示符识别会失效。
+                // 快速模式的 root shell 是 init 自己起的，装完包就一定有，所以到点直接盲发命令。
+                if (rootfsReadyAt == 0L && tail.contains("Installing packages to root filesystem")) {
+                    rootfsReadyAt = System.currentTimeMillis()
+                }
+
                 // 只认真正的 shell 提示符，不能把 apk 进度条末尾的 # 误判成提示符
                 val lastLine = tail.lines().lastOrNull { it.isNotBlank() }?.trimEnd().orEmpty()
                 val hasPrompt = lastLine.endsWith(":~#") ||
@@ -581,30 +718,65 @@ class QemuManager private constructor(private val context: Context, val linux: L
                     lastLine.endsWith(":/#") ||
                     lastLine.endsWith(": #") ||
                     lastLine == "#"
-                if (sawLogin && !hasPrompt && rootAttempts < 5) {
+                val fastPrompt = lastLine.endsWith("~ #") ||
+                    lastLine.endsWith("/ #") ||
+                    lastLine == "#"
+                val shellReady = if (fast) fastPrompt else (sawLogin && hasPrompt)
+                val blindSend = fast && rootfsReadyAt > 0L &&
+                    System.currentTimeMillis() - rootfsReadyAt > 20_000L
+
+                val needFirstSend = (shellReady || blindSend) && !setupSent
+                val needRetry = setupSent && !setupBegun && attempts < MAX_SETUP_ATTEMPTS &&
+                    System.currentTimeMillis() - sentAt > SETUP_RETRY_MS
+                if (needFirstSend || needRetry) {
+                    if (commands.isEmpty()) {
+                        setupSent = true
+                        session.appendSynthetic("[App] 手机桥未启动，无法自动安装 Guest Harness；请先启动 VM。")
+                    } else {
+                        attempts++
+                        setupSent = true
+                        session.appendSynthetic(
+                            if (attempts == 1) {
+                                if (shellReady) {
+                                    if (fast) {
+                                        "[App] 快速模式 root shell 已就绪，开始安装 phone bridge + Guest Harness"
+                                    } else {
+                                        "[App] guest shell 已就绪，开始安装 phone bridge + Guest Harness"
+                                    }
+                                } else {
+                                    "[App] 未识别到 shell 提示符，快速模式下直接发送安装命令（兜底）"
+                                }
+                            } else {
+                                "[App] 未收到 AICHAT_SETUP_BEGIN，重发安装命令（第 " + attempts + " 次）"
+                            }
+                        )
+                        delay(200)
+                        for (line in commands) {
+                            if (!isActive || activeSession !== session) break
+                            session.write(line)
+                        }
+                        // 发送本身可能耗时（分块 + 等回显），重试计时从发完开始算
+                        sentAt = System.currentTimeMillis()
+                    }
+                } else if (!fast && sawLogin && !hasPrompt && rootAttempts < 6) {
                     // login: 出现后 getty 可能还没完全就绪，稍等并重试
                     rootAttempts++
                     session.appendSynthetic("[App] 检测到 login，发送 root（第 " + rootAttempts + " 次）")
                     delay(600)
                     session.write("root")
-                    delay(5000)
                 }
-                if (sawLogin && hasPrompt && !setupSent) {
-                    setupSent = true
-                    guestSetupDone = true
-                    if (cmd.isBlank()) {
-                        session.appendSynthetic("[App] 手机桥未启动，无法自动安装 Guest Harness；请点复制 QEMU guest 手机桥命令手动执行。")
-                    } else {
-                        session.appendSynthetic("[App] guest shell 已就绪，开始安装 phone bridge + Guest Harness")
-                        delay(300)
-                        session.write(cmd)
-                    }
-                    break
-                }
+
+                // 注意：不能一看到 AICHAT_SETUP_BEGIN 就退出循环AICHAT_DSH_URL / AICHAT_DSH_OK
+                // 是脚本末尾才打印的，提前退出会导致抓不到 URL（DS Harness 页就一直显示旧界面）。
+                if (setupBegun && (tail.contains("AICHAT_SETUP_DONE") || tail.contains("AICHAT_DSH_FAIL"))) break
                 delay(1200)
             }
         }
     }
+
+    /** 去掉 ANSI 转义序列，便于识别 shell 提示符 / login 提示。 */
+    private fun stripAnsi(text: String): String =
+        if (text.indexOf('\u001B') < 0) text else text.replace(ANSI_ESCAPE, "")
 
     @Synchronized
     fun stopSession() {

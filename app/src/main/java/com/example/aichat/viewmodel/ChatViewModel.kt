@@ -525,13 +525,63 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** 审计 + 溯源：最终答案落盘前调用，返回 (带标注的最终文本, 溯源标签, 工具步骤快照) */
     private fun finalizeAnswer(text: String, convId: String): Triple<String, List<String>?, List<AgentStep>?> {
         val roundSteps = turnStepsFor(convId)
-        val warnings = AnswerAuditor.check(text, roundSteps, activePersonaId)
-        val finalText = if (warnings.isEmpty()) text
-            else text + "\n\n" + warnings.joinToString("\n")
+        // 人物卡：解析本轮 <<CARD_UPDATE>> 增量并落盘；块永远从可见文本里去掉
+        val committed = if (activePersonaId == "fortune") {
+            try { CardStore.commitAnswer(getApplication(), cardKeyFor(convId), text) }
+            catch (_: Exception) { com.example.aichat.data.CardCommitResult(text = text, card = null) }
+        } else {
+            com.example.aichat.data.CardCommitResult(text = text, card = null)
+        }
+        val visible = committed.text
+        val card = committed.card ?: (if (activePersonaId == "fortune") CardStore.load(getApplication(), cardKeyFor(convId)) else null)
+        val hasImage = try {
+            storage.getConversation(convId)?.messages?.lastOrNull { it.role == "user" }?.imageUri != null
+        } catch (_: Exception) { false }
+        val warnings = AnswerAuditor.check(visible, roundSteps, activePersonaId, card, recentContextText(convId), hasImage)
+        val finalText = if (warnings.isEmpty()) visible
+            else visible + "\n\n" + warnings.joinToString("\n")
+        if (committed.card != null || committed.parsed != "none") refreshPersonCard()
         val toolSteps = roundSteps.filter { it.type == "tool_call" || it.type == "tool_result" }
             .takeIf { it.isNotEmpty() }
         return Triple(finalText, buildToolBadges(roundSteps), toolSteps)
     }
+
+    // ==================== 人物卡（命理师）====================
+
+    /** 卡片 key：优先用最近一次排盘的指纹（同一个人换会话也能接上），否则退回按会话隔离 */
+    private fun cardKeyFor(convId: String): String {
+        val paipan = try {
+            storage.getConversation(convId)?.messages?.lastOrNull { it.paipanData != null }?.paipanData
+        } catch (_: Exception) { null }
+        return CardStore.fingerprintOf(paipan) ?: ("conv:" + convId)
+    }
+
+    /** 最近几轮原文，供审计器核对"引用的原句是否真的存在" */
+    private fun recentContextText(convId: String): String = try {
+        storage.getConversation(convId)?.messages?.takeLast(6)?.joinToString("\n") { it.content }.orEmpty().take(4000)
+    } catch (_: Exception) { "" }
+
+    /** UI 刷新信号（卡片面板/条数变化时 +1） */
+    var personCardRevision by mutableStateOf(0)
+        private set
+
+    fun refreshPersonCard() { personCardRevision++ }
+
+    fun personCardKey(): String = currentCardKey()
+    fun currentCardKey(): String = cardKeyFor(currentConvId)
+    fun personCard(): PersonCard? = try { CardStore.load(getApplication(), currentCardKey()) } catch (_: Exception) { null }
+    fun cardConfirm(id: String) { CardStore.setState(getApplication(), currentCardKey(), id, "active"); refreshPersonCard() }
+    fun cardReject(id: String) { CardStore.setState(getApplication(), currentCardKey(), id, "rejected"); refreshPersonCard() }
+    fun cardRemove(id: String) { CardStore.remove(getApplication(), currentCardKey(), id); refreshPersonCard() }
+    fun cardAddManual(cat: String, text: String) { CardStore.addManual(getApplication(), currentCardKey(), cat, text); refreshPersonCard() }
+    fun cardExport(): String = CardStore.exportJson(getApplication(), currentCardKey())
+    fun faceReport(): String = CardStore.exportFaceReport(getApplication(), currentCardKey())
+    fun cardImport(payload: String): Int {
+        val n = CardStore.importJson(getApplication(), payload)
+        refreshPersonCard()
+        return n
+    }
+    fun cardSelfTest(): List<String> = CardStore.selfTest()
 
     fun currentConversationId(): String = currentConvId
 
@@ -662,8 +712,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // 本对话自己的消息列表，不依赖共享 UI 状态
             var myMsgs = storage.getConversation(myConvId)?.messages ?: emptyList()
             // 未配置独立视觉模型时，直接把图片按 OpenAI 多模态格式发给当前模型
-            val directImageDataUri =
-                if (imageUri != null && effectiveProfile.visionModel.isBlank()) imageToDataUri(imageUri) else null
+            // 命理师看相：强制走主模型多模态（用户指定），并用带辅助参照线的版本
+            val directImageDataUri = when {
+                imageUri == null -> null
+                activePersonaId == "fortune" -> faceImageToDataUri(imageUri)
+                effectiveProfile.visionModel.isBlank() -> imageToDataUri(imageUri)
+                else -> null
+            }
             try {
                 // 新消息时清空本对话的计划状态（除非正在执行计划）；不影响其他并行对话
                 if (planStateOf(myConvId).phase != PlanPhase.EXECUTING) {
@@ -821,6 +876,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val memoryLimit = if (activePersonaId == "fortune") 400 else 1500
                     preHistorySystemMsgs.add(ChatMessageDto(role = "system",
                         content = "## 用户记忆\n\n以下是之前对话中记录的偏好和习惯，请在思考和决策时参考：\n\n${memory.take(memoryLimit)}"))
+                }
+
+                // 命理师：注入人物卡（只带与当前问题相关类别 + 待确认/冲突/反例，避免卡片吃满上下文）
+                if (activePersonaId == "fortune") {
+                    try {
+                        val ck = cardKeyFor(myConvId)
+                        val rendered = CardStore.render(CardStore.load(getApplication(), ck), content)
+                        if (rendered.isNotBlank()) {
+                            dynamicSystemMsgs.add(ChatMessageDto(role = "system", content = rendered))
+                        }
+                    } catch (_: Exception) { }
                 }
 
                 // 相对稳定的系统消息先放入，再接历史，尽量延长可缓存前缀
@@ -1016,7 +1082,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         // API 上下文里保持原文（审计标注只给用户看，不进上下文）
                         conversationDtos.add(ChatMessageDto(
                             role = "assistant",
-                            content = display,
+                            content = if (activePersonaId == "fortune")
+                                com.example.aichat.data.CardStore.splitBlock(display).first else display,
                             reasoningContent = if (thinkingMode) finalThink.takeIf { it.isNotBlank() } else null
                         ))
                         finishReason = "stop"
@@ -1575,6 +1642,155 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
     }
 
     // --- 视觉 API（直接走 OkHttp，绕过 Retrofit URL 前缀问题）---
+
+    /**
+     * 面相专用图片处理：
+     *  1) EXIF 方向纠正 -> 长边缩到 1280（只做几何变换，不美颜/不锐化）
+     *  2) 本地人脸检测（android.media.FaceDetector，零依赖）：仅用于**几何**
+     *     检出脸框就裁切放大，并把参照线画在"脸部"而不是画面上
+     *  3) 叠辅助参照：脸部框(绿) + 脸部三等分线(青) + 10x10 网格(白) + 中轴(黄)
+     *  注意：**不做任何照片质量判断**（偏暗/过曝/侧脸/多人都不下结论）质量由模型自己看，
+     *  系统只在几何层面给参照物，避免本地启发式把模型卡住。
+     */
+    private fun faceImageToDataUri(path: String): String? {
+        if (path.startsWith("data:") || path.startsWith("http")) return path
+        return try {
+            val f = java.io.File(path)
+            if (!f.exists()) return null
+            val bytes = f.readBytes()
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 1280) sample *= 2
+            val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+            var bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+            // EXIF 方向纠正
+            try {
+                @Suppress("DEPRECATION")
+                val exif = android.media.ExifInterface(path)
+                @Suppress("DEPRECATION")
+                val ori = exif.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)
+                val m = android.graphics.Matrix()
+                when (ori) {
+                    6 -> m.postRotate(90f)
+                    3 -> m.postRotate(180f)
+                    8 -> m.postRotate(270f)
+                }
+                if (!m.isIdentity) {
+                    val rotated = android.graphics.Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                    if (rotated !== bmp) { bmp.recycle(); bmp = rotated }
+                }
+            } catch (_: Exception) { }
+
+            // 3) 人脸检测（可能检出 0 张：侧脸/遮挡/艺术照都会漏）
+            var faceRect: android.graphics.RectF? = null
+            try {
+                val w = bmp.width
+                val h = bmp.height
+                val b565 = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.RGB_565)
+                android.graphics.Canvas(b565).drawBitmap(bmp, 0f, 0f, null)
+                val fd = android.media.FaceDetector(w, h, 3)
+                val arr = arrayOfNulls<android.media.FaceDetector.Face>(3)
+                val n = fd.findFaces(b565, arr)
+                b565.recycle()
+                val faces = arr.filterNotNull().take(n.coerceAtLeast(0))
+                if (faces.isNotEmpty()) {
+                    val face = faces[0]
+                    val mid = android.graphics.PointF()
+                    face.getMidPoint(mid)
+                    val eyeDist = face.eyesDistance()
+                    val halfW = eyeDist * 1.7f
+                    val halfH = eyeDist * 2.4f
+                    faceRect = android.graphics.RectF(
+                        (mid.x - halfW).coerceAtLeast(0f),
+                        (mid.y - halfH).coerceAtLeast(0f),
+                        (mid.x + halfW).coerceAtMost(w.toFloat()),
+                        (mid.y + halfH).coerceAtMost(h.toFloat())
+                    )
+                }
+            } catch (_: Exception) { }
+
+            // 3.5) 有脸框就裁切放大（脸占比更大，细节更清楚）
+            val fr = faceRect
+            var canvasBmp = bmp
+            if (fr != null && fr.width() > 60f && fr.height() > 60f) {
+                val mx = fr.width() * 0.25f
+                val my = fr.height() * 0.25f
+                val x0 = (fr.left - mx).coerceAtLeast(0f).toInt()
+                val y0 = (fr.top - my).coerceAtLeast(0f).toInt()
+                val x1 = (fr.right + mx).coerceAtMost(bmp.width.toFloat()).toInt()
+                val y1 = (fr.bottom + my).coerceAtMost(bmp.height.toFloat()).toInt()
+                if (x1 - x0 > 80 && y1 - y0 > 80) {
+                    canvasBmp = android.graphics.Bitmap.createBitmap(bmp, x0, y0, x1 - x0, y1 - y0)
+                }
+            }
+
+            val w = canvasBmp.width
+            val h = canvasBmp.height
+            if (w <= 0 || h <= 0) return null
+            val out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(out)
+            canvas.drawBitmap(canvasBmp, 0f, 0f, null)
+
+            val grid = android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(60, 255, 255, 255)
+                strokeWidth = 1f
+            }
+            for (i in 1 until 10) {
+                val x = w * i / 10f
+                val y = h * i / 10f
+                canvas.drawLine(x, 0f, x, h.toFloat(), grid)
+                canvas.drawLine(0f, y, w.toFloat(), y, grid)
+            }
+
+            // 参照线：裁到脸就用"脸部框"画线（真三停参照），否则退回画面三等分
+            val box = if (fr != null && canvasBmp !== bmp) {
+                android.graphics.RectF(
+                    (fr.left * w / bmp.width.toFloat()),
+                    (fr.top * h / bmp.height.toFloat()),
+                    (fr.right * w / bmp.width.toFloat()),
+                    (fr.bottom * h / bmp.height.toFloat())
+                )
+            } else if (fr != null) {
+                fr
+            } else null
+
+            val thirds = android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(210, 0, 229, 255)
+                strokeWidth = 2f
+            }
+            val axis = android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(210, 255, 235, 59)
+                strokeWidth = 2f
+            }
+            if (box != null) {
+                val bx = android.graphics.Paint().apply {
+                    color = android.graphics.Color.argb(180, 76, 255, 120)
+                    strokeWidth = 2f
+                    style = android.graphics.Paint.Style.STROKE
+                }
+                canvas.drawRect(box, bx)
+                for (i in 1..2) {
+                    val y = box.top + box.height() * i / 3f
+                    canvas.drawLine(box.left, y, box.right, y, thirds)
+                }
+                canvas.drawLine(box.centerX(), box.top, box.centerX(), box.bottom, axis)
+            } else {
+                for (i in 1..2) {
+                    val y = h * i / 3f
+                    canvas.drawLine(0f, y, w.toFloat(), y, thirds)
+                }
+                canvas.drawLine(w / 2f, 0f, w / 2f, h.toFloat(), axis)
+            }
+
+            if (canvasBmp !== bmp) canvasBmp.recycle()
+            bmp.recycle()
+            val bos = java.io.ByteArrayOutputStream()
+            out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 88, bos)
+            out.recycle()
+            "data:image/jpeg;base64," + android.util.Base64.encodeToString(bos.toByteArray(), android.util.Base64.NO_WRAP)
+        } catch (_: Exception) { null }
+    }
 
     /** 把本地图片转成 data URI；大图先按最长边 1600 压缩，避免请求体过大 */
     private fun imageToDataUri(path: String): String? {

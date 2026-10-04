@@ -128,11 +128,14 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                     )
                     Spacer(Modifier.height(10.dp))
                     Text(
-                        "Guest Harness: " + when {
-                            vmOutput.contains("AICHAT_HARNESS_OK") -> " 已就绪，可以打开 DS Harness"
-                            vmOutput.contains("AICHAT_HARNESS_FAIL") -> " 安装失败，请看下方串口日志"
-                            vmOutput.contains("AICHAT_HARNESS_NO_PYTHON") -> " Python 安装失败，请看串口日志"
-                            else -> " 等待 guest 自动安装（通常 1-3 分钟）"
+                        "Guest 环境: " + when {
+                            vmOutput.contains("AICHAT_DSH_OK") -> " DeepSeek Harness 已就绪"
+                            vmOutput.contains("AICHAT_DSH_FAIL") -> " DSH 启动失败，请看下方串口日志"
+                            vmOutput.contains("AICHAT_DSH_BEGIN") -> " 正在解压并启动 DeepSeek Harness ..."
+                            vmOutput.contains("AICHAT_TOOLCHAIN_OK") -> " node / pnpm / git 已就绪（准备 DSH）"
+                            vmOutput.contains("AICHAT_TOOLCHAIN_FAIL") -> " 工具链安装失败，请看下方串口日志"
+                            vmOutput.contains("AICHAT_TOOLCHAIN_BEGIN") -> " 正在安装 node / pnpm / git ..."
+                            else -> " 等待 guest 自动安装（首次通常 1-3 分钟）"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -204,7 +207,8 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 ) { Text("3. 释放内核/ISO", maxLines = 1) }
 
                 OutlinedButton(
-                    enabled = !busy && manager.rootfsInstalled() && manager.qemuInstalled() && manager.imagesReady() && !manager.diskReady(),
+                    enabled = !busy && manager.rootfsInstalled() && manager.qemuInstalled() && manager.imagesReady() &&
+                            (!manager.diskReady() || (manager.preinstallImageReady() && !manager.preinstalledDiskLive())),
                     onClick = {
                         busy = true
                         scope.launch {
@@ -222,18 +226,31 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(
-                    enabled = !running && manager.abiSupported() && manager.qemuInstalled() && manager.imagesReady() && manager.diskReady(),
+                    enabled = !running && manager.abiSupported() && manager.qemuInstalled() && manager.imagesReady() &&
+                        (manager.diskReady() || manager.preinstallImageReady()),
                     onClick = {
-                        val s = manager.startSession()
-                        if (s == null) {
-                            appendLog("启动失败：环境不完整")
-                        } else {
-                            log = ""
-                            session = s
-                            appendLog("QEMU 已启动，等待内核/initramfs 输出...")
-                            appendLog("QEMU 参数: " + manager.buildQemuArgs().joinToString(" "))
+                        scope.launch {
+                            // 内置预装系统镜像：第一次点"启动 VM"时自动展开（含 node/pnpm/git/DSH）
+                            if (manager.preinstallImageReady() && !manager.preinstalledDiskLive()) {
+                                appendLog("正在展开内置预装系统（node/pnpm/git/DeepSeek Harness，首次 30-60 秒）...")
+                                val r = manager.installPreinstalledDisk { msg -> scope.launch { appendLog(msg) } }
+                                if (r.isFailure) {
+                                    appendLog("展开预装系统失败：" + (r.exceptionOrNull()?.message ?: "未知错误"))
+                                    refreshStatus()
+                                    return@launch
+                                }
+                            }
+                            val s = manager.startSession()
+                            if (s == null) {
+                                appendLog("启动失败：环境不完整")
+                            } else {
+                                log = ""
+                                session = s
+                                appendLog("QEMU 已启动，等待内核/initramfs 输出...")
+                                appendLog("QEMU 参数: " + manager.buildQemuArgs().joinToString(" "))
+                            }
+                            refreshStatus()
                         }
-                        refreshStatus()
                     }
                 ) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null)

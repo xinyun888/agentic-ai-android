@@ -44,3 +44,5 @@ app/src/main/assets/qemu/
 app/src/main/assets/qemu-x86_64/
 app/src/main/assets/vm/
 app/src/main/assets/guest-apks/
+# dsh 预装磁盘与 bundle 合计约 395MB，超 GitHub 单文件 100MB 上限，禁止入库
+app/src/main/assets/dsh/

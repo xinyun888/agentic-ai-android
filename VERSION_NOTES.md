@@ -1,3 +1,301 @@
+## v2.61.27（面相报告导出 + guest 脚本重跑修复）
+
+### 新增：面相报告导出
+- 人物卡面板新增 **「面相报告」** 按钮：生成 markdown 报告  复制到剪贴板 + 弹系统分享（发微信/文件/备忘录）
+- 报告结构：**一、客观特征（观测）**（按部位分组，带置信度与来源） **二、解读（含依据 卡[id]）** 
+  **三、八字与面相互证**（双向：面相引用八字 / 八字引用面相） **四、待确认/冲突/反例** + 免责声明
+- 卡片从不存图，报告也不含图片；纯函数 `buildFaceReport(card)` 可离线自检（新增第 17 组用例）
+
+### 修复：guest 脚本重跑会误报 DSH 失败（真机隐患）
+- 现象：脚本被重跑（App 超时重试 / 手动再执行）时会**再起一个 `dsh web`**，端口 3080 被占  新实例报错并
+  把 `/tmp/dsh-web.log` **覆盖**掉  token 丢失  界面误报 `AICHAT_DSH_FAIL`（其实 DSH 一直正常运行）
+- 修复：
+  - 启动前检查 `/tmp/dsh-web.log` 里已有 `token=`  打印 `AICHAT_DSH_REUSE` 直接复用，不再重启
+  - 日志改为追加（`>>`）而不是覆盖
+  - 转发进程写 `/tmp/dsh-forward.pid`，重跑时 `kill -0` 检查存活  复用，避免抢占 8000 端口
+
+- versionCode 303 / versionName 2.61.27
+
+## v2.61.26（面相加强：几何参照 + 对称/互证 + 直接分析）
+
+### 图片管线（全部本地、零新依赖、**不做质量判断**）
+- **人脸检测只用于几何**（`android.media.FaceDetector`）：检出脸框就裁切放大，并把参照线画在"脸部"
+- 参照线：绿框(脸框) + 脸部三等分线(青) + 中轴(黄) + 10x10 网格(白)；没有脸框才退回画面三等分
+- **已按要求撤掉所有本地质量结论**（偏暗/过曝/侧脸/多人/头部偏转一律不下结论、也不注入提示）
+  照片质量交给模型自己判断，系统只在几何层面给参照物，避免本地启发式把模型卡住
+- EXIF 方向纠正 + 长边 1280；**不美颜/不磨皮/不锐化**
+
+### 提示词升级
+- 结果分**几何类**（三停占比%、脸宽长比、眉眼距眼宽几倍、鼻宽/脸宽、下颌角）+ **印象类**（浓淡/光泽/气色/神态）
+- **左右对称检查**：以中轴为参照逐项比较（眉高/眼大小/嘴角/颧骨/下颌线），用可核对的说法
+- **八字面相互证映射表**（伤官旺眉眼锐利 / 印星重面部圆润 / 比劫旺轮廓硬朗 / 财星旺鼻挺唇厚 /
+  官杀重眉浓法令 / 身弱面部柔和），标注"一致/部分一致/不一致"
+- **用户明确说"直接分析/直接看/从面相分析/不用确认"时不再等确认**：同一轮里先给特征表、紧接着给解读，
+  末尾加一句"若某项特征与你不符，说一声我据此修正"
+
+### 审计补强
+- 新增硬规则：本轮没有照片却出现**面相测量数值**（上停/脸宽/眉眼距 + 数字） 拦
+
+### 验证
+- `CardStore.selfTest()` 16 组 PASS；面相 demo 5 个审计场景符合预期
+- 图片管线自检：EXIF / 人脸检测 / 裁切 / 脸部三等分 / 网格 / 中轴 均在；
+  已确认本地质量结论相关代码（偏暗/过曝/侧脸/多人提示）**全部移除**
+
+- versionCode 302 / versionName 2.61.26
+
+## v2.61.25（命理师面相：多模态看相 + 客观特征表 + 审计兜底）
+
+### 功能
+- **面相分析走主模型多模态**（用户指定）：命理师角色发照片时不走独立视觉模型，直接进主模型上下文
+- **图片预处理**：EXIF 方向纠正  长边缩到 1280  叠**辅助参照**（三等分横线 + 10x10 网格 + 中轴） JPEG 88
+  - 只做几何变换，**不做美颜/磨皮/锐化**（会改骨相与纹理，影响看相）
+  - 提示词明确：这是**画面**三等分不是脸部三等分，要求先用网格坐标报告关键位置（发际线 R2.5、眉心 R4）
+- **强制两段式**（防幻视）：
+  1. 拍摄质量检查（不合格要求重拍，不硬看）+ **逐部位客观特征表**（部位｜观察值｜置信度，看不清就写看不清）
+  2. 用户核对后才解读；每条结论必须引用 `卡[面相-额#f1]` 这类观测条目
+- **结构化成人物卡**：新增 `面相-部位` 类别（脸型/三停/额/眉/眼/鼻/颧/法令/口/下巴/痣纹/气色）、
+  新类型 `观测`、新字段 `source`（图1/正面 之类）；面板按类别自动分组显示，导出导入沿用
+- 与八字**互证**：并列不强行统一
+
+### 审计（零 token，4 条新规则）
+1. 硬：本轮没有照片却给面相结论  "无法核对，请勿采信"
+2. 软：提到面相部位但没有对应「观测」条目  "缺乏支撑，建议先给特征表"
+3. 硬：**健康/疾病诊断**（"你肝不好"） 拦
+4. 硬：**年龄/性别/身份判断、整容/医美建议**  拦
+
+### 验证
+- `CardStore.selfTest()` 扩到 **16 组**（新增面相类别透传/来源保留/问面相时可渲染），JVM 直跑 **PASS**
+- 面相端到端 demo（JVM）：
+  - 观测入卡  类别落成 `面相额`/`面相眉`、`source=图1/正面` 保留 
+  - 问"帮我看看面相"  注入片段含 `面相*` 条目 + `来源:图1/正面` 
+  - 审计：无照片给结论硬告警  / 有照片+有观测无告警  / 肝不好硬告警  / 看年龄+整容硬告警  / 无观测支撑的部位软提示 
+
+### 本轮修掉的问题
+- 模型只写 `cat="面相"` 而部位在正文时，类别没落到具体部位  `normalizeEntry()` 从正文推导（并在 `merge` 内统一归一化，覆盖 JSON 解析与直接构造两条路径）
+- 自检期望值里的 `` 被编码吞掉导致误报  改用 `\u00B7` 转义
+
+- versionCode 301 / versionName 2.61.25
+
+## v2.61.24（命理师：人物卡 + 适度联想 + 引用校验）
+
+### 新增能力
+- **人物卡（有出处、可增量维护）**：`data/PersonCard.kt`（CardStore）
+  - 排盘确认后建卡，按八字指纹隔离（换会话也能接上）；每条带 类别/结论/类型(自述命盘联想)/强度(明确倾向待确认)/**逐字原句+轮次**
+  - 三类来源可区分；联想默认"待确认"；**反例**（counter）自动降级该条 + **联动降级**依赖它的联想
+  - 冲突不覆盖，新旧并列交用户裁决；每类目上限 8 条，超出合并为"历史摘要"；单轮增量硬上限 6 条
+  - 每轮只注入**相关类别 + 待确认/冲突/反例**（省 token，不翻原文）
+- **允许适度联想**：提示词新增「人物卡与上下文联想规则」16 条依据 卡[id] + 推理链、默认 1 跳最多 2 跳、
+  自动联想（先"接上文"再分析）、联想不得覆盖命盘、负面结论要建设性+给补位方案、可证伪+给验证问题、
+  敏感领域只给倾向+建议、每轮最多问一个聚焦问题
+- **卡片面板 UI**（聊天输入框上方入口）：查看全部条目 + 一键 `对/不对/删除` + `导出/导入`（格式 `AICHAT_CARD_V1`）
+- **增量协议**：模型回答末尾附 `<<CARD_UPDATE>>{json}<<END>>`，App 解析合并后从可见文本里剔除
+
+### 解析与校验（零 token）
+- 三级降级解析：strict JSON  修复(去 code fence/尾逗号)  正则抽取三元组；全失败只去块不动卡片
+- `AnswerAuditor` 新增 4 条规则（软/硬分级）：
+  - 硬：引用 `卡[id]` 但条目不存在  "凭空引用"
+  - 软：有【推断】无依据 / 引用原句在卡片与最近上下文都找不到 / 把"联想"说成命盘结论
+
+### 自检与验证
+- `CardStore.selfTest()` 14 组回归用例（指纹、拆块、三级解析、去重合并、确认、反例、**反例联动**、
+  冲突、溢出合并、单轮上限、渲染、引用校验、未知 id 容错）；debug 启动自动跑并打日志
+- 已用 JVM 直跑：`SELF-TEST PASS`；并用你的例子端到端验证：
+  「我性子比较急」+「做事急躁」（去重合并成 1 条，两句原句都留） 问职业（生成联想条目，依据 卡[x1]）
+   用户说「我其实挺能坐得住」（反例：本条 + 依赖它的联想一起降级为待确认）
+   审计器：引用 卡[x9] 报硬告警、正常引用无告警、编造原句报软提示
+
+### 本轮修掉的 3 个 bug（demo 抓到）
+1. 「做事急躁」与「性子急」不合并（相似度阈值 0.8 太死） 0.6 + 同域特征词命中
+2. 正则兜底把 "原句: " 吞进结论正文  `cutAtKeys()` 截断
+3. 反例只降级自身，依赖它的联想不降级  反例联动降级
+
+- versionCode 300 / versionName 2.61.24
+
+## v2.61.23（真机验证通过 + 脚本加固 + 自动进 QEMU 模式）
+
+- **真机实测全链路成功**（用户手机，磁盘启动）：
+  `AICHAT_TOOLCHAIN_OK`  `dsh 0.2.0-rc.2`  `AICHAT_DSH_OK` 
+  `AICHAT_DSH_URL=http://127.0.0.1:18000/?token=...`  `AICHAT_SETUP_DONE`
+- guest 脚本加固：
+  - 模型配置改用 `printf` 写（不再用 heredoc，避免终止符问题把后续启动代码吞掉）
+  - 打印 `AICHAT_DSH_CONFIG_WRITTEN` / `AICHAT_DSH_WAIT=30s` 进度 + DSH 日志尾行，便于排错
+  - 转发脚本已存在时不再重写
+- DS Harness 页：若 DSH 已就绪（`DshState.ready`）**默认直接进入 QEMU 模式**，省一次点击
+- versionCode 299 / versionName 2.61.23
+
+## v2.61.22（磁盘启动失败自动回退 Live）
+
+- 磁盘启动看门狗超时（900s 仍未进 shell）时**自动切回 Live 模式**重试：
+  `setDiskBootEnabled(false)` + 重新以 Live ISO + 离线 apk + DSH 包安装（已验证的流程），
+  预装镜像仍保留在 `/vm/alpine.qcow2`，之后仍可用「当前:磁盘」切回
+- 背景：预装镜像在真实 aarch64 QEMU（PC，App 相同参数）90 秒进 login、`dsh web` 正常；
+  但 Android 模拟器上 PRoot 拦截磁盘 I/O 导致卡在 `Mounting root`（实测 30 秒内 stime 25s vs utime 14s），
+  属于环境极端情况，加自动回退兜底
+- versionCode 298 / versionName 2.61.22
+
+## v2.61.21（预装镜像改为"解压后的普通 qcow2" + 磁盘启动看门狗放宽）
+
+- 预装镜像资源改为 **gzip 过的未压缩 qcow2**（253MB，比压缩 qcow2 还小）：
+  App 展开时解压一次（`GZIPInputStream`），之后 guest 读写就是普通镜像。
+  原因：**压缩 qcow2 在 PRoot 下逐簇解压极慢**模拟器实测卡在 `Mounting root:` 十几分钟
+  （同一镜像在 PC 上用 App 完全相同的 QEMU 参数 90 秒就进 login）。
+- 磁盘启动看门狗 240s  **900s**（完整 OpenRC + ext4 journal 回放比 Live 快启慢得多）
+- versionCode 297 / versionName 2.61.21
+
+## v2.61.20（点"启动 VM"即自动展开预装系统）
+
+- 「启动 VM」按钮：如果检测到内置预装镜像还没展开（缺 `.preinstalled` 标记），
+  自动先展开到 `/vm/alpine.qcow2`（含 node/pnpm/git/DSH）再启动，用户只需点一次
+- 「4. 创建磁盘」按钮在预装镜像未展开时也保持可用（不再是"已有空磁盘就禁用"）
+- 启动按钮可用条件放宽为 `diskReady() || preinstallImageReady()`
+- versionCode 296 / versionName 2.61.20
+
+## v2.61.19（内置"预装系统"磁盘镜像：首次 30-60 秒直接可用）
+
+- 新增 `assets/dsh/preinstall-disk.qcow2.bin`（286.8MB，压缩 qcow2）：
+  一台真正装好的 aarch64 Alpine  `node v24.18.1 / npm / pnpm / git / bash`
+  + `@deepseek-ai/dsh@0.2.0-rc.2`（/opt/dsh，实测 `dsh web` 正常输出带 token 的 URL）
+  + `dsh-forward.js`（0.0.0.0:8000  127.0.0.1:3080 转发）
+- 点「创建磁盘」= 展开这个镜像到 `/vm/alpine.qcow2` 并自动切磁盘启动；
+  开机后 Guest 脚本只需写模型配置 + 起 DSH，**不再需要装任何东西、也不需要联网**
+- 实测：`dsh web: http://127.0.0.1:3080/?token=...`（磁盘镜像内启动成功）
+- 需要说明的两个坑（已解决）：
+  1. 第一次做镜像时 DSH 起不来，报 `SyntaxError: Unexpected end of JSON input`（`collectInstallationScopePackages`）
+      根因是解压时 tar 被截断，留下空的 `package.json`；重新完整解压后正常
+  2. `setup-disk` 装盘后必须补内核模块（见 v2.61.18），否则磁盘模式没网络
+- 若镜像缺失，自动回退到旧流程（Live ISO + 离线 apk + DSH 包），不会坏
+- versionCode 295 / versionName 2.61.19
+
+## v2.61.18（内置预装系统镜像 + 修 3 个装盘致命 bug）
+
+- **新增 `assets/dsh/preinstall-disk.qcow2.bin`**：一台真正装好的 aarch64 Alpine（234MB）：
+  `node v24.18.1 / npm / pnpm / git / bash` + `@deepseek-ai/dsh@0.2.0-rc.2`（/opt/dsh）+
+  DSH 模型配置 + `dsh-forward.js`。点「创建磁盘」即展开为 `/vm/alpine.qcow2` 并自动切磁盘启动，
+  **首次 30-60 秒即可用，不需要装任何东西、不需要联网**
+- 磁盘模式下 `imagesReady()` 允许只靠预装镜像（ISO 可缺省）
+- **修 3 个"安装到磁盘"致命 bug**（实测发现）：
+  1. aarch64 上 `setup-disk` 默认要 `u-boot`（仓库没有） 加 `-B none`
+     （反正 App 用 `-kernel/-initrd` 直接引导，不需要 bootloader）
+  2. `init=/bin/sh` 快速模式没有 mdev 守护，分区后 `/dev/vdaX` 不出现  装盘前先起 `mdev -d`
+  3. **磁盘系统 `/lib/modules/<uname -r>` 为空**（setup-disk 装的是 CDN 最新内核，与 assets 内核不同版本）
+      `AF_PACKET`/`virtio_net` 全加载不了，磁盘模式完全没有网络  装盘后把 Live 的匹配模块树拷进目标根
+- 实测：Live 装盘  磁盘启动  DHCP 正常  离线装 node/DSH 成功（磁盘 755MB，压缩 234MB）
+- versionCode 294 / versionName 2.61.18
+
+## v2.61.17（首次运行自动"安装到磁盘"：DSH 与环境持久化）
+
+- DSH 就绪后，如果当前还是 Live ISO（`bootFromDisk=false`），App 自动：
+  1. 调 `installToDisk()`（手机桥的 `disk-install.sh` + `setup-disk`）把 Alpine 装到 `/dev/vda`
+  2. 成功后自动重启会话切到磁盘启动（`root=/dev/vda3`），无需手动操作
+  3. 磁盘模式下离线脚本会重跑一遍（node/DSH 装到磁盘根），之后**重启 VM 不再重新解压，
+     会话/设置/工作区都保留**
+- 失败时给出提示并继续用内存模式（不影响使用）
+- 只在首次触发一次；`bootFromDisk=true` 会持久保存，之后一直在磁盘模式
+- 说明：
+  - 装盘那一步的 `setup-disk` 需要联网（从 Alpine CDN 取 kernel/bootloader）；node/DSH 仍是离线包
+  - **工作区**：DSH 的 workspace 注册表由它自己的 API（`workspace.initializeDefault()` / 默认目录
+    `<Documents>/deepseek-harness`）在 Web UI 首次点击时创建，App 侧未找到可预置的配置/接口，
+    因此第一次仍需在 DSH Web UI 点一次「选择工作区」；装盘之后该选择会**永久保留**（只此一次）
+- versionCode 293 / versionName 2.61.17
+
+## v2.61.16（全离线集成：Node 工具链 + DeepSeek Harness，一键直达）
+
+- **下载全部内置**（APK 体积换开箱即用）：
+  - `assets/guest-apks/aarch64/`：nodejs / npm / pnpm / git / bash 及其依赖的 aarch64 Alpine 离线包
+    （合并 main+community 的 APKINDEX，共 41.7MB），guest 只从手机桥 `10.0.2.2` 装，**无需外网**
+  - `assets/dsh/dsh-bundle.tar.gz`：在 aarch64 Alpine 上真实编译好的 DeepSeek Harness
+    `@deepseek-ai/dsh@0.2.0-rc.2` 整棵依赖树（540 个包，124MB；koffi 已用 cmake 源码编译），
+    guest 解压到 `/opt/dsh`，无需 npm 安装、无需联网
+- **guest 自动流程**（`guestSetupScript`）：
+  1. 离线装 node/npm/pnpm/git/bash，打印版本 + `AICHAT_TOOLCHAIN_OK`
+  2. 从手机桥下载并解压 DSH，打印 `dsh 0.2.0-rc.2`
+  3. 预置模型：把 App 当前 API 配置写成 `~/.dsh/profiles/web/cordis.patch.yml`
+     （`llm-pi-ai` + `openai-completions`，key 走 `AICHAT_API_KEY` 环境变量）
+  4. 启动 `dsh --profile web --no-open --port 3080 --host 127.0.0.1`
+     （DSH 官方只允许 loopback；用 Node 写了一个 0.0.0.0:8000  127.0.0.1:3080 的 TCP 转发）
+  5. 就绪后打印 `AICHAT_DSH_OK` 和改写后的带 token URL（`http://127.0.0.1:18000/?token=...`）
+- **App 侧**：
+  - `DshState` 捕获 URL/就绪状态；DS Harness 页的 QEMU 模式直接内嵌 **WebView** 显示 DSH Web UI
+  - VM 默认内存 1024MB  **2048MB**（DSH + 解压需要）
+  - VM 页面状态：` 正在解压并启动 DeepSeek Harness ...` / ` DeepSeek Harness 已就绪`
+- **真机同构验证**（aarch64 Alpine + QEMU，走 App 同一份脚本 + 手机桥离线资源）：
+  ```
+  AICHAT_TOOLCHAIN_OK  node v24.18.1 / npm 11.12.1 / git 2.54.0 / pnpm 11.20.0
+  dsh-bundle.tar.gz 123M saved / dsh 0.2.0-rc.2
+  AICHAT_DSH_OK
+  AICHAT_DSH_URL=http://127.0.0.1:18000/?token=...
+  ```
+  PC 侧访问 hostfwd 返回 401（无 token 被安全栅栏拒绝，符合预期）
+- versionCode 292 / versionName 2.61.16
+
+## v2.61.15（VM 自动配置 node / pnpm / git 环境）
+
+- guest 自动安装脚本从"装 python3 + 内置 harness"改为安装 **Node 工具链**：
+  - 配置 Alpine 官方源（main/community）+ 手机桥离线源 + DNS
+  - `apk add --no-cache nodejs npm git`
+  - `npm install -g --prefix /usr/local pnpm@11.7.0`（版本与 DeepSeek Harness
+    桌面运行时一致；Alpine 上 npm 全局 bin 不在 PATH，脚本里加了 /usr/local/bin 兜底与软链）
+  - 依次打印版本并输出 `AICHAT_TOOLCHAIN_OK` / `AICHAT_TOOLCHAIN_FAIL`
+- VM 页面状态改成"Guest 环境"：
+  - ` 正在安装 node / pnpm / git ...`
+  - ` node / pnpm / git 已就绪`
+  - ` 工具链安装失败，请看下方串口日志`
+- 真机同构验证（aarch64 Alpine + QEMU，走 App 同一套短命令 + 同一份脚本）：
+  ```
+  AICHAT_TOOLCHAIN_BEGIN
+  node v24.18.1
+  npm  11.12.1
+  git  git version 2.54.0
+  pnpm 11.7.0
+  AICHAT_TOOLCHAIN_OK
+  ```
+- versionCode 291 / versionName 2.61.15
+
+## v2.61.14（真正的元凶：串口输出被 150ms 节流吞掉）
+
+- 用户实测：QEMU 启动正常，但终端停在 `/`；看门狗报"仍未检测到 shell"，harness 永远连不上。
+- 真机复现（Android 模拟器 + App 自带 PRoot/QEMU）：
+  - App 的 reader 线程停在 `pipe_read`（等数据），QEMU 的 TCG 线程停在 `futex_wait`（空闲），
+    即 guest 早已输出完、在等输入，但最后一批数据没进到 App 里。
+  - 根因：QemuSession 读取循环把 `_output` 发布做了 150ms 节流。若最后一批串口输出
+    落在节流窗口内、之后 guest 不再输出，这批数据就永远只在 StringBuilder 里，
+    `read()` 又一直阻塞，于是终端停在半行（`/`）、提示符 `~ #` 检测不到、
+    自动安装命令永远不发  时好时坏，取决于时序。
+- 修复：
+  - 每读到一块数据立即发布一次（去掉手动节流；StateFlow 会自行合并，Compose 每帧最多重绘一次）。
+- 另加兜底（针对提示符被切半行的情况）：
+  - 快速模式下只要看到 `Installing packages to root filesystem`，20 秒后即使用户提示符
+    没被识别出来，也直接发送安装命令；仍会在收不到 `AICHAT_SETUP_BEGIN` 时重发（最多 3 次）。
+- 模拟器实测（最恶劣情况：假 initramfs 只输出 `/" 且不给提示符）：
+  - 终端完整显示到最后一行；
+  - 20 秒后自动盲发 8 条安装命令，guest 逐条执行（`GOT: ...`）；
+  - 正常假 initramfs（有真实 `~ #` 提示符）下同样全链路通过。
+- versionCode 290 / versionName 2.61.14
+
+## v2.61.13（修复 QEMU 连不上 Guest Harness）
+
+- 用户实测：QEMU 跑起来了，但 DS Harness 一直「未连接 / 等待 guest 自动安装」，
+  guest-setup 永远不执行，harness 永远装不上。
+- 根因 1（致命）：App 向 guest 串口写命令时用 `\r` 结尾。guest 控制台是 icanon 规范
+  模式，getty/login 还会清掉 ICRNL，只有 LF 才能结束一行；只发 CR 时 `root`、
+  guest-setup 命令都停在行缓冲里不执行，所以既登录不上，harness 也装不上。
+  - 现在统一改发 `\n`。
+- 根因 2（致命）：guest 的 busybox ash 会在提示符后发 `ESC[6n` 查询光标位置，
+  `lastLine.endsWith("~ #")` 因此永远不成立，提示符检测一直失败。
+  - 现在识别前先剥掉 ANSI 转义序列再判断。
+- 根因 3：串口没有流控，PL011 RX FIFO 只有 16 字节。之前按 48 字节/25ms 灌 500+ 字符的
+  guest-setup 长命令会被静默丢字符写坏。
+  - 写入改成 12 字符分块 + 等 guest 回显确认后再发下一块；
+  - guest-setup 拆成多条短命令，并新增「等 AICHAT_SETUP_BEGIN，收不到就重发（最多 3 次）」。
+- 根因 4：部分机型完整 OpenRC 会卡在 firstboot 前，永远到不了 login。
+  - 默认改为快速模式（`init=/bin/sh`），跳过 OpenRC/getty/login；
+  - 安全模式也改用 `init=/bin/sh`；
+  - 看门狗 240 秒还没进 shell 时，自动停掉旧 QEMU 并改用快速模式重启一次，不再只提示。
+- 「安装到磁盘」的 wget/sh 也拆成两条短命令。
+- Windows QEMU 实测：快速模式约 5 秒进 `~ #`，约 11 秒出现 `AICHAT_HARNESS_OK`，
+  `127.0.0.1:18000/v1/models` 正常返回 `ds-harness`。
+- versionCode 289 / versionName 2.61.13
+
 ## v2.61.12（定位 OpenRC 卡死：单线程 TCG）
 
 - 用户实测：Alpine 完整 OpenRC 在部分设备卡在：

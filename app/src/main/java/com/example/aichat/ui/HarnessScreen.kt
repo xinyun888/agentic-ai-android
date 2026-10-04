@@ -20,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.example.aichat.data.ApiProfile
@@ -27,6 +28,7 @@ import com.example.aichat.data.ChatMessage
 import com.example.aichat.data.HttpClient
 import com.example.aichat.linux.PhoneBridgeHttpServer
 import com.example.aichat.viewmodel.ChatViewModel
+import com.example.aichat.vm.DshState
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -52,7 +56,7 @@ fun HarnessScreen(
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
-    var mode by remember { mutableStateOf("builtin") }
+    var mode by remember { mutableStateOf(if (com.example.aichat.vm.DshState.ready) "guest" else "builtin") }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -185,6 +189,18 @@ private fun BuiltinHarness(
 
 @Composable
 private fun GuestHarness(modifier: Modifier = Modifier) {
+    // Guest 里的 DeepSeek Harness（dsh web）一就绪，就直接内嵌它的 Web UI
+    var dshUrl by remember { mutableStateOf(DshState.webUrl) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            dshUrl = DshState.webUrl
+            delay(2000)
+        }
+    }
+    if (!dshUrl.isNullOrBlank()) {
+        DshWebView(dshUrl!!, modifier)
+        return
+    }
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("harness_client", Context.MODE_PRIVATE) }
     var baseUrl by remember { mutableStateOf(prefs.getString("baseUrl", "http://127.0.0.1:18000") ?: "") }
@@ -450,6 +466,30 @@ private fun GuestHarness(modifier: Modifier = Modifier) {
             dismissButton = { TextButton(onClick = { showSettings = false }) { Text("取消") } }
         )
     }
+}
+
+/** 内嵌 Guest 里 DeepSeek Harness 的 Web UI（带 token 的启动 URL 会自动换取签名 cookie）。 */
+@Composable
+private fun DshWebView(url: String, modifier: Modifier = Modifier) {
+    AndroidView(
+        modifier = modifier.fillMaxSize(),
+        factory = { ctx ->
+            WebView(ctx).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.databaseEnabled = true
+                settings.useWideViewPort = true
+                settings.loadWithOverviewMode = true
+                settings.allowFileAccess = false
+                settings.allowContentAccess = false
+                webViewClient = WebViewClient()
+                loadUrl(url)
+            }
+        },
+        update = { view ->
+            if (view.url != url) view.loadUrl(url)
+        }
+    )
 }
 
 private data class HarnessMsg(val role: String, val content: String)
