@@ -35,9 +35,14 @@ class ActiveModeService : Service() {
         const val ACTION_STOP = "com.example.aichat.ACTION_STOP_ACTIVE"
         const val ACTION_HEARTBEAT = "com.example.aichat.ACTION_ACTIVE_HEARTBEAT"
         const val ACTION_BOOT_RESUME = "com.example.aichat.ACTION_BOOT_RESUME"
+        /** 用户发消息：把对应对话的心跳档位重置回 20 秒 */
+        const val ACTION_USER_ACTIVITY = "com.example.aichat.ACTION_ACTIVE_USER_ACTIVITY"
         const val EXTRA_PERSONA_ID = "persona_id"
         const val EXTRA_CONV_ID = "conv_id"
-        const val EXTRA_INTERVAL_MIN = "interval_min"
+
+        /** 自适应心跳档位：0=20秒，1=1分钟，2=2分钟，3=3分钟，4=4分钟，5=5分钟（封顶） */
+        private val HEARTBEAT_DELAY_MS = longArrayOf(20_000L, 60_000L, 120_000L, 180_000L, 240_000L, 300_000L)
+        private const val MAX_HEARTBEAT_STEP = 5
         const val EXTRA_IMMERSIVE = "immersive"
         const val EXTRA_SHOW_THINKING = "show_thinking"
         const val EXTRA_START_HOUR = "start_hour"
@@ -50,11 +55,36 @@ class ActiveModeService : Service() {
         val runningConversations: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
         fun isRunning(personaId: String): Boolean = personaId in runningPersonas
+
+        /**
+         * 用户发消息时调用：找出该对话上的所有主动角色，清除退避并安排 20 秒后的下一跳。
+         * runningConversations 为空说明服务没运行（或本进程刚起还没 loadConfigs），直接忽略。
+         */
+        fun notifyUserActivity(context: Context, convId: String) {
+            if (convId.isBlank()) return
+            if (runningConversations.none { it == convId }) return
+            try {
+                val i = Intent(context, ActiveModeService::class.java).apply {
+                    action = ACTION_USER_ACTIVITY
+                    putExtra(EXTRA_CONV_ID, convId)
+                }
+                context.startService(i)
+            } catch (_: Exception) {}
+        }
     }
 
     private data class ActiveConfig(
-        val convId: String, val intervalMin: Int, val immersive: Boolean,
-        val showThinking: Boolean, val startHour: Int, val endHour: Int
+        val convId: String,
+        val immersive: Boolean,
+        val showThinking: Boolean,
+        val startHour: Int,
+        val endHour: Int,
+        /** 自适应心跳档位：0=20秒，1=1分钟，...，5=5分钟 */
+        val step: Int = 0,
+        /** 用户最近一次发消息时间；比 lastHeartbeatAt 新则说明上次心跳后用户回过话 */
+        val lastUserAt: Long = 0L,
+        /** 最近一次心跳触发时间 */
+        val lastHeartbeatAt: Long = 0L
     )
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -67,6 +97,8 @@ class ActiveModeService : Service() {
     private val personaConvs = ConcurrentHashMap<String, String>()
     /** personaId → 心跳配置，进程被杀后由闹钟恢复 */
     private val configs = ConcurrentHashMap<String, ActiveConfig>()
+    /** 序列化推进档位/用户发消息/注册闹钟三类操作，避免 20 秒与 5 分钟互相覆盖 */
+    private val scheduleLock = Any()
 
     private fun prefs() = getSharedPreferences("active_mode", MODE_PRIVATE)
 
@@ -76,7 +108,10 @@ class ActiveModeService : Service() {
             // getParameterized 显式构造泛型，绕开 R8 剥离签名导致的 Missing type parameter
             val type = com.example.aichat.data.GsonTypes.map(String::class.java, ActiveConfig::class.java)
             val map: Map<String, ActiveConfig> = gson.fromJson(json, type) ?: return
-            configs.putAll(map)
+            configs.putAll(map.mapValues { (_, cfg) ->
+                val step = if (cfg.lastUserAt > cfg.lastHeartbeatAt) 0 else cfg.step.coerceIn(0, MAX_HEARTBEAT_STEP)
+                cfg.copy(step = step)
+            })
             runningPersonas.addAll(map.keys)
             map.values.forEach { cfg -> if (cfg.convId.isNotBlank()) runningConversations.add(cfg.convId) }
         } catch (_: Exception) {}
@@ -116,12 +151,11 @@ class ActiveModeService : Service() {
         when {
             action == ACTION_START -> {
                 val convId = intent.getStringExtra(EXTRA_CONV_ID) ?: ""
-                val intervalMin = intent.getIntExtra(EXTRA_INTERVAL_MIN, 15)
                 val immersive = intent.getBooleanExtra(EXTRA_IMMERSIVE, false)
                 val showThinking = intent.getBooleanExtra(EXTRA_SHOW_THINKING, false)
                 val startHour = intent.getIntExtra(EXTRA_START_HOUR, 0)
                 val endHour = intent.getIntExtra(EXTRA_END_HOUR, 24)
-                startHeartbeat(personaId, convId, intervalMin, immersive, showThinking, startHour, endHour)
+                startHeartbeat(personaId, convId, immersive, showThinking, startHour, endHour)
             }
             action == ACTION_STOP -> {
                 stopHeartbeat(personaId)
@@ -129,6 +163,9 @@ class ActiveModeService : Service() {
             action == ACTION_HEARTBEAT -> {
                 // 闹钟唤醒，后台/被杀也能执行心跳
                 handleHeartbeat(personaId)
+            }
+            action == ACTION_USER_ACTIVITY -> {
+                markUserActivity(intent.getStringExtra(EXTRA_CONV_ID) ?: "")
             }
             action == ACTION_BOOT_RESUME -> {
                 if (configs.isEmpty()) {
@@ -235,22 +272,76 @@ class ActiveModeService : Service() {
         }
     }
 
+    /** 自适应心跳档位对应的间隔；比上次心跳后用户又发过消息时强制回到 20 秒档。 */
+    private fun effectiveStep(cfg: ActiveConfig): Int {
+        val step = cfg.step.coerceIn(0, MAX_HEARTBEAT_STEP)
+        return if (cfg.lastUserAt > cfg.lastHeartbeatAt) 0 else step
+    }
+
+    private fun heartbeatDelayMs(step: Int): Long =
+        HEARTBEAT_DELAY_MS[step.coerceIn(0, MAX_HEARTBEAT_STEP)]
+
+    private fun heartbeatDelayLabel(step: Int): String = when (step.coerceIn(0, MAX_HEARTBEAT_STEP)) {
+        0 -> "20秒"
+        1 -> "1分钟"
+        2 -> "2分钟"
+        3 -> "3分钟"
+        4 -> "4分钟"
+        else -> "5分钟"
+    }
+
     private fun scheduleAlarm(personaId: String) {
-        val cfg = configs[personaId] ?: return
-        val am = getSystemService(ALARM_SERVICE) as AlarmManager
-        val at = System.currentTimeMillis() + cfg.intervalMin * 60_000L
-        // Android 12+ 精确闹钟可能被用户拒绝，检测后降级为普通闹钟
-        val canExact = android.os.Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
-        try {
-            if (canExact) {
-                // 精确闹钟，Doze 下也能触发
-                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
-            } else {
-                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+        synchronized(scheduleLock) {
+            val cfg = configs[personaId] ?: return
+            val step = effectiveStep(cfg)
+            if (cfg.step != step) {
+                // 用户消息后进程重启等场景：把回到 20 秒的状态落盘，防止下一次心跳直接跳回大间隔
+                configs[personaId] = cfg.copy(step = step)
+                saveConfigsToPrefs()
             }
-        } catch (_: Exception) {
-            try { am.set(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
-            catch (_: Exception) {}
+            val am = getSystemService(ALARM_SERVICE) as AlarmManager
+            val at = System.currentTimeMillis() + heartbeatDelayMs(step)
+            // Android 12+ 精确闹钟可能被用户拒绝，检测后降级为普通闹钟
+            val canExact = android.os.Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()
+            try {
+                if (canExact) {
+                    // 精确闹钟，Doze 下也能触发
+                    am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+                } else {
+                    am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId))
+                }
+            } catch (_: Exception) {
+                try { am.set(AlarmManager.RTC_WAKEUP, at, buildHeartbeatPI(personaId)) }
+                catch (_: Exception) {}
+            }
+        }
+    }
+
+    /** 用户发消息：对应对话里所有主动角色清空退避，立即回到 20 秒档。 */
+    private fun markUserActivity(convId: String) {
+        if (convId.isBlank()) return
+        val now = System.currentTimeMillis()
+        var changed = false
+        synchronized(scheduleLock) {
+            for ((personaId, cfg) in configs.entries) {
+                if (cfg.convId != convId) continue
+                configs[personaId] = cfg.copy(step = 0, lastUserAt = now)
+                cancelAlarm(personaId)
+                scheduleAlarm(personaId)
+                changed = true
+            }
+            if (changed) saveConfigsToPrefs()
+        }
+        if (!changed) return
+        // 通知放在锁外，避免持锁做 Binder/系统调用
+        for ((personaId, cfg) in configs.entries) {
+            if (cfg.convId != convId) continue
+            val persona = Personas.getByIdWithCustom(personaId, this)
+            updateNotification(
+                2000 + Math.floorMod(personaId.hashCode(), 1000),
+                "${persona.emoji} ${persona.name}",
+                "收到新消息，20秒后继续"
+            )
         }
     }
 
@@ -260,7 +351,7 @@ class ActiveModeService : Service() {
     }
 
     private fun startHeartbeat(
-        personaId: String, convId: String, intervalMin: Int, immersive: Boolean,
+        personaId: String, convId: String, immersive: Boolean,
         showThinking: Boolean, startHour: Int, endHour: Int
     ) {
         val persona = Personas.getByIdWithCustom(personaId, this)
@@ -268,34 +359,53 @@ class ActiveModeService : Service() {
         val fgId = 2000 + Math.floorMod(personaId.hashCode(), 1000)
 
         // 先确保前台（ACTION_START 路径可能因为配置已存在而 early-return）
-        ensureForeground(personaId, "主动模式  ${intervalMin}分钟  每轮心跳写回对话")
+        ensureForeground(personaId, "主动模式：自适应 20 秒 -> 5 分钟")
 
-        if (personaId in runningPersonas) {
-            // 已运行：更新配置、通知和下一次闹钟，不重复启动 Job
-            configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
-            saveConfigsToPrefs()
-            if (convId.isNotBlank()) {
-                runningConversations.add(convId)
-                personaConvs[personaId] = convId
+        val now = System.currentTimeMillis()
+        var nextLabel = "20秒"
+        synchronized(scheduleLock) {
+            val old = configs[personaId]
+            if (personaId in runningPersonas && old != null) {
+                // 已运行：更新配置，保留当前退避档位和用户活跃时间，不重复启动 Job
+                val updated = old.copy(
+                    convId = convId,
+                    immersive = immersive,
+                    showThinking = showThinking,
+                    startHour = startHour,
+                    endHour = endHour
+                )
+                configs[personaId] = updated
+                if (convId.isNotBlank()) {
+                    runningConversations.add(convId)
+                    personaConvs[personaId] = convId
+                }
+                saveConfigsToPrefs()
+                nextLabel = heartbeatDelayLabel(effectiveStep(updated))
+                scheduleAlarm(personaId)
+            } else {
+                runningPersonas.add(personaId)
+                if (convId.isNotBlank()) {
+                    runningConversations.add(convId)
+                    personaConvs[personaId] = convId
+                }
+                // 持久化配置，进程被杀后闹钟拉起时能恢复
+                configs[personaId] = ActiveConfig(
+                    convId = convId,
+                    immersive = immersive,
+                    showThinking = showThinking,
+                    startHour = startHour,
+                    endHour = endHour,
+                    step = 0,
+                    lastUserAt = now,
+                    lastHeartbeatAt = now
+                )
+                saveConfigsToPrefs()
+                nextLabel = heartbeatDelayLabel(0)
+                scheduleAlarm(personaId)
             }
-            updateNotification(fgId, fullName, "${intervalMin}分钟后下一次心跳")
-            scheduleAlarm(personaId)
-            return
         }
-
-        runningPersonas.add(personaId)
-        if (convId.isNotBlank()) {
-            runningConversations.add(convId)
-            personaConvs[personaId] = convId
-        }
-
-        // 持久化配置，进程被杀后闹钟拉起时能恢复
-        configs[personaId] = ActiveConfig(convId, intervalMin, immersive, showThinking, startHour, endHour)
-        saveConfigsToPrefs()
-        Log.i(TAG, "主动模式启动 persona=$personaId interval=$intervalMin conv=$convId")
-        // 间隔后首次心跳，不立即触发
-        updateNotification(fgId, fullName, "${intervalMin}分钟后首次心跳")
-        scheduleAlarm(personaId)
+        Log.i(TAG, "主动模式启动 persona=$personaId next=$nextLabel conv=$convId")
+        updateNotification(fgId, fullName, "${nextLabel}后下一次心跳（最高5分钟）")
     }
 
 /** 闹钟唤醒时执行心跳 */
@@ -318,21 +428,32 @@ class ActiveModeService : Service() {
         ensureForeground(personaId, "心跳中...")
 
         jobs[personaId]?.cancel()
-        // 先注册下一次闹钟再发请求：即使进程在请求中途被杀，心跳链也不断
-        scheduleAlarm(personaId)
+        // 先推进自适应档位并注册下一次闹钟再发请求：即使进程在请求中途被杀，心跳链也不断。
+        // 心跳本身按 20s -> 1 -> 2 -> 3 -> 4 -> 5 分钟递增；只有用户发新消息才会把档位拉回 20 秒。
+        val now = System.currentTimeMillis()
+        var nextStep = 1
+        synchronized(scheduleLock) {
+            val cur = configs[personaId] ?: cfg
+            // 极小概率：用户在闹钟响的同一瞬间发消息。3 秒内视为并发，保留 20 秒档，避免把刚重置的节奏顶掉。
+            val justActive = cur.lastUserAt > cur.lastHeartbeatAt && now - cur.lastUserAt < 3_000L
+            nextStep = if (justActive) 0 else (cur.step + 1).coerceAtMost(MAX_HEARTBEAT_STEP)
+            configs[personaId] = cur.copy(step = nextStep, lastHeartbeatAt = now)
+            saveConfigsToPrefs()
+            scheduleAlarm(personaId)
+        }
         jobs[personaId] = scope.launch {
             try {
                 if (!isInTimeRange(cfg.startHour, cfg.endHour)) {
-                    updateNotification(fgId, fullName, "休息时段跳过")
+                    updateNotification(fgId, fullName, "休息时段跳过；下次${heartbeatDelayLabel(nextStep)}")
                     return@launch
                 }
                 val result = doHeartbeat(persona, cfg.convId, cfg.immersive, cfg.showThinking)
                 if (result.isNotBlank() && !result.uppercase().startsWith("PASS")) {
                     pushNotification(persona, result)
                     saveToConversation(cfg.convId, persona, result)
-                    updateNotification(fgId, fullName, "已推送")
+                    updateNotification(fgId, fullName, "已推送；下次${heartbeatDelayLabel(nextStep)}")
                 } else {
-                    updateNotification(fgId, fullName, "本轮PASS")
+                    updateNotification(fgId, fullName, "本轮PASS；下次${heartbeatDelayLabel(nextStep)}")
                 }
             } catch (e: Exception) {
                 updateNotification(fgId, fullName, "心跳异常: ${e.message?.take(20) ?: "未知"}")
@@ -345,11 +466,13 @@ class ActiveModeService : Service() {
     @Suppress("DEPRECATION")
     private fun stopHeartbeat(personaId: String) {
         jobs.remove(personaId)?.cancel()
-        cancelAlarm(personaId)
-        configs.remove(personaId)
-        saveConfigsToPrefs()
-        runningPersonas.remove(personaId)
-        personaConvs.remove(personaId)?.let { runningConversations.remove(it) }
+        synchronized(scheduleLock) {
+            cancelAlarm(personaId)
+            configs.remove(personaId)
+            saveConfigsToPrefs()
+            runningPersonas.remove(personaId)
+            personaConvs.remove(personaId)?.let { runningConversations.remove(it) }
+        }
         // 最后一个角色停止后，前台服务没有继续存在的必要
         if (runningPersonas.isEmpty()) {
             stopForeground(true)

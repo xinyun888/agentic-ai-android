@@ -88,6 +88,95 @@ rm -f "${'$'}RESP"
 
     fun rootfsInstalled(): Boolean = File(rootfsDir, "bin/sh").exists()
 
+    /**
+     * PRoot 需要把加载器解压到一个可写目录，然后再 chmod/exec 它。
+     * 之前用 cacheDir  Android 在低存储时会**自动清空 App 缓存目录**，目录一消失 PRoot 就报
+     *   can't chmod '.../cache/proot-xxxx': No such file or directory
+     * 紧接着 execve("/usr/bin/env"): Permission denied，
+     * 之后所有 guest 命令（含 QEMU 启动）全部失败。
+     * 现在固定在 filesDir 下（系统不会自动清理），并且每次启动前重建 + 写测试。
+     */
+    val prootTmpDir: File = File(linuxRoot, "proot-tmp")
+
+    fun ensureProotTmp(): File? {
+        val d = prootTmpDir
+        return try {
+            if (!d.exists()) d.mkdirs()
+            val probe = File(d, ".probe")
+            probe.writeText("ok")
+            probe.delete()
+            // 清掉上次残留的半成品加载器（同名文件会让 PRoot 误判）
+            d.listFiles()?.forEach { f -> if (f.name.startsWith("proot-")) f.delete() }
+            d
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** 可用空间（MB），-1 表示取不到 */
+    fun freeSpaceMb(): Long = try {
+        android.os.StatFs(appContext.filesDir.absolutePath).availableBytes / 1024 / 1024
+    } catch (e: Exception) {
+        -1L
+    }
+
+    /** 空间预检：不足时返回给用户看的错误文案，够则返回 null */
+    fun requireFreeSpace(needMb: Long, what: String): String? {
+        val free = freeSpaceMb()
+        if (free in 0 until needMb) {
+            return "\u274C 存储空间不足：$what 需要约 ${needMb}MB，当前可用 ${free}MB。\n" +
+                "请先清理空间（可用「清理临时文件」按钮，或删除手机里不用的文件），然后重试。"
+        }
+        return null
+    }
+
+    /** 清理可再生的大文件，返回释放的字节数 */
+    fun cleanupTemp(): Long {
+        var freed = 0L
+        fun zap(f: File) {
+            if (!f.exists()) return
+            val size = if (f.isDirectory) {
+                f.walkBottomUp().filter { it.isFile }.sumOf { it.length() }
+            } else f.length()
+            if (runCatching { if (f.isDirectory) f.deleteRecursively() else f.delete() }.getOrDefault(false)) {
+                freed += size
+            }
+        }
+        zap(File(vmDir, "alpine.qcow2.part"))
+        zap(File(vmDir, "qemu-apks"))
+        zap(File(vmDir, "disk-install.log"))
+        zap(File(linuxRoot, "$ROOTFS_DIR_NAME.tmp"))
+        zap(File(appContext.cacheDir, "dsh-bundle.tar.gz"))
+        zap(File(appContext.cacheDir, "aichat-dsh-untar.log"))
+        zap(File(appContext.cacheDir, "aichat-toolchain.log"))
+        runCatching {
+            appContext.cacheDir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("proot-")) zap(f)
+            }
+        }
+        return freed
+    }
+
+    /** 给 ProcessBuilder 统一注入 PRoot 运行环境；tmp 目录不可写时抛带指引的异常 */
+    private fun applyProotEnv(pb: ProcessBuilder) {
+        val tmp = ensureProotTmp() ?: throw IllegalStateException(
+            "\u274C PRoot 临时目录不可写：${prootTmpDir.absolutePath}\n" +
+                "常见原因：手机存储已满，或系统已清理 App 缓存。请清理空间后重试（VM 页有「清理临时文件」）。" +
+                (compatibilityWarning()?.let { "\n" + it } ?: "")
+        )
+        pb.environment()["PROOT_TMP_DIR"] = tmp.absolutePath
+        pb.environment()["PROOT_NO_SECCOMP"] = "1"
+        val proot = prootFile()
+        if (proot != null) {
+            ensureLoader(File(proot.parentFile, "libproot_loader.so"), File(linuxRoot, "proot_loader"))?.let {
+                pb.environment()["PROOT_LOADER"] = it.absolutePath
+            }
+            ensureLoader(File(proot.parentFile, "libproot_loader_m32.so"), File(linuxRoot, "proot_loader_m32"))?.let {
+                pb.environment()["PROOT_LOADER_32"] = it.absolutePath
+            }
+        }
+    }
+
     fun prootFile(): File? {
         val nativeFile = File(appContext.applicationInfo.nativeLibraryDir, PROOT_NAME)
         if (nativeFile.exists()) {
@@ -106,7 +195,9 @@ rm -f "${'$'}RESP"
     fun compatibilityWarning(): String? {
         val target = appContext.applicationInfo.targetSdkVersion
         return if (Build.VERSION.SDK_INT >= 29 && target >= 29) {
-            "\u26A0\uFE0F targetSdk=$target；Android 10+ 可能阻止 proot 执行 rootfs 内二进制。若命令报 Permission denied，请用 -PtargetSdk=28 重新构建 APK。"
+            "\u26A0\uFE0F 你装的是 targetSdk=$target 的包：Android 10+ 会阻止 proot 执行 rootfs 内二进制\n" +
+                "（典型报错：execve(\"/usr/bin/env\"): Permission denied）。\n" +
+                "请改装文件名里带 **target28** 的那个 APK（本仓库每次都会一起产出），PRoot / QEMU / DSH 才能工作。"
         } else null
     }
 
@@ -214,20 +305,18 @@ rm -f "${'$'}RESP"
         val pb = ProcessBuilder(cmd)
         pb.directory(rootfsDir)
         pb.redirectErrorStream(true)
-        pb.environment()["PROOT_TMP_DIR"] = cacheDir.absolutePath
-        pb.environment()["PROOT_NO_SECCOMP"] = "1"
-        ensureLoader(File(proot.parentFile, "libproot_loader.so"), File(linuxRoot, "proot_loader"))?.let {
-            pb.environment()["PROOT_LOADER"] = it.absolutePath
-        }
-        ensureLoader(File(proot.parentFile, "libproot_loader_m32.so"), File(linuxRoot, "proot_loader_m32"))?.let {
-            pb.environment()["PROOT_LOADER_32"] = it.absolutePath
+        try {
+            applyProotEnv(pb)
+        } catch (e: Exception) {
+            return@withContext ExecResult(output = e.message ?: "PRoot 环境准备失败", exitCode = -1)
         }
 
         val process = try {
             pb.start()
         } catch (e: Exception) {
             return@withContext ExecResult(
-                output = "\u274C 启动 proot 失败: ${e.message}",
+                output = "\u274C 启动 proot 失败: ${e.message}" +
+                    (compatibilityWarning()?.let { "\n" + it } ?: ""),
                 exitCode = -1
             )
         }
@@ -292,15 +381,7 @@ rm -f "${'$'}RESP"
         val pb = ProcessBuilder(cmd)
         pb.directory(rootfsDir)
         pb.redirectErrorStream(true)
-        pb.environment()["PROOT_TMP_DIR"] = cacheDir.absolutePath
-        pb.environment()["PROOT_NO_SECCOMP"] = "1"
-        val proot = prootFile()!!
-        ensureLoader(File(proot.parentFile, "libproot_loader.so"), File(linuxRoot, "proot_loader"))?.let {
-            pb.environment()["PROOT_LOADER"] = it.absolutePath
-        }
-        ensureLoader(File(proot.parentFile, "libproot_loader_m32.so"), File(linuxRoot, "proot_loader_m32"))?.let {
-            pb.environment()["PROOT_LOADER_32"] = it.absolutePath
-        }
+        applyProotEnv(pb)
         return pb.start()
     }
 

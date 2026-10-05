@@ -11,8 +11,13 @@ object DshState {
     @Volatile
     var ready: Boolean = false
 
+    /** 每次 VM/DSH 会话重启自增；用于让保留的 WebView 真正重新加载一次。 */
+    @Volatile
+    var generation: Int = 0
+
     fun reset() {
         webUrl = null
         ready = false
+        generation++
     }
 }

@@ -222,6 +222,30 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 ) { Text("4. 创建磁盘", maxLines = 1) }
             }
 
+            Spacer(Modifier.height(6.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    enabled = !busy,
+                    onClick = {
+                        busy = true
+                        scope.launch {
+                            val freed = manager.cleanupTemp()
+                            busy = false
+                            appendLog(
+                                "已清理临时文件：释放 ${freed / 1024 / 1024} MB；" +
+                                    "当前可用 ${manager.freeSpaceMb()} MB"
+                            )
+                            refreshStatus()
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("清理临时文件（释放空间）", maxLines = 1) }
+            }
+
             Spacer(Modifier.height(8.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

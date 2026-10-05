@@ -611,6 +611,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (convId == currentConvId) {
             messages = storage.getConversation(convId)?.messages ?: emptyList()
         }
+        // 用户一发消息，对应对话的主动模式立即回到 20 秒询问节奏
+        ActiveModeService.notifyUserActivity(getApplication(), convId)
     }
 
     fun loadConversation(convId: String) {
@@ -935,56 +937,69 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         continue
                     }
 
-                    // 上下文压缩：仅超长会话触发，1M 上下文基本用不到，兜底小模型
+                    // 上下文压缩：仅超长会话触发（发图很容易冲过阈值）
+                    // 关键：必须按"工具组"整组裁剪  assistant(tool_calls) 与它的 tool 结果同进同出，
+                    // 只删 tool 结果会破坏工具协议，DeepSeek 直接报 400 insufficient tool messages。
                     val totalChars = conversationDtos.sumOf { (it.content?.toString()?.length ?: 0) }
                     if (totalChars > 300_000 && conversationDtos.size > 8) {
-                        val oldTools = conversationDtos.filter { it.role == "tool" }
-                        if (oldTools.size > 3) {
-                            val remove = oldTools.dropLast(3)
-                            // 智能摘要：提取这些工具调用的实际作用
-                            val toolNames = remove.mapNotNull { dto ->
-                                conversationDtos.find { it.toolCallId == dto.toolCallId }?.let { _ ->
-                                    // 找到调用此工具的 assistant 消息
-                                    val callMsg = conversationDtos.find { m ->
-                                        m.toolCalls?.any { tc -> tc.id == dto.toolCallId } == true
-                                    }
-                                    callMsg?.toolCalls?.find { tc -> tc.id == dto.toolCallId }?.function?.name
-                                }
-                            }.distinct().take(5)
-                            val toolOutcomes = remove.joinToString("; ") { (it.content?.toString() ?: "").take(100) }
+                        val groups = mutableListOf<IntRange>()
+                        var gi = 0
+                        while (gi < conversationDtos.size) {
+                            val m = conversationDtos[gi]
+                            if (m.role == "assistant" && !m.toolCalls.isNullOrEmpty()) {
+                                var gj = gi
+                                while (gj + 1 < conversationDtos.size && conversationDtos[gj + 1].role == "tool") gj++
+                                groups.add(gi..gj)
+                                gi = gj + 1
+                            } else gi++
+                        }
+                        if (groups.size > 3) {
+                            val drop = groups.dropLast(3)
+                            val dropIdx = HashSet<Int>()
+                            drop.forEach { r -> r.forEach { dropIdx.add(it) } }
+                            val dropped = drop.map { r -> conversationDtos.subList(r.first, r.last + 1) }.flatten()
+                            val toolNames = dropped.filter { it.role == "assistant" }
+                                .flatMap { it.toolCalls.orEmpty() }.map { it.function.name }.distinct().take(5)
+                            val toolOutcomes = dropped.filter { it.role == "tool" }
+                                .joinToString("; ") { (it.content?.toString() ?: "").take(100) }
                                 .replace(Regex("\\s+"), " ").take(300)
-                            // 用身份比较（===）而非结构相等，避免误删 content 相同的其他 tool 消息
-                            conversationDtos.removeAll { dto -> remove.any { it === dto } }
-                            conversationDtos.add(2, ChatMessageDto(role = "system",
-                                content = "已使用的工具（${remove.size}次）：${toolNames.joinToString("，")}。结果摘要：$toolOutcomes"))
-                        }
-                        // 裁剪超过 16 组的最早用户/助手对话
-                        val ua = conversationDtos.filter { it.role == "user" || it.role == "assistant" }
-                        if (ua.size > 32) {
-                            val drop = ua.take(ua.size - 32)
-                            // 丢弃前将关键上下文保存到记忆
-                            val userMsgs = drop.filter { it.role == "user" }
-                            val keyRequests = userMsgs.mapNotNull { (it.content?.toString() ?: "").take(200) }
-                                .filter { it.length > 20 }
-                            if (keyRequests.isNotEmpty()) {
-                                saveUserMemory(myConvId, "用户曾处理：${keyRequests.take(3).joinToString("；")}")
+                            val kept = conversationDtos.filterIndexed { k, _ -> k !in dropIdx }.toMutableList()
+                            conversationDtos.clear()
+                            conversationDtos.addAll(kept)
+                            if (conversationDtos.size >= 2) {
+                                conversationDtos.add(2, ChatMessageDto(role = "system",
+                                    content = "已使用的工具（" + drop.size + " 组）：" + toolNames.joinToString("，") +
+                                        "。结果摘要：" + toolOutcomes))
                             }
-                            conversationDtos.removeAll { dto -> drop.any { it === dto } }
+                        }
+                        val uaIdx = conversationDtos.indices.filter {
+                            conversationDtos[it].role == "user" || conversationDtos[it].role == "assistant"
+                        }
+                        if (uaIdx.size > 32) {
+                            val keepFrom = uaIdx[uaIdx.size - 32]
+                            val dropIdx2 = HashSet<Int>()
+                            for (k in 0 until keepFrom) {
+                                dropIdx2.add(k)
+                                var t = k + 1
+                                while (t < conversationDtos.size && conversationDtos[t].role == "tool") { dropIdx2.add(t); t++ }
+                            }
+                            val droppedUsers = (0 until keepFrom)
+                                .filter { conversationDtos[it].role == "user" }
+                                .map { (conversationDtos[it].content?.toString() ?: "").take(200) }
+                                .filter { it.length > 20 }
+                            if (droppedUsers.isNotEmpty()) {
+                                saveUserMemory(myConvId, "用户曾处理：" + droppedUsers.take(3).joinToString("；"))
+                            }
+                            val kept2 = conversationDtos.filterIndexed { k, _ -> k !in dropIdx2 }.toMutableList()
+                            conversationDtos.clear()
+                            conversationDtos.addAll(kept2)
                         }
                     }
-
-                    // 错误循环检测：同一工具报错 3 次及以上时进行提示
-                    val worstError = consecutiveErrors.entries.maxByOrNull { it.value }
-                    if (worstError != null && worstError.value >= 3) {
-                        conversationDtos.add(ChatMessageDto(role = "system",
-                            content = "工具 '${worstError.key}' 已连续失败 ${worstError.value} 次。请尝试其他方法，不要重复调用此工具。"))
-                        consecutiveErrors.clear()
-                    }
-
+                    // 非流式请求：一次调用同时完成"工具决策"和"最终回答"，省掉额外的 final 请求
                     val request = ChatRequest(
                         model = effectiveProfile.model,
-                        messages = conversationDtos,
-                        // 单次请求直接承担“工具决策 + 最终回答”，所以按用户档位设置推理强度，
+                        messages = ToolCallSanitizer.sanitize(conversationDtos),
+                        // 单次请求直接承担工具决策 + 最终回答，所以按用户档位设置推理强度，
                         // 不再额外发一次 final 请求，省掉一整套重复 prompt/tool schema。
                         reasoningEffort = if (thinkingMode)
                             when (effectiveProfile.reasoningLevel) {
@@ -999,16 +1014,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                         stream = false
                     )
-
-                    // 原生 OkHttp + 具体类解析（Retrofit 的 suspend 泛型签名会被 R8 剥离导致崩溃）
-                    val body = try {
-                        chatCompletion(effectiveProfile, request)
-                    } catch (e: ApiHttpException) {
-                        withContext(Dispatchers.Main) {
-                            errorMessage = "API 错误 ${e.code}: ${e.message}\n${e.errorBody}"
-                        }
-                        return@launch
-                    }
+                    val body = chatCompletion(effectiveProfile, request)
                     val choice = body.choices.firstOrNull()
                     body.usage?.let { u ->
                         UsageMeter.record(u.promptTokens, u.completionTokens, u.cacheHitTokens, u.cacheMissTokens)
@@ -1188,6 +1194,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         val agentRules = if (activePersonaId == "fortune") """
 Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
+
+## 实时客观性铁律（最高优先级）
+每轮分析实时以本轮工具输出/用户原话/人物卡为准；吉凶并陈、正反同权、先说不利；禁止无依据的乐观话术和安慰式结论。
 
 ## 工具使用铁律（命理师精简版）
 ① **时间和日期**：涉及"现在/今天/当前"用 get_time；干支/农历/节气/星期换算必须用 date_convert，禁止自写代码或凭记忆推算。
@@ -1582,7 +1591,7 @@ Agent 助手。你拥有工具，不要凭记忆回答可验证的事实。
                     while (true) {
                         val request = ChatRequest(
                             model = profile.model,
-                            messages = currentDtos,
+                            messages = ToolCallSanitizer.sanitize(currentDtos),
                             reasoningEffort = if (thinkingMode)
                                 when (profile.reasoningLevel) {
                                     "fast" -> "low"

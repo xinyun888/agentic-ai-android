@@ -105,6 +105,9 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 if (!rootfsInstalled()) {
                     return@withContext Result.failure(IllegalStateException("请先安装 Alpine rootfs"))
                 }
+                linux.requireFreeSpace(400, "离线安装 QEMU")?.let {
+                    return@withContext Result.failure(IllegalStateException(it))
+                }
                 onProgress("检查并修复 rootfs 符号链接 ...")
                 linux.fixRootfsSymlinks()
                 val assetDir = qemuAssetDir()
@@ -163,6 +166,9 @@ class QemuManager private constructor(private val context: Context, val linux: L
                     onProgress("内核/ISO 已存在")
                     return@withContext Result.success(Unit)
                 }
+                linux.requireFreeSpace(300, "释放内核/ISO")?.let {
+                    return@withContext Result.failure(IllegalStateException(it))
+                }
                 onProgress("释放 vmlinuz / initramfs / ISO ...")
                 listOf(
                     "vmlinuz-virt" to kernelFile,
@@ -188,6 +194,38 @@ class QemuManager private constructor(private val context: Context, val linux: L
         }
 
     fun qemuInstalled(): Boolean = File(linux.rootfsDir, "usr/bin/qemu-system-aarch64").exists()
+
+    /** 预装镜像解压后的体积（MB）：gzip 尾部 4 字节是 ISIZE（未压缩大小，LE） */
+    private fun preinstallUncompressedMb(): Long = try {
+        val total = context.assets.openFd(preinstallAsset).use { it.length }
+        if (total < 8) -1L else context.assets.open(preinstallAsset).use { input ->
+            var remain = total - 4
+            while (remain > 0) {
+                val skipped = input.skip(remain)
+                if (skipped <= 0) break
+                remain -= skipped
+            }
+            val b = ByteArray(4)
+            var read = 0
+            while (read < 4) {
+                val n = input.read(b, read, 4 - read)
+                if (n < 0) break
+                read += n
+            }
+            if (read < 4) -1L else {
+                val isize = (b[0].toLong() and 0xFF) or ((b[1].toLong() and 0xFF) shl 8) or
+                    ((b[2].toLong() and 0xFF) shl 16) or ((b[3].toLong() and 0xFF) shl 24)
+                isize / 1024 / 1024
+            }
+        }
+    } catch (e: Exception) {
+        -1L
+    }
+
+    fun freeSpaceMb(): Long = linux.freeSpaceMb()
+
+    /** 清理可再生的大文件（半成品镜像、离线包副本、PRoot 残留），返回释放字节数 */
+    fun cleanupTemp(): Long = linux.cleanupTemp()
 
     /** 内置的"预装系统"磁盘镜像（node/pnpm/git/DeepSeek Harness 已装好） */
     private val preinstallAsset = "dsh/preinstall-disk.qcow2.bin"
@@ -220,11 +258,17 @@ class QemuManager private constructor(private val context: Context, val linux: L
         appendLine("启动模式: " + if (bootFromDisk) "\u2705 磁盘启动" else "\u2705 Live ISO")
         appendLine("快速模式: " + if (fastBoot && !bootFromDisk) "\u2705 init=/bin/sh（推荐）" else "\u274C 完整 OpenRC")
         appendLine("手机桥: " + if (PhoneBridgeHttpServer.isRunning) "\u2705 guest -> 10.0.2.2:${PhoneBridgeHttpServer.PORT}" else "\u274C 未启动")
+        linux.compatibilityWarning()?.let { appendLine(it) }
+        val freeMb = linux.freeSpaceMb()
+        appendLine("存储:   " + if (freeMb < 0) "\u2753 取不到" else if (freeMb < 500) "\u26A0\uFE0F 仅剩 ${freeMb}MB（偏低，可能装不下镜像）" else "\u2705 可用 ${freeMb}MB")
         appendLine("VM 目录: ${vmDir.absolutePath}")
     }
 
     suspend fun installQemuOnline(onProgress: (String) -> Unit): Result<Unit> = withContext(Dispatchers.IO) {
         try {
+            linux.requireFreeSpace(600, "在线安装 QEMU")?.let {
+                return@withContext Result.failure(IllegalStateException(it))
+            }
             if (qemuInstalled()) {
                 onProgress("QEMU 已安装")
                 return@withContext Result.success(Unit)
@@ -282,10 +326,15 @@ class QemuManager private constructor(private val context: Context, val linux: L
                     onProgress("预装系统已就绪")
                     return@withContext Result.success(Unit)
                 }
+                // 展开需要"解压后体积 + 余量"的空间，先算准再检查（gzip 尾部带 ISIZE）
+                val needMb = preinstallUncompressedMb().let { if (it > 0) it + 300 else 2000 }
+                linux.requireFreeSpace(needMb, "展开内置预装系统")?.let {
+                    return@withContext Result.failure(IllegalStateException(it))
+                }
                 val tmp = File(vmDir, "alpine.qcow2.part")
                 tmp.parentFile?.mkdirs()
                 if (tmp.exists()) tmp.delete()
-                onProgress("展开内置预装系统（首次 1-2 分钟）...")
+                onProgress("展开内置预装系统（约 ${needMb}MB 空间，首次 1-2 分钟）...")
                 // 资源是 gzip 过的未压缩 qcow2：这里解压一次，之后 guest 读写就是普通镜像
                 // （压缩 qcow2 在 PRoot 下逐簇解压会非常慢）
                 java.util.zip.GZIPInputStream(context.assets.open(preinstallAsset), 1 shl 20).use { input ->
@@ -543,6 +592,23 @@ class QemuManager private constructor(private val context: Context, val linux: L
 
     fun currentSession(): QemuSession? = activeSession
 
+    /** 用户改了 API key/模型后调用：重跑 guest setup，重新写 DSH 模型配置并重启 dsh web。 */
+    @Synchronized
+    fun restartGuestHarness() {
+        val session = activeSession ?: return
+        val ignoreBefore = session.output.value.length
+        DshState.reset()
+        setupScope.launch {
+            try {
+                session.appendSynthetic("[App] 正在重配 DSH（使用当前 API 配置，重新加载插件可能较慢）...")
+                session.write("pkill -f 'dsh --profile web' 2>/dev/null")
+                delay(1500)
+            } catch (_: Exception) {}
+            // 只看重配后的新串口输出，避免旧 AICHAT_SETUP_DONE 让新 setup 循环提前结束
+            startGuestSetup(session, ignoreBefore)
+        }
+    }
+
     fun phoneBridgeSetupCommand(): String = PhoneBridgeHttpServer.guestSetupCommand()
 
     fun startSession(memoryMb: Int = 2048, smp: Int = 1): QemuSession? =
@@ -649,7 +715,10 @@ class QemuManager private constructor(private val context: Context, val linux: L
         }
     }
 
-    private fun startGuestSetup(session: QemuSession) {
+    /** 已经完成 token->cookie 交换的 URL（一次性 token，绝不重复交换） */
+    private var dshUrlExchangedFor: String? = null
+
+    private fun startGuestSetup(session: QemuSession, ignoreBefore: Int = 0) {
         setupJob?.cancel()
         setupJob = setupScope.launch {
             val commands = PhoneBridgeHttpServer.guestSetupCommands()
@@ -662,8 +731,11 @@ class QemuManager private constructor(private val context: Context, val linux: L
             var rootfsReadyAt = 0L
             val fast = fastBoot && !bootFromDisk
             while (isActive && activeSession === session) {
-                // busybox ash 的提示符后面会跟 ESC[6n（光标位置查询），不剥掉 ANSI 就永远匹配不到提示符
-                val tail = stripAnsi(session.output.value.takeLast(20000))
+                // busybox ash 的提示符后面会跟 ESC[6n（光标位置查询），不剥掉 ANSI 就永远匹配不到提示符。
+                // ignoreBefore 用于重配 DSH：只看本次重配之后的新输出，避免旧 AICHAT_SETUP_DONE 让新循环秒退。
+                val fullOutput = session.output.value
+                val from = ignoreBefore.coerceIn(0, fullOutput.length)
+                val tail = stripAnsi(fullOutput.substring(from).takeLast(20000))
                 if (tail.contains("AICHAT_SETUP_BEGIN")) setupBegun = true
                 if (tail.contains("login:", ignoreCase = true)) sawLogin = true
                 // 捕获 Guest 里 dsh web 的启动 URL / 就绪状态，供 DS Harness 页直接内嵌
@@ -696,12 +768,20 @@ class QemuManager private constructor(private val context: Context, val linux: L
                     }
                 }
                 if (tail.contains("AICHAT_DSH_FAIL")) { DshState.ready = false; DshState.webUrl = null }
-                val dshIdx = tail.indexOf("AICHAT_DSH_URL=")
+                // 取最后一条 AICHAT_DSH_URL=（脚本会重复打印，最后一条最完整）；
+                // 并且必须校验 token 长度：管道被截断时会出现 token 为空的 URL，
+                // 用它去加载 DSH 只会得到 "dsh web authentication required"。
+                val dshIdx = tail.lastIndexOf("AICHAT_DSH_URL=")
                 if (dshIdx >= 0) {
                     val line = tail.substring(dshIdx).lineSequence().firstOrNull().orEmpty()
                     val url = line.removePrefix("AICHAT_DSH_URL=").trim()
-                    if (url.startsWith("http")) {
-                        DshState.webUrl = url
+                    val tokenOk = Regex("token=[A-Za-z0-9_-]{20,}").containsMatchIn(url)
+                    if (url.startsWith("http") && tokenOk && dshUrlExchangedFor != url) {
+                        dshUrlExchangedFor = url
+                        val clean = exchangeDshToken(url)
+                        // 成功：把"干净地址"交给 WebView（靠 cookie 会话，可安全重载）
+                        // 失败：退回带 token 的地址（WebView 可能仍能自己换成功）
+                        DshState.webUrl = clean ?: url
                         DshState.ready = true
                     }
                 }
@@ -771,6 +851,58 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 if (setupBegun && (tail.contains("AICHAT_SETUP_DONE") || tail.contains("AICHAT_DSH_FAIL"))) break
                 delay(1200)
             }
+        }
+    }
+
+    /**
+     * DSH 的 `?token=` 是【进程一次性启动令牌】：用它请求一次会得到 303 + Set-Cookie（dsh-auth-* 会话 cookie）。
+     * 把这个交换交给 WebView 做有两个坑：
+     *   1) 一次性 token 若被加载第二次（重组/重进页面） 401，页面显示 "authentication required"；
+     *   2) 主框架 401 不会触发 onReceivedHttpError，界面上看不出原因。
+     * 所以这里由 App 自己用 HttpURLConnection 完成交换，把 cookie 注入 WebView 的 CookieManager，
+     * 之后 WebView 只加载【不带 token 的干净地址】确定性的做法，且可重载、可重进。
+     * 前提：guest 的 dsh-forward.js 必须是透明 TCP 转发、Host 保持 127.0.0.1:18000；
+     * 一旦转发器改写 Host，这里换到的 cookie authority 会和后续 /api 请求对不上（HTTP 401）。
+     * @return 干净地址（交换成功）或 null（失败，调用方自行决定是否回退）
+     */
+    private suspend fun exchangeDshToken(tokenUrl: String): String? = withContext(Dispatchers.IO) {
+        val clean = tokenUrl.substringBefore("?token=")
+        try {
+            val conn = (java.net.URL(tokenUrl).openConnection() as java.net.HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 10_000
+                readTimeout = 10_000
+                requestMethod = "GET"
+                setRequestProperty("Accept", "text/html")
+            }
+            val code = conn.responseCode
+            // 303 响应可能不止一个 Set-Cookie；必须精确挑 dsh-auth-*，
+            // 否则误选其它 cookie 会让 WebView 仍然 401。
+            val setCookies = conn.headerFields.entries
+                .filter { it.key.equals("Set-Cookie", ignoreCase = true) }
+                .flatMap { it.value.orEmpty() }
+            val setCookie = setCookies.firstOrNull { it.trimStart().startsWith("dsh-auth-") }
+                ?: setCookies.firstOrNull().orEmpty()
+            runCatching { conn.inputStream?.close(); conn.errorStream?.close() }
+            conn.disconnect()
+            if (setCookie.isBlank()) {
+                Log.w(TAG, "DSH token 交换未拿到 Set-Cookie (HTTP $code) url=$clean")
+                return@withContext null
+            }
+            val pair = setCookie.substringBefore(";").trim()
+            if (pair.isBlank() || !pair.contains("=") || !pair.startsWith("dsh-auth-")) {
+                Log.w(TAG, "DSH token 交换拿到的不是 dsh-auth-* cookie (HTTP $code): ${setCookie.take(120)}")
+                return@withContext null
+            }
+            val cm = android.webkit.CookieManager.getInstance()
+            cm.setAcceptCookie(true)
+            cm.setCookie(clean, pair)
+            cm.flush()
+            Log.i(TAG, "DSH token 交换成功：HTTP $code，已注入 cookie ${pair.substringBefore("=")}")
+            clean
+        } catch (e: Exception) {
+            Log.w(TAG, "DSH token 交换失败: ${e.message}")
+            null
         }
     }
 

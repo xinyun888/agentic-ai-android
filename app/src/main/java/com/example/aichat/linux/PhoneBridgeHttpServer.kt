@@ -342,9 +342,15 @@ object PhoneBridgeHttpServer {
             appContext?.let { StorageManager(it).getActiveProfile() }
                 ?: appContext?.let { StorageManager(it).getProfiles().firstOrNull() }
         } catch (_: Exception) { null }
-        val seedKey = profile?.apiKey.orEmpty().replace("'", "'\\''")
-        val seedBase = profile?.baseUrl.orEmpty().trimEnd('/')
+        // 清洗：换行/制表符会把生成的 shell 脚本断行（DSH 起不来、日志空白）；URL 去掉所有空白
+        val seedKey = profile?.apiKey.orEmpty()
+            .replace(Regex("[\r\n\t]"), "")
+            .trim()
+            .replace("'", "'\\''")
+        val seedBase = profile?.baseUrl.orEmpty().filter { !it.isWhitespace() }.trimEnd('/')
         val seedModel = profile?.model.orEmpty()
+            .replace(Regex("[\r\n\t]"), "")
+            .trim()
         // 用 printf 写配置（不用 heredoc：万一终止符不匹配会把后面的启动代码一起吞掉）
         val seedBlock = if (seedKey.isNotBlank() && seedBase.isNotBlank() && seedModel.isNotBlank()) {
             "mkdir -p /root/.dsh/profiles/web; " +
@@ -354,6 +360,17 @@ object PhoneBridgeHttpServer {
                 "'$seedBase' '$seedModel' > /root/.dsh/profiles/web/cordis.patch.yml; " +
                 "echo AICHAT_DSH_CONFIG_WRITTEN\n"
         } else "echo AICHAT_DSH_CONFIG_SKIP\n"
+        // 用独立的 --patch overlay 写 DSH 配置，避免动 profile/home patch：
+        // 1) Alpine 没有 xdg-user-dir，显式指定 documentsDirectory=/root，DSH 才能建默认工作区；
+        // 2) QEMU 慢机连接 WebSocket mux 的 ready 帧可能超过默认 15 秒，放宽到 3 分钟，
+        //    避免 "generation was not ready within 15000ms; cancelling generation" 反复重连导致白屏。
+        val workspaceBlock = "mkdir -p /root/.dsh; " +
+            "printf -- '- id: workspace-controller\\n  config:\\n    documentsDirectory: /root\\n" +
+            "- id: connection\\n  config:\\n    recovery:\\n" +
+            "      backoffBaseMs: 1000\\n      backoffFactor: 1.5\\n      backoffMaxMs: 30000\\n" +
+            "      generationReadyWarnMs: 30000\\n      generationReadyTimeoutMs: 180000\\n' " +
+            "> /root/.dsh/aichat.patch.yml; " +
+            "echo AICHAT_DSH_WORKSPACE_PATCH_OK\n"
         return """#!/bin/sh
 echo AICHAT_SETUP_BEGIN
 mkdir -p /usr/local/bin /opt
@@ -391,53 +408,184 @@ if [ ! -x /opt/dsh/bin/dsh ]; then
   tar -xzf /tmp/dsh-bundle.tar.gz -C /opt >/tmp/aichat-dsh-untar.log 2>&1 || true
   rm -f /tmp/dsh-bundle.tar.gz
 fi
+# DSH 0.2.0-rc.2 的 ui-user-questions 在同意执行后的恢复流程里，如果 session binding 尚未就绪，
+# reconcile 会同步抛错并冒泡，导致整个 DSH Web UI 白屏。给它加一层 try/catch 防御：出错只记日志，不拖垮壳。
+UQ=/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-user-questions/lib/client.js
+if [ -f "${dollar}UQ" ]; then
+cat > /tmp/aichat-patch-uq.js <<'JS_UQ_EOF'
+const fs = require('fs');
+const p = '/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-user-questions/lib/client.js';
+if (!fs.existsSync(p)) process.exit(0);
+let s = fs.readFileSync(p, 'utf8');
+if (s.indexOf('[aichat] uq reconcile guard') >= 0) { console.log('already patched'); process.exit(0); }
+const open = 'const reconcile = () => {\n';
+const close = '\n\t\t\t};\n\t\t\treconcile();';
+if (s.indexOf(open) < 0 || s.indexOf(close) < 0) { console.log('pattern missing'); process.exit(0); }
+s = s.replace(open, open + '\t\t\t\ttry {\n');
+s = s.replace(close, '\n\t\t\t\t} catch (error) { console.error("[aichat] uq reconcile guard", error); }\n\t\t\t};\n\t\t\treconcile();');
+fs.writeFileSync(p, s);
+console.log('patched');
+JS_UQ_EOF
+node /tmp/aichat-patch-uq.js >/tmp/aichat-patch-uq.log 2>&1 || true
+echo "AICHAT_DSH_UQ_PATCH=${dollar}(tail -1 /tmp/aichat-patch-uq.log 2>/dev/null)"
+fi
 if [ -x /opt/dsh/bin/dsh ]; then
   ln -sf /opt/dsh/bin/dsh /usr/local/bin/dsh 2>/dev/null || true
   echo "dsh ${dollar}(/opt/dsh/bin/dsh --version 2>/dev/null)"
   export DSH_HOME=/root/.dsh
+  # Node 22+ 的 V8 编译缓存：首次成功启动后生成，之后 DSH 启动会快很多（手机单核很需要）
+  export NODE_COMPILE_CACHE=/root/.node-cache
+  mkdir -p /root/.node-cache 2>/dev/null
   cd /root
-  # DSH 出于安全只允许监听 127.0.0.1；用 node 写个 TCP 转发，把 0.0.0.0:8000 转到 127.0.0.1:3080
-  if [ ! -f /usr/local/bin/dsh-forward.js ]; then
-    (nohup true) 2>/dev/null
-    printf '%s\n' "const net = require('net');" "net.createServer((c) => {" "  const s = net.connect(3080, '127.0.0.1');" "  c.pipe(s); s.pipe(c);" "  c.on('error', () => s.destroy());" "  s.on('error', () => c.destroy());" "}).listen(8000, '0.0.0.0');" > /usr/local/bin/dsh-forward.js
+  # DSH 出于安全只允许监听 127.0.0.1；用 node 做透明 TCP 转发：0.0.0.0:8000 -> 127.0.0.1:3080。
+  # 这里绝不能改写 Host/Origin！DSH 的浏览器会话 cookie 名和签名 audience 都绑定请求 authority（Host）。
+  # App/WebView 始终用 127.0.0.1:18000 访问，DSH 也必须始终看到 Host=127.0.0.1:18000，
+  # 这样 token 交换时签发的 cookie 才会和后续所有 /api 请求一致。
+  # 旧实现只改写每条 TCP 连接的第一个请求；浏览器 keep-alive 复用连接后，后续 /api 请求
+  # 带原始 Host=127.0.0.1:18000 到达 DSH，cookie 名对不上 -> HTTP 401
+  #（/api/session/modelCatalog、directoryPicker/createDirectory 等都会失败）。
+  cat > /usr/local/bin/dsh-forward.js <<'JS_EOF'
+const net = require('net');
+net.createServer((c) => {
+  const s = net.connect(3080, '127.0.0.1');
+  c.on('data', (d) => { if (!s.destroyed) s.write(d); });
+  s.on('data', (d) => { if (!c.destroyed) c.write(d); });
+  c.on('end', () => s.end());
+  s.on('end', () => c.end());
+  c.on('error', () => s.destroy());
+  s.on('error', () => c.destroy());
+}).listen(8000, '0.0.0.0');
+JS_EOF
+  # 重启转发器（旧版本在跑的话换掉）
+  if [ -f /tmp/dsh-forward.pid ]; then
+    kill ${dollar}(cat /tmp/dsh-forward.pid) 2>/dev/null
+    rm -f /tmp/dsh-forward.pid
   fi
-  $seedBlock  # 脚本可能被重跑（App 超时重试/手动再执行）：已经起过就直接复用，避免第二个实例抢 3080
-  # 失败并把 /tmp/dsh-web.log 覆盖掉（那样 token 就丢了，界面会误报 AICHAT_DSH_FAIL）
-  if grep -q 'token=' /tmp/dsh-web.log 2>/dev/null; then
+  pkill -f dsh-forward.js 2>/dev/null
+  (nohup node /usr/local/bin/dsh-forward.js >/tmp/dsh-forward.log 2>&1 & echo ${dollar}! > /tmp/dsh-forward.pid)
+  sleep 2
+  $workspaceBlock
+  $seedBlock  # 脚本可能被重跑（App 超时重试/手动再执行）：用"进程是否还活着"判断，活着就复用，
+  # 不重启也不覆盖日志（覆盖会把 token 弄丢，界面就误报 AICHAT_DSH_FAIL）
+  if pgrep -f 'dsh --profile web' >/dev/null 2>&1; then
     echo AICHAT_DSH_REUSE
   else
-    (nohup env AICHAT_API_KEY='$seedKey' /opt/dsh/bin/dsh --profile web --no-open --port 3080 --host 127.0.0.1 \
+    rm -f /tmp/dsh-web.log
+    (nohup env AICHAT_API_KEY='$seedKey' /opt/dsh/bin/dsh --profile web --patch /root/.dsh/aichat.patch.yml --no-open --port 3080 --host 127.0.0.1 \
+        --trusted-host 127.0.0.1:18000 >/tmp/dsh-web.log 2>&1 &)
+    sleep 3
+  fi
+  # 兜底：3 秒后进程还不在，就换一种写法再试（export 注入环境变量 + 直接 nohup 执行）
+  if [ ${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | wc -l) -eq 0 ]; then
+    echo AICHAT_DSH_RETRY_SIMPLE
+    export AICHAT_API_KEY='$seedKey'
+    cd /root
+    (nohup /opt/dsh/bin/dsh --profile web --patch /root/.dsh/aichat.patch.yml --no-open --port 3080 --host 127.0.0.1 \
         --trusted-host 127.0.0.1:18000 >>/tmp/dsh-web.log 2>&1 &)
-    sleep 2
+    sleep 4
   fi
-  if [ -f /tmp/dsh-forward.pid ] && kill -0 ${dollar}(cat /tmp/dsh-forward.pid) 2>/dev/null; then
-    echo AICHAT_FWD_REUSE
-  else
-    (nohup node /usr/local/bin/dsh-forward.js >>/tmp/dsh-forward.log 2>&1 & echo ${dollar}! > /tmp/dsh-forward.pid)
-    sleep 1
+  # 启动后立刻自检：进程数 / 日志大小 / 日志尾  出问题一眼能看出来
+  echo "AICHAT_DSH_PS=${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | wc -l)"
+  echo "AICHAT_DSH_LOG_BYTES=${dollar}(wc -c < /tmp/dsh-web.log 2>/dev/null || echo 0)"
+  echo "AICHAT_SEED_KEYLEN=${dollar}{#AICHAT_API_KEY}"
+  echo "AICHAT_SEED_BASE=$seedBase"
+  echo "AICHAT_SEED_MODEL=$seedModel"
+  echo AICHAT_DSH_LOG_TAIL
+  tail -3 /tmp/dsh-web.log 2>/dev/null || true
+  echo AICHAT_DSH_CFG_HEAD
+  head -2 /root/.dsh/profiles/web/cordis.patch.yml 2>/dev/null || true
+  echo AICHAT_DSH_STARTLOG
+  # 注意：不能写 tail -3 $(ls ...)，匹配不到文件时 tail 会去读 stdin 卡死
+  SLA=${dollar}(ls -t /root/.dsh/logs/*.log 2>/dev/null | head -1)
+  [ -n "${dollar}SLA" ] && tail -3 "${dollar}SLA" 2>/dev/null
+  true
+  # 进程级诊断：命令行 / fd1 指向 / cwd / 监听端口 / HTTP 应答
+  DPID=${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | head -1)
+  if [ -n "${dollar}DPID" ]; then
+    echo "DIAG_CMD=${dollar}(tr '\0' ' ' < /proc/${dollar}DPID/cmdline 2>/dev/null)"
+    echo "DIAG_FD1=${dollar}(readlink /proc/${dollar}DPID/fd/1 2>/dev/null)"
+    echo "DIAG_FD2=${dollar}(readlink /proc/${dollar}DPID/fd/2 2>/dev/null)"
+    echo "DIAG_CWD=${dollar}(readlink /proc/${dollar}DPID/cwd 2>/dev/null)"
+    # 兜底：如果它把输出写到了别的文件，就从那个文件里把 token 捡回来
+    FD1=${dollar}(readlink /proc/${dollar}DPID/fd/1 2>/dev/null)
+    if [ -n "${dollar}FD1" ] && [ -f "${dollar}FD1" ]; then
+      T=${dollar}(grep -ho 'token=[A-Za-z0-9_-]*' "${dollar}FD1" 2>/dev/null | head -1)
+      [ -n "${dollar}T" ] && echo "AICHAT_DSH_TOKEN_FROM_FD=${dollar}T"
+    fi
   fi
+  echo DIAG_LISTEN
+  netstat -tln 2>/dev/null | grep -E ':3080|:8000' || echo "(no listen)"
+  echo DIAG_HTTP_ROOT
+  wget -qO- -T 3 http://127.0.0.1:3080/ </dev/null 2>&1 | head -3 || true
+  echo DIAG_LOGDIR_LIST
+  ls -la /root/.dsh/logs 2>/dev/null | head -6
+  echo "AICHAT_FWD_PS=${dollar}(pgrep -f 'dsh-forward.js' 2>/dev/null | wc -l)"
+  echo "AICHAT_DSH_HINT=首次启动要加载全部插件，慢机型可能要 5-15 分钟，请耐心等待（最多 30 分钟）；"
+  echo "AICHAT_DSH_HINT2=成功后 NODE_COMPILE_CACHE 会缓存下来，以后再启动会明显变快"
+  # 慢机型（单核 cortex-a53 + 单线程 TCG）加载 540 个包可能要 5-15 分钟，
+  # 所以这里"只要进程还活着就一直等"，最多 30 分钟；进程死了才提前判失败
   i=0
-  while [ ${dollar}i -lt 90 ]; do
+  while [ ${dollar}i -lt 900 ]; do
     sleep 2
-    if grep -q 'token=' /tmp/dsh-web.log 2>/dev/null; then
+    if grep -q 'token=' /tmp/dsh-web.log 2>/dev/null || grep -q 'token=' /root/.dsh/logs/*.log 2>/dev/null \
+       || { [ -n "${dollar}FD1" ] && [ -f "${dollar}FD1" ] && grep -q 'token=' "${dollar}FD1" 2>/dev/null; }; then
       echo AICHAT_DSH_OK
       tail -2 /tmp/dsh-web.log 2>/dev/null
       break
     fi
     i=${dollar}((i+1))
     if [ ${dollar}((i % 15)) -eq 0 ]; then
-      echo "AICHAT_DSH_WAIT=${dollar}((i*2))s"
+      WPS=${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | wc -l)
+      WSZ=${dollar}(wc -c < /tmp/dsh-web.log 2>/dev/null || echo 0)
+      # CPU 时间（时钟滴答）与进程状态：数字在涨 = 在干活（只是慢）；一直不动 = 可能真卡住
+      WPID=${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | head -1)
+      WCPU=${dollar}(awk '{print ${dollar}14+${dollar}15}' /proc/${dollar}WPID/stat 2>/dev/null)
+      WST=${dollar}(awk '{print ${dollar}3}' /proc/${dollar}WPID/stat 2>/dev/null)
+      WMEM=${dollar}(awk '/VmRSS/{print ${dollar}2}' /proc/${dollar}WPID/status 2>/dev/null)
+      echo "AICHAT_DSH_WAIT=${dollar}((i*2))s PS=${dollar}WPS LOG=${dollar}WSZ CPU=${dollar}WCPU ST=${dollar}WST RSS=${dollar}WMEM"
       tail -1 /tmp/dsh-web.log 2>/dev/null
+      if [ "${dollar}WPS" = "0" ]; then
+        echo AICHAT_DSH_DEAD
+        break
+      fi
     fi
   done
-  if [ ${dollar}i -ge 90 ]; then
+  if [ ${dollar}i -ge 900 ]; then
     echo AICHAT_DSH_FAIL
+    echo "DIAG_DSH_PS=${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | wc -l)"
+    echo "DIAG_FWD_PS=${dollar}(pgrep -f 'dsh-forward.js' 2>/dev/null | wc -l)"
+    echo "DIAG_DSH_LOG_BYTES=${dollar}(wc -c < /tmp/dsh-web.log 2>/dev/null || echo 0)"
+    echo "DIAG_FWD_LOG_BYTES=${dollar}(wc -c < /tmp/dsh-forward.log 2>/dev/null || echo 0)"
+    echo "DIAG_SEED_KEYLEN=${dollar}{#AICHAT_API_KEY}"
+    echo "DIAG_SEED_BASE=$seedBase"
+    echo "DIAG_SEED_MODEL=$seedModel"
+    echo "DIAG_DSH_BIN=${dollar}(ls -l /opt/dsh/bin/dsh 2>&1 | head -1)"
+    echo "DIAG_NODE=${dollar}(node -v 2>&1)"
+    echo "DIAG_TMP_WRITE=${dollar}(touch /tmp/_w 2>&1 && echo ok && rm -f /tmp/_w)"
+    echo "DIAG_PS_LIST"
+    ps -o pid,args 2>/dev/null | grep -E 'dsh|node' | grep -v grep | head -8
+    echo DIAG_DSH_LOG_TAIL
     tail -30 /tmp/dsh-web.log 2>/dev/null || true
+    echo DIAG_FWD_LOG_TAIL
+    tail -10 /tmp/dsh-forward.log 2>/dev/null || true
+    echo DIAG_DSH_LOGDIR
+    ls -lt /root/.dsh/logs 2>/dev/null | head -5
+    echo DIAG_DSH_STARTUP_TAIL
+    SLA2=${dollar}(ls -t /root/.dsh/logs/*.log 2>/dev/null | head -1)
+    [ -n "${dollar}SLA2" ] && tail -20 "${dollar}SLA2" 2>/dev/null
+    true
+    echo DIAG_TOKEN_SEARCH
+    grep -ho 'token=[A-Za-z0-9_-]\{20,\}' /tmp/dsh-web.log /root/.dsh/logs/*.log 2>/dev/null | tail -3
   else
     # 把 dsh 打印的监听 URL（guest IP:8000）改写成 App 侧可访问的 hostfwd 地址
-    URL=${dollar}(grep -o 'http://[^ ]*token=[^ ]*' /tmp/dsh-web.log 2>/dev/null | head -1)
+    # 注意：这里绝不能用 | head -1  head 提前退出会给 grep 发 SIGPIPE，
+    # 把长行截断（实测会出现 token 为空的 URL，WebView 就提示 authentication required）。
+    # 用 tail -1（会读完输入，不会提前退出），并要求 token 至少 20 个字符。
+    URL=${dollar}(grep -ho 'http://[^ ]*token=[A-Za-z0-9_-]\{20,\}' /tmp/dsh-web.log /root/.dsh/logs/*.log 2>/dev/null | tail -1)
     if [ -n "${dollar}URL" ]; then
-      echo "AICHAT_DSH_URL=${dollar}(echo ${dollar}URL | sed 's#^http://[^/]*#http://127.0.0.1:18000#')"
+      FIXED=${dollar}(echo "${dollar}URL" | sed 's#^http://[^/]*#http://127.0.0.1:18000#')
+      echo "AICHAT_DSH_URL=${dollar}FIXED"
+      echo "AICHAT_DSH_URL=${dollar}FIXED"
     fi
   fi
 else

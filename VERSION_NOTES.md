@@ -1,3 +1,478 @@
+## v2.61.45（加载遮罩）
+
+### 体验
+- DSH WebView 首次加载/慢机加载插件期间，显示原生遮罩：
+  DSH 正在加载插件，首次可能需要 13 分钟，请不要退出。
+- 页面探针确认渲染完成后自动隐藏；超过 5 分钟未完成会改为提示可点「诊断」。
+- 点「重载」或渲染进程重建时遮罩自动重新出现。
+- 不改变 v2.61.44 的 WebView 兼容层逻辑。
+
+- versionCode 321 / versionName 2.61.45
+
+## v2.61.44（白屏根治：WebView 兼容层）
+
+### 根因（已在 Android 模拟器 + QEMU + DSH 真机链路中验证）
+- 白屏与 API key、工作区、401 都无关。用 Chrome DevTools 连进 App 的 WebView 抓到：
+  `Uncaught TypeError: Promise.withResolvers is not a function @ http://127.0.0.1:18000/:45`
+- DSH 页面开头的 inline boot 脚本直接调用 `Promise.withResolvers()`，老 WebView 没有这个 API，
+  于是 `__DSH_BOOT_READY__` 永远不 resolve，前端停在 Loading plugins 或完全空白。
+- 用 DevTools 在页面加载前注入 polyfill 后，DSH UI 完整渲染（Into the Unknown / Choose workspace）。
+
+### 修复
+- App 在 `onPageStarted` 里、DSH 的 inline 脚本之前注入兼容层，只补缺失 API，不覆盖原生实现：
+  `Promise.withResolvers`、`AbortSignal.any`、`AbortSignal.timeout`、`Object.groupBy`、`Map.groupBy`。
+- 渲染看门狗不再把 Loading plugins 当白屏；首屏宽限 30 秒，真正空白连续约 40 秒才重载，最多 2 次。
+- 保留 v2.61.43 的 guest 端防御：ui-user-questions reconcile try/catch、connection recovery 超时放宽、
+  WebSocket 探针、onRenderProcessGone 重建、退出 Harness 不重载。
+
+- versionCode 320 / versionName 2.61.44
+
+## v2.61.43（DSH 页面空白看门狗 + 重配 setup 修复）
+
+### 针对点同意执行/计划审批后整页空白
+- 新增渲染看门狗：首屏 20 秒宽限后，每 8 秒检查一次可见内容；
+  连续 3 次（约 24 秒）无可见内容就自动用干净地址重载，最多 2 次。
+- DSH 的会话/消息都持久化在 guest 的 Host 里，重载后会恢复当前会话，
+  不会因为前端偶发空白而需要手动退出重进或重启 VM。
+- 重载只走不带 token 的干净地址，不消耗一次性 token。
+- 新增 onRenderProcessGone 处理：WebView 渲染进程被 Android 低内存回收时重建 WebView，
+  避免整页突然空白或 App 崩溃。
+- 注入 window.onerror / unhandledrejection 转发到诊断；白屏自动重载前还会把
+  __DSH_BOOT__ / __ModuleLoader__ / readyState / root 子节点数写进诊断，便于下一步定位。
+- 第二次自动重载带随机 query，绕开可能的旧缓存。
+- guest setup 会给 DSH 的 ui-user-questions 的 reconcile 加 try/catch 防御：
+  DSH 0.2.0-rc.2 里同意执行后如果 session binding 尚未就绪，reconcile 同步抛错会冒泡到
+  client 插件宿主，导致整个 Web UI 白屏；现在出错只写 console.error，不拖垮页面。
+- guest setup 通过 --patch overlay 给 DSH connection 放宽 recovery 超时：
+  generationReadyWarnMs=30000、generationReadyTimeoutMs=180000、backoffMaxMs=30000。
+  解决慢机 WebSocket remote.mux 握手超过默认 3s/15s 导致反复 cancel generation、页面白屏。
+- App 注入 WebSocket 探针：记录 remote.mux 的 open/opened/error/close，诊断条可直接判断是
+  WebSocket 握手失败还是服务端 ready 帧太慢。
+- **白屏真正根因**：手机自带 WebView 缺少 Promise.withResolvers / AbortSignal.any。
+  DSH 页面开头的 inline boot 脚本调用 Promise.withResolvers() 直接抛 TypeError，
+  __DSH_BOOT_READY__ 永远不 resolve，前端停在 Loading plugins 或空白。
+  App 现在在 onPageStarted 里、DSH inline 脚本之前注入兼容 polyfill，老 WebView 也能正常渲染。
+- 渲染看门狗不再把 Loading plugins 当成白屏，加载中不会重载；首屏宽限 30 秒，
+  真正完全空白连续约 40 秒才尝试恢复重载，最多 2 次。
+
+### 重配 DSH
+- 重配时只分析重配之后的新串口输出，避免旧 AICHAT_SETUP_DONE 让新的
+  setup 循环提前退出，导致按了重配却什么都没发生。
+
+### 保留
+- v2.61.42 的 Harness 退出不重载、返回复用 WebView。
+- 顶栏「重配」：改完 API key/模型后一键重启 guest dsh web。
+- WebView 不可见时 INVISIBLE 保留状态。
+
+- versionCode 319 / versionName 2.61.43
+
+## v2.61.42（Harness 退出不重载 + 白屏重试 + 一键重配 DSH）
+
+### App 侧
+- DS Harness 打开一次后保持挂载：退出 Harness 只是切到别的页面，WebView 不销毁、不 reload；
+  再进来直接复用原页面/WebSocket/session。BackHandler 只在 Harness 可见时生效。
+- WebView 不可见时设 INVISIBLE 保留状态，避免盖住其它页面。
+- DSH/VM 真正重启时用 DshState.generation 区分：只有换 token / 换会话才重新 load，
+  普通退出/进入绝不重新加载。
+- 主动白屏检测放宽：10 秒未渲染先继续等 20 秒（共 30 秒）再自动重载一次，
+  探针同时看 #root 是否有可见子节点，避免 QEMU 慢机首启被误判/误重载。
+- 顶栏新增「重配」：改完 API key/模型后点一下，会用当前 App 配置重写 DSH 模型配置、
+  重启 dsh web（不用重启整个 VM/手机）。重配时只看重配后的串口输出，避免旧
+  AICHAT_SETUP_DONE 让新的 setup 循环提前退出。
+
+### guest 侧
+- 复用 v2.61.41 的 `/root/.dsh/cordis.patch.yml`（workspace-controller.documentsDirectory=/root）
+  和透明 dsh-forward.js。
+
+- versionCode 318 / versionName 2.61.42
+
+## v2.61.41（DSH 白屏/工作区无法创建：配置默认 documentsDirectory + 白屏重载）
+
+### 根因
+- DSH 的首次工作区初始化在 Linux 上依赖 `xdg-user-dir DOCUMENTS`。Alpine guest 没有这个命令，
+  `initializeDefault` 查不到 Documents 目录，默认工作区创建失败，Web UI 可能停在空白主界面；
+  用户手动新建目录又常遇到 /root/harness already exists。
+- 另外 App 之前只在 3 秒时检查一次 body 文字长度，DSH 在 QEMU 单核慢机上首启没渲染完就误报白屏。
+
+### 修复
+1. guest setup 每次写入/追加 home 级 patch `/root/.dsh/cordis.patch.yml`：
+   `workspace-controller` 配置 `documentsDirectory: /root`。
+   这样 DSH 不再查 `xdg-user-dir`，会自动创建
+   `/root/deepseek-harness/default-workspace` 作为默认工作区。
+   （已存在 `id: workspace-controller` 行时跳过，避免覆盖用户自己的 home patch。）
+2. DSH WebView 白屏检测从 3 秒改为 8 秒，且改为先看 `#root` 是否已有子节点；
+   仍为空时自动用干净地址重载一次（不会消耗 token），再空才提示白屏。
+3. 诊断文案补充：Chrome 打开干净地址提示 authentication required 属于正常
+   （token 已被 App 消费，第二个客户端没有 cookie），不是 proot 问题。
+
+### 验证
+- 本地用 dsh `--dump-config` 验证 home patch 能正确覆盖 `workspace-controller` 的
+  `documentsDirectory`，配置写入生效。
+- `versionCode 317 / versionName 2.61.41`
+
+## v2.61.40（命理客观性 + 主动模式自适应心跳）
+
+### 命理师分析实时客观、去乐观倾向
+- 新增 FORTUNE_OBJECTIVITY 铁律，完整对话和主动模式心跳都会注入：
+  每轮只以本轮工具输出/用户原话/人物卡为准；不因用户期待、情绪、追问方式或上一轮结论改口。
+  吉凶并陈、正反同权：先讲不利/风险/代价，再讲有利/机会；不得为了安慰用户弱化、省略或拖延坏信息。
+  禁止无依据的乐观话术（"放宽心""一定会好起来""很快就有转机""运气不错""不用担心"等）；信息不足就直说"不确定/信息不足"。
+- 人物卡规则第 13 条补强：建设性不等于乐观化，必须先如实说清不利/风险，再给对策。
+- AnswerAuditor 新增命理乐观偏差审计：
+  出现安慰/乐观话术即提示；通篇没有不利/风险/代价词时，按"单边乐观"提醒补全反面依据。
+  正面/吉利词 >=3 且无任何风险词时，也提示正反同权。
+- 主动模式的非沉浸心跳以前只取 Persona 前 3 行，命理师会丢掉客观性原则；现在心跳也带通用 BASE + 命理实时客观性铁律。
+
+### 主动模式：20 秒 -> 5 分钟自适应心跳（5 分钟封顶）
+- 移除固定频率选择，改为自适应：
+  刚开启 / 用户一发消息：20 秒后心跳
+  如果没回：1 -> 2 -> 3 -> 4 -> 5 分钟
+  到 5 分钟后一直保持 5 分钟；用户再发消息立即回到 20 秒
+- ActiveConfig 增加 step / lastUserAt / lastHeartbeatAt，进程被杀或重启后也能从正确档位恢复。
+- ChatViewModel 在用户发消息时通知 ActiveModeService，按 convId 找到所有主动角色，取消当前闹钟并重排到 20 秒。
+- 心跳触发时先推进档位并加锁注册下一闹钟，避免请求中途被杀断链，也避免 20 秒和 5 分钟互相覆盖。
+- 主动模式对话框、前台通知、启动 Toast 同步显示自适应说明。
+
+- versionCode 316 / versionName 2.61.40
+
+## v2.61.39（修复 DSH API 401：透明转发，Host 不能再改写）
+
+### 根因
+2.61.33 为了让 DSH 接受来自 127.0.0.1:18000 的浏览器会话，在 guest 的 dsh-forward.js 里把
+Host/Origin 改写成 127.0.0.1:3080。但 DSH 的浏览器会话 cookie 名 = sha256(Host authority)，
+签名 audience 也绑定 Host。这段转发代码只在每条 TCP 连接的第一个请求上改写 Host；
+浏览器 keep-alive 复用连接后，后续 /api 请求会带着原始 Host=127.0.0.1:18000 直接到达 DSH，
+cookie 名对不上，于是：
+- 页面/静态资源能打开（根请求恰好被改写）
+- /api/session/modelCatalog、/api/directoryPicker/createDirectory 等 401
+- 工作区创建失败；重试时目录可能已存在，报 /root/harness already exists
+
+### 修复
+1. guest 里的 dsh-forward.js 改为透明 TCP 转发：0.0.0.0:8000 -> 127.0.0.1:3080，
+   不再改写 Host/Origin。App/WebView/后续 API 始终以 Host=127.0.0.1:18000 访问 DSH，
+   token 交换签发的 cookie 和后续所有请求的 authority 完全一致。
+2. App 侧 exchangeDshToken 在 303 响应里精确选择 dsh-auth-* cookie（不再盲取第一条
+   Set-Cookie），并校验 cookie 名前缀。
+3. WebView 回退路径：只有 url 仍带一次性 token 时才让 WebView 自己换 cookie；成功后把
+   DshState.webUrl 回写为干净地址，避免同一 token 被加载第二次。
+
+### 验证
+- Node 复现旧转发：keep-alive 连续两个请求，DSH 看到的 Host 分别是 ...:3080 和 ...:18000
+  （第二个请求的会话 cookie 必然对不上）。
+- 新转发：两个请求 Host 都是 ...:18000。
+- /api/session/modelCatalog、directoryPicker/createDirectory 不再 401，可正常创建工作区。
+
+- versionCode 315 / versionName 2.61.39
+
+## v2.61.38（DSH 认证：改由 App 自己换 cookie，WebView 只加载干净地址）
+
+### 为什么还要改
+2.61.37 修掉了"WebView 重复加载一次性 token"，但真机仍然 401（页面显示
+`dsh web authentication required`）。原因是 **主框架 401 不会触发 `onReceivedHttpError`**，
+所以诊断条看不到任何错误，而问题根源仍在"由 WebView 来完成一次性 token 交换"这件事本身
+（何时加载、加载几次、重进页面等都会影响）。
+
+### 新方案（确定性）
+把 tokencookie 的交换**交给 App 自己做**，WebView 只负责带 cookie 访问：
+1. App 用 `HttpURLConnection`（`instanceFollowRedirects=false`）请求 `http://127.0.0.1:18000/?token=`
+2. 读取 **303** 响应里的 `Set-Cookie: dsh-auth-`（这正是 DSH 换 cookie 的方式）
+3. `CookieManager.setCookie(clean, "name=value")` + `flush()`
+4. `DshState.webUrl` 存**不带 token 的干净地址**，WebView 只加载它
+    可安全重载、可随意重进页面（每次都靠 cookie）
+5. 同一 token 只交换一次（`dshUrlExchangedFor` 去重）；交换失败则退回带 token 的地址并打日志
+
+### 验证（PC 手机同款慢配置，模拟 App 的每一步）
+```
+A) 不跟随重定向: status=303 location=./ set-cookie=dsh-auth-=v1.; HttpOnly; SameSite=Strict
+B) 注入 cookie : dsh-auth-VPhEEcLKeqRDBoBalzN2Nm7CnfxKhLE00pKIDWxt1sw=
+C) 带 cookie 请求根路径: status=200 body=<!doctype html>   DSH 页面
+```
+
+- versionCode 314 / versionName 2.61.38
+
+## v2.61.37（DSH 认证失败根治：一次性 token 被重复加载）
+
+### 现象（DSH 已经起来、串口 token 完整的情况下）
+串口里 `AICHAT_DSH_URL=...token=<43 字符完整>` 打印正常，
+但 DS Harness 页显示 `dsh web authentication required; reopen the URL printed by dsh web.`
+（页面上那行 URL 看起来"token 为空"其实是文字被宽度裁掉了，真实 URL 是完整的。）
+
+### 根因：WebView 把一次性 token URL 加载了第二次
+`DshWebView` 里我写了：
+```kotlin
+update = { view -> if (view.url != url) view.loadUrl(url) }   //  错
+```
+DSH 的 `?token=` 是**进程一次性启动令牌**：首次加载会 **303 重定向**到干净地址并下发会话 cookie
+（此时 `view.url` 已变成干净地址） `update` 判定"不一样" **又用同一个（已作废的）token 加载一次**
+ DSH 拒绝  页面就显示 authentication required。
+
+### 修复
+1. **`update` 不再重复加载**（一次性 token 绝不加载第二次）
+2. **「重载」按钮走"干净地址"**（`url.substringBefore("?token=") `），靠首次换来的 cookie 认证
+3. **再次进入 DS Harness 页**时：若已有 `dsh-auth-*` cookie  直接用干净地址；
+   否则才用带 token 的地址换 cookie（避免拿作废 token 再加载）
+4. 上一版的产物保留：脚本端 `tail -1`（不再 SIGPIPE 截断）+ token 20 字符校验 + URL 打印两遍
+
+### 验证
+- 脚本端：PC 手机同款慢配置实测 `AICHAT_DSH_OK` @80.8s，URL 完整 43 字符
+- 服务端：`HTTP[with-token] 200`（重定向后带 cookie）、`HTTP[follow-cookie] 200`（cookie 生效）
+- token 只能换一次 cookie 这一点，是 DSH 的设计（`PROCESS_LAUNCH_TOKENS` + 303 + Set-Cookie）
+
+- versionCode 313 / versionName 2.61.37
+
+## v2.61.36（DSH 通了：token 被管道截断导致 authentication required）
+
+### 真机现象（DSH 已经起来之后）
+DS Harness 页 URL 显示为 `http://127.0.0.1:18000/?token=`  **token 是空的**，
+DSH 页面回 "dsh web authentication required; reopen the URL printed by dsh web."
+（诊断条同时报 `HTTP 404 @ .../favicon.ico`，那是无害的。）
+
+### 根因：shell 管道竞态（SIGPIPE 截断）
+脚本里提取 URL 用的是
+```sh
+URL=$(grep -ho 'http://[^ ]*token=[^ ]*' /tmp/dsh-web.log | head -1)
+```
+`head -1` 读到第一行就退出，会给前面的 `grep` 发 **SIGPIPE**，grep 正好在写这行时被打断
+ **长行被截断**（恰好断在 `token=` 后面），机器越快越不容易撞上（我 PC 上就没复现）。
+
+### 修复（三层防呆）
+1. **脚本**：改用 `tail -1`（会读完输入，不提前退出），并且 grep 要求
+   `token=[A-Za-z0-9_-]\{20,\}`（**token 少于 20 字符根本不匹配**）
+2. **脚本**：`AICHAT_DSH_URL=` 连续打印两遍（App 取最后一条）
+3. **App**：解析改用 `lastIndexOf("AICHAT_DSH_URL=")`，并且**校验 token 长度  20**
+    空 token 的 URL 再也不可能被拿去加载 WebView（宁可继续等，也不用错的）
+
+### 验证（PC 手机同款慢配置，实测）
+```
+[ 80.8s] AICHAT_DSH_OK
+         AICHAT_DSH_URL=http://127.0.0.1:18000/?token=KjfKt2-6zAAk7oLyLneSg_BKmYTw5tZEGj_eRp41K1k   (43 字符完整)
+HTTP[with-token] status=200  body=<!doctype html>（DSH 页面）
+HTTP[follow-cookie] status=200
+```
+
+- versionCode 312 / versionName 2.61.36
+
+## v2.61.35（真凶确认：装错 targetSdk 的包；已把坑堵死）
+
+### 真凶（用 aapt 实测确认）
+```
+AI-Chat-...-combined-linux-target28-release.apk  -> targetSdkVersion 28   PRoot 可执行 rootfs 内二进制
+AI-Chat-...-combined-target35-release.apk        -> targetSdkVersion 35   Android 10+ W^X 拦截 -> execve Permission denied
+```
+`proot error: execve("/usr/bin/env"): Permission denied` **正是 targetSdk>=29 的 W^X 拦截**，
+不是 QEMU 坏了  装了 target35 的包，PRoot 整条通道（QEMU / DSH / 工具链）都是废的。
+（App 早就内置了 `compatibilityWarning()`，但只在 Linux 环境页提示过，不够醒目。）
+
+### 本版防呆
+1. **PRoot 启动失败/临时目录不可写时，报错里直接写明**：
+   "你装的是 targetSdk=N 的包  请改装带 target28 的那个 APK"
+2. **VM 状态面板常驻显示该警告**（targetSdk>=29 时）
+3. 交付上只把 **target28** 版放桌面，并命名为 `手机装这个-target28`
+
+### 同时保留上一版的 PRoot 加固
+- `PROOT_TMP_DIR` 从 `cacheDir`（会被系统清空）改到 `filesDir/linux/proot-tmp`，启动前重建 + 写测试 + 清残留
+- 空间预检（离线 QEMU 400MB / ISO 300MB / 预装镜像按 gzip ISIZE 精确计算 / 在线 600MB）
+- VM 页新增「清理临时文件（释放空间）」按钮；状态面板显示可用空间
+
+- versionCode 311 / versionName 2.61.35
+
+## v2.61.34（修 "proot error: execve(/usr/bin/env): Permission denied" + 空间管理）
+
+### 现象
+```
+失败: 离线安装 QEMU 失败（exit=1）:
+proot error: execve("/usr/bin/env"): Permission denied
+proot error: can't chmod '/data/data/com.example.aichat/cache/proot-20321-kFr1mB': No such file or directory
+```
+之后 **QEMU 也用不了了**（所有 guest 命令都走同一条 PRoot 通道）。
+
+### 根因
+PRoot 需要把**自己的加载器**解压到 `PROOT_TMP_DIR` 再 chmod + exec。
+之前这个目录设的是 **`cacheDir`**  Android 在**存储紧张时会自动清空 App 缓存目录**，
+目录/文件一消失，就出现上面前两条报错：加载器 chmod 失败  接着 execve 失败  **整条 PRoot 通道废掉**
+（所以"qemu都不对了"）。
+
+### 修复
+1. **`PROOT_TMP_DIR` 改到稳定目录**：`filesDir/linux/proot-tmp`（系统不会自动清理），
+   每次启动前 `ensureProotTmp()`：重建目录 + **写测试** + 清掉上次残留的 `proot-*` 半成品加载器
+2. `exec()` 与 `startProcess()`（QEMU 走这条）**统一注入** `applyProotEnv()`；
+   目录不可写时给出明确指引（不再是一串 proot 内部错误）：
+   "PRoot 临时目录不可写常见原因：手机存储已满，或系统已清理 App 缓存。请清理空间后重试"
+3. **空间预检**（`StatFs`）：
+   - 离线安装 QEMU：需要 ~400MB
+   - 释放内核/ISO：需要 ~300MB
+   - 展开内置预装系统：**按 gzip 尾部 ISIZE 算出解压后真实体积 + 300MB**
+   - 在线安装 QEMU：需要 ~600MB
+   不足时直接给出："存储空间不足：X 需要约 N MB，当前可用 M MB"（不再跑到一半失败）
+4. **新增「清理临时文件（释放空间）」按钮**（VM 页）：
+   清理半成品镜像 `alpine.qcow2.part`、`vm/qemu-apks`、`linux/*.tmp`、PRoot 残留、离线包缓存等，
+   并显示释放了多少 MB
+5. **状态面板新增「存储」一行**：可用空间 < 500MB 会标 
+
+- versionCode 310 / versionName 2.61.34
+
+## v2.61.33（DSH 真机卡死根治  已在"手机同款慢配置"下端到端验证通过）
+
+### 真机现象
+`AICHAT_DSH_PS=1`（进程活着）+ `AICHAT_DSH_LOG_BYTES=0`（日志为空）+ 测试返回 405
+ 定位：**不是 DSH 没起来，是脚本自己卡死 + 等得不够久 + 会话 authority 不一致**
+
+### 本轮实测发现并修掉的 5 个真 bug
+1. **脚本永久卡死（主因）**：`tail -3 $(ls -t /root/.dsh/logs/*.log | head -1)`
+   在匹配不到文件时，命令行退化成裸的 `tail -3`  **去读 stdin（tty） 永不返回**
+    脚本卡在 `AICHAT_DSH_STARTLOG` 之后，等待循环根本没机会跑（这正是真机日志"就没输出了"）
+   修复：先取变量，判空后再 tail（两处）；`wget` 也补 `</dev/null`
+2. **等待窗口 180s 太短**：慢机（单核 cortex-a53 + 单线程 TCG）实测 DSH 从启动到打印 token 需要
+   **74.5 秒**，真机更慢  现在改为**"只要进程还活着就一直等"（最多 30 分钟）**，每 30 秒打印
+   `AICHAT_DSH_WAIT=...s PS=<进程数> LOG=<日志字节>`；进程死了才提前 `AICHAT_DSH_DEAD`
+3. **转发器不重写 Host/Origin**：DSH 的浏览器会话凭据（cookie 名 + 签名 audience）**绑定 request authority**，
+   经 18000 进来会和 DSH 自己的 3080 不一致  现在转发器把 `Host`/`Origin` 改写成 `127.0.0.1:3080`
+4. **复用判断**：从"日志里有没有 token"改为 `pgrep -f 'dsh --profile web'`（进程活着就复用），
+   并去掉 `>>` 追加（避免重跑时把 token 冲掉/覆盖）
+5. **配置值清洗**：API Key / baseURL / model 里的换行、制表符会被注进 shell 把行断掉
+    现在统一清洗（key 去 `\r\n\t` + trim + 单引号转义；URL 去掉所有空白）
+
+### 端到端验证（PC 上按手机速度：-smp 1 / cortex-a53 / 单线程 TCG / 2GB）
+```
+[ 74.5s] AICHAT_DSH_OK
+         dsh web: http://127.0.0.1:3080/?token=***
+         AICHAT_DSH_URL=http://127.0.0.1:18000/?token=***
+HTTP[with-token]    status=200  body=<!doctype html> ...（DSH 页面）
+HTTP[follow-cookie] status=200
+cookies = dsh-auth-...（会话 cookie 正确签发）
+```
+即：**VM 启动  DSH 就绪  token 抓取  hostfwd/转发  DSH UI 200  cookie 建立** 全链路通过。
+
+### 附带修复（本版一并包含）
+- **400 insufficient tool messages**：新增 `ToolCallSanitizer`（纯函数，6 组自检）+ 上下文压缩改为"工具组整组裁剪"
+- 面相报告导出（人物卡面板「面相报告」按钮：markdown + 分享 + 剪贴板）
+- DS Harness WebView 诊断条（重载 / 复制链接 / 诊断：控制台错误 + HTTP 错误 + 白屏自检）
+
+- versionCode 309 / versionName 2.61.33
+
+## v2.61.32（进程级诊断：DSH 活着但日志为空  直读 /proc）
+
+### 2.61.31 的真机诊断给出的关键事实
+```
+AICHAT_DSH_PS=1             DSH 进程确实在跑（与"测试返回 405"完全吻合）
+AICHAT_DSH_LOG_BYTES=0      但它一个字节都没写进 /tmp/dsh-web.log
+AICHAT_SEED_BASE/MODEL 正常；AICHAT_DSH_CFG_HEAD 显示配置已写入
+```
+ 结论：问题不是"起没起"，而是 **DSH 的输出没有进那个日志文件**（所以 token 抓不到）。
+
+### 本版新增（直读进程状态，不再猜）
+- `DIAG_CMD`  = `/proc/<pid>/cmdline`（它到底被什么命令行、带什么参数启动的）
+- `DIAG_FD1/FD2` = stdout/stderr 实际指向哪个文件（**若是 "(deleted)" 就说明日志被删过**）
+- `DIAG_CWD`  = 工作目录
+- `DIAG_LISTEN` / `DIAG_HTTP_ROOT` = 端口监听情况 + 直接问 DSH 的根路径返回什么
+- `DIAG_LOGDIR_LIST` = `/root/.dsh/logs` 列表
+- **从 fd 兜底捡 token**：若 fd1 指向的文件里有 `token=`，直接打印
+  `AICHAT_DSH_TOKEN_FROM_FD=...`，并且等待循环也认它  即使日志路径不对也能成功
+- 失败分支同样带 `DIAG_DSH_STARTUP_TAIL` / `DIAG_TOKEN_SEARCH`
+
+- versionCode 308 / versionName 2.61.32
+
+## v2.61.31（重要线索：405 说明 DSH 其实活着  token 只是没进那个日志）
+
+### 关键判断
+DS Harness 页「测试」返回 **HTTP 405**（不是"连接失败"）说明 `127.0.0.1:18000` 上**有 HTTP 服务在应答**
+ **DSH 很可能已经正常运行**，只是它的 token URL 没写进 `/tmp/dsh-web.log`（该日志一直是空的），
+于是脚本判 FAIL、App 没有 URL  回退到旧界面。
+
+### 修复/增强
+1. **token 检索范围扩大**：等待循环与 URL 提取现在同时搜
+   `/tmp/dsh-web.log` 和 **DSH 自己的启动日志** `/root/.dsh/logs/*.log`
+   （DSH 遇到问题时会写 "Full diagnostics: /root/.dsh/logs/startup-*.log"，token 也可能只落在那里）
+2. **第二形态兜底启动**：首次启动 3 秒后若没有 DSH 进程，改用 `export AICHAT_API_KEY=... + nohup dsh ...` 再试一次
+   （绕开 `env VAR=cmd` 这种写法；会在串口打印 `AICHAT_DSH_RETRY_SIMPLE`）
+3. **失败分支诊断补全**（保证出现在可见的日志末尾）：
+   `DIAG_DSH_PS / DIAG_FWD_PS / DIAG_DSH_LOG_BYTES / DIAG_FWD_LOG_BYTES / DIAG_SEED_KEYLEN /
+    DIAG_SEED_BASE / DIAG_SEED_MODEL / DIAG_DSH_BIN / DIAG_NODE / DIAG_TMP_WRITE /
+    DIAG_PS_LIST / DIAG_DSH_LOG_TAIL / DIAG_FWD_LOG_TAIL / DIAG_DSH_LOGDIR / DIAG_DSH_STARTUP_TAIL / DIAG_TOKEN_SEARCH`
+4. 启动处也加 `AICHAT_DSH_STARTLOG`（DSH 启动日志尾 3 行）
+
+- versionCode 307 / versionName 2.61.31
+
+## v2.61.30（修 DSH 卡在等待 + 启动自检全打出来）
+
+### 现象
+真机 2.61.29：`AICHAT_DSH_BEGIN  dsh 0.2.0-rc.2  AICHAT_DSH_CONFIG_WRITTEN  AICHAT_DSH_WAIT=30/60/90/120s`
+一直等待；`/tmp/dsh-web.log` **空的**（说明 DSH 根本没跑起来或输出被吞）。
+
+### 两个改动（一个是回退，一个是真凶候选）
+1. **回退到真机验证成功过的启动写法**：`>/tmp/dsh-web.log`（不再用 `>>`），并在启动前 `rm -f` 旧日志
+   - 复用判断从"日志里有没有 token"改为**"进程是否还活着"**：`pgrep -f 'dsh --profile web'`
+     （旧的写法有副作用：重跑时会去 greps 日志、并可能截断 token）
+2. **清洗注入脚本的配置值（真凶候选）**：API Key / baseURL / model 里若带**换行或制表符**，
+   生成的 shell 会变成 `AICHAT_API_KEY='sk-xxx<换行>'`  **整行断掉  DSH 起不来、日志空白**，
+   与现象完全吻合。现在：
+   - `seedKey`：去掉 `\r\n\t` + trim + 单引号转义
+   - `seedBase`：去掉**所有空白** + 去尾 `/`
+   - `seedModel`：去掉 `\r\n\t` + trim
+
+### 启动自检（下次一眼定位）
+`AICHAT_DSH_BEGIN` 之后会立刻打印：
+```
+AICHAT_DSH_PS=<进程数>          AICHAT_FWD_PS=<转发进程数>
+AICHAT_DSH_LOG_BYTES=<日志字节>  AICHAT_SEED_KEYLEN=<key 长度，不泄露内容>
+AICHAT_SEED_BASE=<baseURL>      AICHAT_SEED_MODEL=<model>
+AICHAT_DSH_CFG_HEAD + 配置前两行  AICHAT_DSH_LOG_TAIL + 日志尾 3 行
+```
+
+- versionCode 306 / versionName 2.61.30
+
+## v2.61.29（修复 400：insufficient tool messages  工具协议清洗）
+
+### 现象
+发图片时"思考很久"后报：
+`400 An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'`
+
+### 根因（定位到具体代码）
+上下文压缩那段（`totalChars > 300_000` 时触发）**只删了 tool 结果消息**：
+```
+val remove = oldTools.dropLast(3)
+conversationDtos.removeAll { dto -> remove.any { it === dto } }   // 只删 tool，留下 assistant(tool_calls)
+```
+ 下次请求里 `assistant(tool_calls)` 后面缺了对应 `tool` 结果  DeepSeek 直接 400。
+**为什么"发图片"会触发**：图片让 token 数轻松冲过 30 万阈值，正好踩中这段压缩。
+
+### 修复（两层）
+1. **新增 `ToolCallSanitizer`（纯函数，所有请求发出前必过）**：
+   - `assistant(tool_calls)` 之后必须紧跟**每个** `tool_call_id` 的 `tool` 消息；缺任何一个  整组降级为纯文本（丢 `tool_calls`），不再半配对
+   - 孤立的 `tool` 消息直接丢弃；顺序错乱按 `tool_call_id` 重排
+   - 挂载点：主 Agent 循环请求 + 断点恢复请求（两处 `ChatRequest`）
+   - **这一层是通用兜底**：中途取消、断点恢复、任何历史裁剪都不会再把 400 抛给用户
+2. **压缩逻辑改为"工具组"整组裁剪**：`assistant(tool_calls)` 与其 `tool` 结果同进同出；
+   裁剪最早 user/assistant 时，也把它后面的 `tool` 结果一起带走
+
+### 验证
+- `ToolCallSanitizer.selfTest()` 6 组用例：配对保留 / 孤立 tool_calls 降级（保留文本）/ 半配对整组丢弃 /
+  孤立 tool 丢弃 / 顺序错乱按 id 重排 / 普通对话不受影响
+- 与人物卡自检一起 JVM 直跑：**ALL SELF-TEST PASS**（17 + 6）
+- debug 启动会同时跑两套自检并打日志
+
+- versionCode 305 / versionName 2.61.29
+
+## v2.61.28（DS Harness WebView 诊断版：定位白屏）
+
+背景：真机实测 WebView 已能加载 DSH（HARNESS + Loading plugins...），但随后**白屏**；
+「用浏览器打开」被拒。翻 DSH 源码得到两个确定结论：
+
+1. **API 栅栏没问题**：`isTrustedApiRequest()` 只要求 `Host` 是环回地址 + `Origin` 与 `Host` 同源
+    我们在 `127.0.0.1:18000` 下**满足**（所以白屏不是"origin 被拒"）
+2. **启动 token 一次性**：`PROCESS_LAUNCH_TOKENS`（换完 cookie 即作废），且 cookie 名由
+   `requestAuthority(headers)` 生成（绑定 authority） **同一链接给第二个客户端（系统浏览器）必然被拒**
+    浏览器兜底这条路本质走不通，已把按钮改为「复制链接」
+
+本版新增（就是为抓白屏原因）：
+- WebView 顶部诊断条：**控制台错误**（onConsoleMessage）/ **HTTP 错误**（onReceivedHttpError）/
+  资源错误（onReceivedError）实时收集；点「收起」自动复制到剪贴板
+- **白屏自检**：onPageFinished 3 秒后查 `document.body.innerText` 长度，过短判定"渲染为空"并提示
+- WebView 兼容设置：桌面 UA（DSH 是桌面优先 UI）+ 宽视口 + 双指缩放 + 接收 Cookie + debug 打开
+  `setWebContentsDebuggingEnabled`（可用 chrome://inspect 远程调试）
+
+- versionCode 304 / versionName 2.61.28
+
 ## v2.61.27（面相报告导出 + guest 脚本重跑修复）
 
 ### 新增：面相报告导出

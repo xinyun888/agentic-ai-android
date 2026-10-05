@@ -91,11 +91,8 @@ fun ChatScreen(
     var showCardPanel by remember { mutableStateOf(false) }
     var editingPersona by remember { mutableStateOf<Persona?>(null) }
     var showActiveModeDialog by remember { mutableStateOf(false) }
-    var pmFrequency by remember { mutableStateOf(15) }
     var pmImmersive by remember { mutableStateOf(false) }
     var pmHideThink by remember { mutableStateOf(true) }
-    val frequencyOptions = remember { listOf(5, 15, 30, 60, 120, 240) }
-    val frequencyLabels = remember { listOf("5分钟", "15分钟", "30分钟", "1小时", "2小时", "4小时") }
     // 长按消息"删除此条及之后"：保存保留条数（截断点）
     var truncateKeep by remember { mutableStateOf<Int?>(null) }
     // 工作区文件删除确认
@@ -108,7 +105,6 @@ fun ChatScreen(
                 action = com.example.aichat.service.ActiveModeService.ACTION_START
                 putExtra(com.example.aichat.service.ActiveModeService.EXTRA_PERSONA_ID, viewModel.activePersonaId)
                 putExtra(com.example.aichat.service.ActiveModeService.EXTRA_CONV_ID, conversationId)
-                putExtra(com.example.aichat.service.ActiveModeService.EXTRA_INTERVAL_MIN, pmFrequency)
                 putExtra(com.example.aichat.service.ActiveModeService.EXTRA_IMMERSIVE, pmImmersive)
                 putExtra(com.example.aichat.service.ActiveModeService.EXTRA_SHOW_THINKING, !pmHideThink)
                 putExtra(com.example.aichat.service.ActiveModeService.EXTRA_START_HOUR, 0)
@@ -1116,16 +1112,12 @@ fun ChatScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
                     Text("角色：${viewModel.getActivePersona(ctx).emoji} ${viewModel.getActivePersona(ctx).name}")
                     Text("每轮心跳消息会写回当前对话。多个角色可同时开启。", style = MaterialTheme.typography.labelSmall)
-                    Text("频率", style = MaterialTheme.typography.labelSmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-                        frequencyOptions.forEachIndexed { i, freq ->
-                            FilterChip(
-                                selected = pmFrequency == freq,
-                                onClick = { pmFrequency = freq },
-                                label = { Text(frequencyLabels[i], style = MaterialTheme.typography.labelSmall) }
-                            )
-                        }
-                    }
+                    Text("自适应频率", style = MaterialTheme.typography.labelSmall)
+                    Text(
+                        "你有对话后 20 秒轮询一次；没回就逐级 1 -> 2 -> 3 -> 4 -> 5 分钟，5 分钟封顶。你一发消息立即回到 20 秒。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = pmImmersive, onCheckedChange = { pmImmersive = it })
                         Text("沉浸模式 ${if (pmImmersive) "(完整上下文)" else "(轻盈≈500t)"}", style = MaterialTheme.typography.labelSmall)
@@ -1202,7 +1194,7 @@ fun ChatScreen(
                         val notifEnabled = NotificationManagerCompat.from(ctx).areNotificationsEnabled() &&
                             notifPermission && !channelBlocked
                         if (notifEnabled) {
-                            Toast.makeText(ctx, "主动模式已启动，${pmFrequency} 分钟后首次心跳", Toast.LENGTH_LONG).show()
+                            Toast.makeText(ctx, "主动模式已启动：20 秒后首次心跳，自适应最高 5 分钟", Toast.LENGTH_LONG).show()
                         } else {
                             Toast.makeText(ctx, "主动模式已启动，但通知被系统关闭/频道被关闭，通知栏不会显示。请在设置中允许通知。", Toast.LENGTH_LONG).show()
                         }

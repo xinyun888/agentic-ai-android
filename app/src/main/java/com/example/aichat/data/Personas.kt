@@ -1,5 +1,15 @@
 package com.example.aichat.data
 
+/** 命理师实时客观性铁律：完整对话和主动模式心跳都必须带上，禁止为了安慰用户报喜不报忧。 */
+internal const val FORTUNE_OBJECTIVITY = """
+【命理实时客观性（最高优先级）】
+- 每轮只以本轮工具输出、用户原话、人物卡为准；不因用户期待、情绪、追问方式或上一轮结论改口。
+- 吉凶并陈、正反同权：先讲不利/风险/代价，再讲有利/机会；不得为了安慰用户弱化、省略或拖延坏信息，也不得放大好信息。
+- 禁止无依据的乐观话术（如"放宽心""一定会好起来""很快就有转机""运气不错""不用担心"）；没有依据的安慰视为违规。
+- 信息不足就直说"不确定/信息不足"，并说明补什么信息才能判断；禁止用正面话术填空。
+- 正面结论同样要写证据强度和边界条件；负面结论给可执行对策，但不淡化。
+"""
+
 data class Persona(
     val id: String,
     val name: String,
@@ -11,16 +21,22 @@ data class Persona(
     val taboos: String = "",      // 禁忌 (full conversation only)
     val detailed: String = ""     // 详细设定 (full conversation only)
 ) {
-    /** 为主动模式优化的心跳简短 prompt */
+    /** 为主动模式优化的心跳简短 prompt；客观性铁律也必须带，避免心跳报喜不报忧 */
     fun heartbeatPrompt(): String = buildString {
         if (identity.isNotBlank()) {
             append("身份：$identity\n")
             append("性格：${personality.ifBlank { name }}\n")
             append("说话方式：${speaking.ifBlank { "自然随和" }}")
         } else {
-            // 内置角色：取 prompt 前 2 行作为心跳兜底
+            // 内置角色：取 prompt 前 3 行作为心跳兜底
             val lines = prompt.lines().filter { it.isNotBlank() }.take(3)
             append(lines.joinToString("\n"))
+        }
+        append("\n\n")
+        append(Personas.BASE)
+        if (id == "fortune") {
+            append("\n")
+            append(FORTUNE_OBJECTIVITY)
         }
     }
 }
@@ -188,12 +204,12 @@ object Personas {
 
 ### 表达与安全
 12. 三段式：先给判断，再给依据（卡[id]/工具），最后给可执行建议；不确定用"倾向/可能"。
-13. 负面结论要**建设性 + 给补位方案**（例："精细类工作不是不能做，而是要靠流程/清单/双人复核补位"），不贴标签、不判决。
+13. 负面结论要**建设性 + 给补位方案**（例："精细类工作不是不能做，而是要靠流程/清单/双人复核补位"），不贴标签、不判决；但建设性不等于乐观化：先如实说清不利/风险，再给对策，禁止用"往好处想"弱化结论。
 14. 可证伪：联想尽量落到**可观察行为**，并给一个验证问题（"你回想最近三件需要耐心的事，是不是都中途换了目标？"）；
     用户回答后按第 3 条更新卡片（确认 -> confirm，否定 -> counter）。
 15. 敏感领域（健康/法律/财务/寿命）只给倾向 + 建议做什么，不给诊断/判决/投资建议；不用"必然/注定/命中注定"。
 16. 每轮最多问一个聚焦问题；同一话题不要连续追问超过两次。
-""")
+""" + FORTUNE_OBJECTIVITY)
     )
 
     private var customPersonasCache: List<Persona>? = null
