@@ -1,6 +1,8 @@
 package com.example.aichat.ui
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -23,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.aichat.data.ApiProfile
 import com.example.aichat.data.ChatMessage
@@ -30,6 +33,7 @@ import com.example.aichat.data.HttpClient
 import com.example.aichat.linux.PhoneBridgeHttpServer
 import com.example.aichat.viewmodel.ChatViewModel
 import com.example.aichat.vm.DshState
+import com.example.aichat.vm.QemuManager
 import com.google.gson.Gson
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
@@ -63,7 +67,14 @@ fun HarnessScreen(
     onBack: () -> Unit
 ) {
     BackHandler(enabled = active) { onBack() }
-    var mode by remember { mutableStateOf(if (com.example.aichat.vm.DshState.ready) "guest" else "builtin") }
+    var mode by remember { mutableStateOf(if (DshState.ready || DshState.externalBrowser) "guest" else "builtin") }
+    var externalModeUi by remember { mutableStateOf(DshState.externalBrowser) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            externalModeUi = DshState.externalBrowser
+            delay(1000)
+        }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -83,7 +94,12 @@ fun HarnessScreen(
                         onClick = { mode = "guest" },
                         label = { Text("QEMU") }
                     )
-                    Spacer(Modifier.width(4.dp))
+                    Spacer(Modifier.width(2.dp))
+                    TextButton(onClick = {
+                        mode = "guest"
+                        chatViewModel.qemuManager.setExternalBrowser(!externalModeUi)
+                    }) { Text(if (externalModeUi) "内置渲染" else "浏览器", style = MaterialTheme.typography.labelSmall) }
+                    Spacer(Modifier.width(2.dp))
                     TextButton(onClick = {
                         mode = "guest"
                         chatViewModel.qemuManager.restartGuestHarness()
@@ -95,7 +111,7 @@ fun HarnessScreen(
         if (mode == "builtin") {
             BuiltinHarness(chatViewModel, profile, conversationId, Modifier.padding(padding))
         } else {
-            GuestHarness(active, Modifier.padding(padding))
+            GuestHarness(chatViewModel.qemuManager, active, Modifier.padding(padding))
         }
     }
 }
@@ -199,16 +215,26 @@ private fun BuiltinHarness(
 }
 
 @Composable
-private fun GuestHarness(active: Boolean, modifier: Modifier = Modifier) {
-    // Guest 里的 DeepSeek Harness（dsh web）一就绪，就直接内嵌它的 Web UI
+private fun GuestHarness(qemuManager: QemuManager, active: Boolean, modifier: Modifier = Modifier) {
+    // Guest 里的 DeepSeek Harness（dsh web）就绪后：外部浏览器模式交给 Chrome，内置模式才挂 WebView
     var dshUrl by remember { mutableStateOf(DshState.webUrl) }
     var dshGeneration by remember { mutableStateOf(DshState.generation) }
+    var external by remember { mutableStateOf(DshState.externalBrowser) }
+    var browserUrl by remember { mutableStateOf(DshState.browserUrl) }
+    var browserNonce by remember { mutableStateOf(DshState.browserLaunchNonce) }
     LaunchedEffect(Unit) {
         while (true) {
             dshUrl = DshState.webUrl
             dshGeneration = DshState.generation
+            external = DshState.externalBrowser
+            browserUrl = DshState.browserUrl
+            browserNonce = DshState.browserLaunchNonce
             delay(2000)
         }
+    }
+    if (external) {
+        ExternalBrowserPanel(qemuManager, active, browserUrl, browserNonce, modifier)
+        return
     }
     if (!dshUrl.isNullOrBlank()) {
         DshWebView(dshUrl!!, dshGeneration, active, modifier)
@@ -477,6 +503,84 @@ private fun GuestHarness(active: Boolean, modifier: Modifier = Modifier) {
                 }) { Text("保存") }
             },
             dismissButton = { TextButton(onClick = { showSettings = false }) { Text("取消") } }
+        )
+    }
+}
+
+/** 外部浏览器模式下由 App 拉起系统浏览器，不消耗 WebView 的 cookie 会话。 */
+private fun launchDshInBrowser(context: Context): String? {
+    val raw = DshState.browserUrl ?: return "DSH 还没有启动完成"
+    val target = if (DshState.browserTokenConsumed) raw.substringBefore("?token=") else raw
+    return try {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(target)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+        // 只有真正拉起浏览器后才算 token 已交给浏览器；拉起失败时保留 raw token，下次还能重试。
+        if (!DshState.browserTokenConsumed) DshState.browserTokenConsumed = true
+        null
+    } catch (e: Exception) {
+        "无法打开系统浏览器: ${e.message}"
+    }
+}
+
+@Composable
+private fun ExternalBrowserPanel(
+    qemuManager: QemuManager,
+    active: Boolean,
+    browserUrl: String?,
+    launchNonce: Int,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var error by remember { mutableStateOf<String?>(null) }
+    var lastAutoNonce by remember { mutableStateOf(Int.MIN_VALUE) }
+    LaunchedEffect(browserUrl, launchNonce, active) {
+        if (active && !browserUrl.isNullOrBlank() && launchNonce != lastAutoNonce) {
+            lastAutoNonce = launchNonce
+            error = launchDshInBrowser(context)
+        }
+    }
+    Column(
+        modifier = modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("DSH 由系统浏览器渲染", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(10.dp))
+        Text(
+            if (browserUrl.isNullOrBlank())
+                "等待 guest DSH 启动\n启动完成后会自动打开系统浏览器。QEMU 由前台服务保持运行，切到浏览器不会中断。"
+            else
+                "地址：\n" + browserUrl.substringBefore("?token="),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(18.dp))
+        Button(
+            onClick = { error = launchDshInBrowser(context) },
+            enabled = !browserUrl.isNullOrBlank()
+        ) { Text("重新打开浏览器") }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = {
+            error = null
+            qemuManager.restartGuestHarness()
+        }) { Text("重配 DSH 并重新打开") }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = {
+            qemuManager.setExternalBrowser(false)
+        }) { Text("切回内置 WebView") }
+        error?.let {
+            Spacer(Modifier.height(12.dp))
+            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "注意：系统浏览器自身也要支持 Promise.withResolvers（Chrome 119+）；如果浏览器版本太老，" +
+                "内嵌 WebView 的兼容层反而更稳，可点「切回内置 WebView」。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
         )
     }
 }

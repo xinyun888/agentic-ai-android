@@ -3,6 +3,10 @@ package com.example.aichat.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -19,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.aichat.vm.DshState
 import com.example.aichat.vm.QemuManager
 import com.example.aichat.vm.QemuSession
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +46,12 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
     var session by remember { mutableStateOf<QemuSession?>(existingSession) }
     var running by remember { mutableStateOf(existingSession?.running?.value ?: false) }
     var vmOutput by remember { mutableStateOf(existingSession?.output?.value ?: "") }
+    var dshExternal by remember { mutableStateOf(DshState.externalBrowser) }
+    var dshBrowserReady by remember { mutableStateOf(!DshState.browserUrl.isNullOrBlank()) }
+    var dshWarmup by remember { mutableStateOf(DshState.browserWarmup) }
+    var crashReport by remember { mutableStateOf(DshState.crashReport) }
+    var crashReportStale by remember { mutableStateOf(DshState.crashReportStale) }
+    var seedKeyLen by remember { mutableStateOf(DshState.seedKeyLen) }
 
     LaunchedEffect(session) {
         val s = session ?: return@LaunchedEffect
@@ -66,6 +77,21 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
 
     // 退出页面不再停止 QEMU；由 QemuKeepAliveService 保持运行，重新进入时自动接管当前会话。
 
+    // 外部浏览器模式下 DSH/QEMU 要在后台长期运行；申请忽略电池优化，减少被 OEM 后台清理导致
+    // 浏览器退出后服务器就没了/一直重新连接。只会在 VM 页首次进入时请求一次。
+    LaunchedEffect(Unit) {
+        try {
+            val pm = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(appContext.packageName)) {
+                appContext.startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + appContext.packageName)
+                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+        } catch (_: Exception) {}
+    }
     LaunchedEffect(Unit) {
         refreshStatus()
         while (isActive) {
@@ -78,6 +104,12 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                 session = null
                 vmOutput = ""
             }
+            dshExternal = DshState.externalBrowser
+            dshBrowserReady = !DshState.browserUrl.isNullOrBlank()
+            dshWarmup = DshState.browserWarmup
+            crashReport = DshState.crashReport
+            crashReportStale = DshState.crashReportStale
+            seedKeyLen = DshState.seedKeyLen
             delay(1500)
         }
     }
@@ -309,6 +341,100 @@ fun VmScreen(manager: QemuManager, onBack: () -> Unit) {
                         refreshStatus()
                     }
                 ) { Text("安全模式", maxLines = 1) }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        if (!running) {
+                            appendLog("请先启动 VM；DSH 启动完成后会自动打开系统浏览器。")
+                        } else if (!dshExternal) {
+                            appendLog("正在重配 DSH 并切换到系统浏览器完成后会自动打开浏览器。")
+                            manager.setExternalBrowser(true)
+                        } else if (dshWarmup) {
+                            appendLog("DSH 已启动，正在预热插件；预热结束后会自动打开系统浏览器，请稍等。")
+                        } else if (!manager.openDshInBrowser()) {
+                            appendLog("DSH 还没就绪；启动完成后会自动打开，也可以点「复制 DSH 地址」手动打开。")
+                        }
+                    }
+                ) { Text(if (dshExternal) "打开 DSH 浏览器" else "切换到浏览器渲染", maxLines = 1) }
+                OutlinedButton(
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        val url = DshState.browserUrl
+                        if (url.isNullOrBlank()) {
+                            appendLog("DSH 地址还没生成；先启动 VM，等 DSH 就绪后再复制。")
+                        } else {
+                            val target = if (DshState.browserTokenConsumed) url.substringBefore("?token=") else url
+                            val clip = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clip.setPrimaryClip(ClipData.newPlainText("dsh_url", target))
+                            appendLog("已复制 DSH 地址：" + target)
+                        }
+                    }
+                ) { Text("复制 DSH 地址", maxLines = 1) }
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                modifier = Modifier.fillMaxWidth(),
+                enabled = running,
+                onClick = {
+                    manager.restartGuestHarness()
+                    appendLog("已请求重配 DSH：使用当前 API 配置重启并重新注入模型 Key。")
+                }
+            ) { Text("重配 DSH（应用 API 配置）", maxLines = 1) }
+            TextButton(
+                onClick = {
+                    val report = DshState.crashReport
+                    if (report.isNullOrBlank()) {
+                        appendLog("暂无 DSH 崩溃摘要；如果刚崩溃，请等 3 秒后再点。")
+                    } else {
+                        val clip = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clip.setPrimaryClip(ClipData.newPlainText("dsh_crash", report))
+                        appendLog("已复制 DSH 崩溃摘要到剪贴板。")
+                    }
+                },
+                modifier = Modifier.align(Alignment.End)
+            ) {
+                Text(
+                    when {
+                        crashReport.isNullOrBlank() -> "复制崩溃日志"
+                        crashReportStale -> "复制历史崩溃日志（DSH 已恢复）"
+                        else -> "复制崩溃日志（已抓取）"
+                    },
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+            if (dshExternal) {
+                Text(
+                    if (dshWarmup)
+                        "外部浏览器模式：DSH 已就绪，正在预热插件（慢机需要几分钟），预热结束后会自动打开浏览器。"
+                    else if (dshBrowserReady)
+                        "外部浏览器模式：DSH 已就绪，可点「打开 DSH 浏览器」或复制地址到任意浏览器。"
+                    else
+                        "外部浏览器模式：等待 DSH 启动，完成后会自动打开系统浏览器。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+            // DSH 本身没有登录/填 key 弹窗；它会静默使用 App「API 配置」里当前 profile 的 key。
+            // key 为空时 UI 仍允许发消息，但请求会一直挂起，所以这里必须明确提示。
+            if (seedKeyLen == 0) {
+                Text(
+                    "模型 Key：未配置。DSH 可以输入消息，但模型请求会一直等待/失败；请到 App「API 配置」填好 key 后点「重配」。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            } else if (seedKeyLen > 0) {
+                Text(
+                    "模型 Key：已从 App「API 配置」注入（${seedKeyLen} 字符），DSH 不会再次询问。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
             }
 
             Spacer(Modifier.height(6.dp))

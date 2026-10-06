@@ -222,8 +222,12 @@ object PhoneBridgeHttpServer {
                 }
                 return
             }
+            // DSH guest 通过 10.0.2.2 调手机桥模型代理，它拿不到 phone bridge token；
+            // /v1/* 只暴露给 QEMU guest networking，且代理内部仍用 App 当前 profile 的 key，
+            // 所以这几个模型转发路由免 token。其余设备能力接口仍必须带 token。
+            val modelProxyPath = path == "/v1/chat/completions" || path == "/v1/models" || path == "/model/chat"
             when {
-                requestToken != tokenValue || tokenValue.isBlank() -> {
+                (requestToken != tokenValue || tokenValue.isBlank()) && !modelProxyPath -> {
                     writeResponse(socket, 403, "forbidden")
                 }
                 method == "GET" && path == "/phone/ping" -> {
@@ -347,7 +351,11 @@ object PhoneBridgeHttpServer {
             .replace(Regex("[\r\n\t]"), "")
             .trim()
             .replace("'", "'\\''")
-        val seedBase = profile?.baseUrl.orEmpty().filter { !it.isWhitespace() }.trimEnd('/')
+        val profileBase = profile?.baseUrl.orEmpty().filter { !it.isWhitespace() }.trimEnd('/')
+        // guest 直连外网可能没有可用 DNS/路由（当前 QEMU dns=192.168.1.1 在部分网络下解析不了），
+        // 所以有 key 时让 DSH 走手机桥的 OpenAI 代理（10.0.2.2:PORT/v1），由 App 用当前 profile 转发到模型。
+        // 保留 profile 原始 baseURL：guest DNS 修好后直连官方模型；桥代理仍有 token/路由兼容问题。
+        val seedBase = profileBase
         val seedModel = profile?.model.orEmpty()
             .replace(Regex("[\r\n\t]"), "")
             .trim()
@@ -365,6 +373,16 @@ object PhoneBridgeHttpServer {
         // 2) QEMU 慢机连接 WebSocket mux 的 ready 帧可能超过默认 15 秒，放宽到 3 分钟，
         //    避免 "generation was not ready within 15000ms; cancelling generation" 反复重连导致白屏。
         val workspaceBlock = "mkdir -p /root/.dsh; " +
+            // 先处理最容易导致创建不了工作区的两类 guest 侧问题：
+            // 1) 根分区因 journal/异常被挂成 ro -> 重新挂载 rw；
+            // 2) /root 或默认工作区目录不存在/权限不对 -> 以 root 预创建并 chmod 755。
+            // DSH 在 guest 里以 root 运行，本身不受 Android 存储权限限制；真正的写失败基本都在这里。
+            "mount -o remount,rw / 2>/dev/null || true; " +
+            "mkdir -p /root/deepseek-harness/default-workspace 2>/dev/null || true; " +
+            "chmod 755 /root /root/deepseek-harness /root/deepseek-harness/default-workspace 2>/dev/null || true; " +
+            "if touch /root/deepseek-harness/default-workspace/.aichat-write-test 2>/dev/null; then " +
+            "rm -f /root/deepseek-harness/default-workspace/.aichat-write-test; echo AICHAT_DSH_WRITE_OK; " +
+            "else echo AICHAT_DSH_WRITE_FAIL; fi; " +
             "printf -- '- id: workspace-controller\\n  config:\\n    documentsDirectory: /root\\n" +
             "- id: connection\\n  config:\\n    recovery:\\n" +
             "      backoffBaseMs: 1000\\n      backoffFactor: 1.5\\n      backoffMaxMs: 30000\\n" +
@@ -429,6 +447,138 @@ JS_UQ_EOF
 node /tmp/aichat-patch-uq.js >/tmp/aichat-patch-uq.log 2>&1 || true
 echo "AICHAT_DSH_UQ_PATCH=${dollar}(tail -1 /tmp/aichat-patch-uq.log 2>/dev/null)"
 fi
+# DSH 的 READY_MARKUP 在页面最前面调用 Promise.withResolvers()；老 WebView/浏览器没有这个 API 会直接抛错，
+# __DSH_BOOT_READY__ 永远不 resolve，UI 停在 Loading plugins 或空白。这里在 DSH 自己的 HTML 模板里、
+# READY_MARKUP 之前插入兼容层：内嵌 WebView 和系统浏览器（外部模式）都能直接受益。
+HOSTWS=/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js
+if [ -f "${dollar}HOSTWS" ]; then
+cat > /tmp/aichat-patch-html.js <<'JS_HTML_EOF'
+const fs = require('fs');
+const p = '/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-host-webserver/lib/index.js';
+if (!fs.existsSync(p)) process.exit(0);
+let s = fs.readFileSync(p, 'utf8');
+if (s.indexOf('__AICHAT_COMPAT__') >= 0) { console.log('already patched'); process.exit(0); }
+const poly = '/*__AICHAT_COMPAT__*/' +
+  "if(typeof Promise.withResolvers!=='function'){Object.defineProperty(Promise,'withResolvers',{configurable:true,writable:true,value:function(){var r,j,p=new Promise(function(a,b){r=a;j=b;});return {promise:p,resolve:r,reject:j};}});}" +
+  "if(typeof AbortSignal.any!=='function'){AbortSignal.any=function(sigs){var c=new AbortController(),a=function(r){if(!c.signal.aborted)c.abort(r);};for(var i=0;sigs&&i<sigs.length;i++){var g=sigs[i];if(!g)continue;if(g.aborted){a(g.reason);break;}g.addEventListener('abort',function(){a(this.reason);},{once:true});}return c.signal;};}" +
+  "if(typeof AbortSignal.timeout!=='function'){AbortSignal.timeout=function(ms){var c=new AbortController();setTimeout(function(){try{c.abort(new DOMException('TimeoutError','TimeoutError'));}catch(_){c.abort();}},ms);return c.signal;};}";
+const html = '<script>' + poly + '</script><script>(globalThis.__DSH_BOOT_READY__ ??= Promise.withResolvers()).resolve()</script>';
+const start = s.indexOf('const READY_MARKUP = ');
+if (start < 0) { console.log('READY_MARKUP not found'); process.exit(0); }
+const end = s.indexOf('\n', start);
+if (end < 0) { console.log('READY_MARKUP line end not found'); process.exit(0); }
+const line = 'const READY_MARKUP = ' + JSON.stringify(html) + ';';
+s = s.slice(0, start) + line + s.slice(end + 1);
+fs.writeFileSync(p, s);
+console.log('patched');
+JS_HTML_EOF
+node /tmp/aichat-patch-html.js >/tmp/aichat-patch-html.log 2>&1 || true
+echo "AICHAT_DSH_HTML_PATCH=${dollar}(tail -1 /tmp/aichat-patch-html.log 2>/dev/null)"
+fi
+# DSH 的 dsh-sandbox-local 在 Linux 上会先探测 bwrap，失败后探测 landlock-run。
+# landlock-run 的 native probe 在部分真机/QEMU 组合下抛 std::system_error: No error information，
+# 导致 DSH 启动即 abort（exit=134）。QEMU guest 本身就是隔离环境，这里直接让 confine 返回原始 argv，
+# 跳过 bwrap/landlock 探测，避免该 native abort。
+SB1=/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
+SB2=/opt/dsh/lib/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js
+if [ -f "${dollar}SB1" ] || [ -f "${dollar}SB2" ]; then
+cat > /tmp/aichat-patch-sandbox.js <<'JS_SB_EOF'
+const fs = require('fs');
+const paths = [
+  '/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js',
+  '/opt/dsh/lib/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js'
+];
+for (const p of paths) {
+  if (!fs.existsSync(p)) continue;
+  let s = fs.readFileSync(p, 'utf8');
+  if (s.indexOf('[aichat] sandbox bypass') >= 0) { console.log('already patched ' + p); continue; }
+  const fn = 'async confine(argv, policy, signal) {';
+  const i = s.indexOf(fn);
+  if (i < 0) { console.log('confine missing ' + p); continue; }
+  const call = 'signal?.throwIfAborted();';
+  const j = s.indexOf(call, i);
+  if (j < 0) { console.log('throwIfAborted missing ' + p); continue; }
+  const at = j + call.length;
+  const inject = '\n\t\t/* [aichat] sandbox bypass: QEMU guest is the isolation boundary; landlock-run probe aborts on some devices */\n' +
+    '\t\treturn Promise.resolve({ argv: [...argv], enforcement: "partial", denialSignatures: [], runnerFailureRules: [] });';
+  s = s.slice(0, at) + inject + s.slice(at);
+  fs.writeFileSync(p, s);
+  console.log('patched ' + p);
+}
+JS_SB_EOF
+node /tmp/aichat-patch-sandbox.js >/tmp/aichat-patch-sandbox.log 2>&1 || true
+if grep -q 'patched' /tmp/aichat-patch-sandbox.log 2>/dev/null; then
+  echo "AICHAT_DSH_SANDBOX_PATCH=patched"
+else
+  echo "AICHAT_DSH_SANDBOX_PATCH=failed"
+  tail -5 /tmp/aichat-patch-sandbox.log 2>/dev/null || true
+fi
+# session-persistence-jsonl 在写会话时调用 native flock（system.node）。在部分真机/QEMU 组合里，
+# 这个 native 调用会抛 std::system_error: No error information 并 abort（exit=134，发生在启动几分钟后）。
+# guest 里同一时刻只有一个 DSH 进程，跨进程文件锁没有意义，这里直接去掉 native flock 调用。
+SP1=/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js
+SP2=/opt/dsh/lib/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js
+if [ -f "${dollar}SP1" ] || [ -f "${dollar}SP2" ]; then
+cat > /tmp/aichat-patch-flock.js <<'JS_FL_EOF'
+const fs = require('fs');
+const paths = [
+  '/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js',
+  '/opt/dsh/lib/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js'
+];
+for (const p of paths) {
+  if (!fs.existsSync(p)) continue;
+  let s = fs.readFileSync(p, 'utf8');
+  if (s.indexOf('[aichat] skip native flock') >= 0) { console.log('already patched ' + p); continue; }
+  const call = 'await tryLockExclusive(handle.fd);';
+  const i = s.indexOf(call);
+  if (i < 0) { console.log('tryLockExclusive missing ' + p); continue; }
+  s = s.slice(0, i) + '/* [aichat] skip native flock: single DSH process per guest; native flock aborts on this QEMU combo */' + s.slice(i + call.length);
+  fs.writeFileSync(p, s);
+  console.log('patched ' + p);
+}
+JS_FL_EOF
+node /tmp/aichat-patch-flock.js >/tmp/aichat-patch-flock.log 2>&1 || true
+if grep -q 'patched' /tmp/aichat-patch-flock.log 2>/dev/null; then
+  echo "AICHAT_DSH_FLOCK_PATCH=patched"
+else
+  echo "AICHAT_DSH_FLOCK_PATCH=failed"
+  tail -5 /tmp/aichat-patch-flock.log 2>/dev/null || true
+fi
+fi
+# dsh-subprocess-local 在 Linux 上也会用 koffi FFI 加载 libc（execve/fcntl）。
+# koffi.node 在部分真机/QEMU 组合里一加载就抛 std::system_error -> abort（exit=134，浏览器里一用会话/工具就触发）。
+# 让它的 Linux bootstrap 探测直接失败，走普通 child_process fallback，彻底不加载 koffi。
+KO1=/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
+KO2=/opt/dsh/lib/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js
+if [ -f "${dollar}KO1" ] || [ -f "${dollar}KO2" ]; then
+cat > /tmp/aichat-patch-koffi.js <<'JS_KO_EOF'
+const fs = require('fs');
+const paths = [
+  '/opt/dsh/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js',
+  '/opt/dsh/lib/node_modules/@deepseek-ai/dsh-subprocess-local/lib/runner-launch-B2zsQ1Dz.js'
+];
+for (const p of paths) {
+  if (!fs.existsSync(p)) continue;
+  let s = fs.readFileSync(p, 'utf8');
+  if (s.indexOf('[aichat] koffi disabled') >= 0) { console.log('already patched ' + p); continue; }
+  const fn = 'function loadLinuxExecve() {';
+  const i = s.indexOf(fn);
+  if (i < 0) { console.log('loadLinuxExecve missing ' + p); continue; }
+  const inject = '\n\tthrow new Error("[aichat] koffi disabled under QEMU to avoid native abort");';
+  s = s.slice(0, i + fn.length) + inject + s.slice(i + fn.length);
+  fs.writeFileSync(p, s);
+  console.log('patched ' + p);
+}
+JS_KO_EOF
+node /tmp/aichat-patch-koffi.js >/tmp/aichat-patch-koffi.log 2>&1 || true
+if grep -q 'patched' /tmp/aichat-patch-koffi.log 2>/dev/null; then
+  echo "AICHAT_DSH_KOFFI_PATCH=patched"
+else
+  echo "AICHAT_DSH_KOFFI_PATCH=failed"
+  tail -5 /tmp/aichat-patch-koffi.log 2>/dev/null || true
+fi
+fi
+fi
 if [ -x /opt/dsh/bin/dsh ]; then
   ln -sf /opt/dsh/bin/dsh /usr/local/bin/dsh 2>/dev/null || true
   echo "dsh ${dollar}(/opt/dsh/bin/dsh --version 2>/dev/null)"
@@ -456,6 +606,78 @@ net.createServer((c) => {
   s.on('error', () => c.destroy());
 }).listen(8000, '0.0.0.0');
 JS_EOF
+  # DSH 进程守护：DSH/Node 偶发崩溃或被 OOM 杀掉后，自动重新拉起。
+  # DSH 的浏览器 cookie 签名密钥持久化在 /root/.dsh（cookieMaxAgeDays=30），
+  # 进程重启后旧 cookie 仍然有效，浏览器可自动重连，不需要重新发 token。
+  cat > /usr/local/bin/aichat-dsh-supervisor.sh <<'DSH_SUP_EOF'
+#!/bin/sh
+# AICHAT_DSH_SUPERVISOR_V1
+export DSH_HOME=/root/.dsh
+export NODE_COMPILE_CACHE=/root/.node-cache
+# DSH/Node 在 QEMU 慢机上偶发 V8 abort（exit=134）。显式限制 old space，避免默认堆上限过高导致
+# 宿主 2GB guest 内触发 native abort；同时保留足够 heap 给 540 插件加载。
+export NODE_OPTIONS="--max-old-space-size=1400 --max-semi-space-size=64"
+cd /root
+while true; do
+  if [ -f /tmp/aichat-dsh-stop ]; then exit 0; fi
+  if ! pgrep -f 'dsh --profile web' >/dev/null 2>&1; then
+    echo "AICHAT_DSH_SUPERVISOR_START ${dollar}(date)" >>/tmp/dsh-web.log
+    NODE_OPTIONS="${dollar}NODE_OPTIONS --report-on-fatalerror --report-directory=/root/.dsh" node --require /tmp/aichat-dsh-hook.js /opt/dsh/bin/dsh --profile web --patch /root/.dsh/aichat.patch.yml --no-open --port 3080 --host 127.0.0.1 --trusted-host 127.0.0.1:18000 >>/tmp/dsh-web.log 2>&1
+    code=${dollar}?
+    cp /tmp/dsh-web.log /tmp/aichat-dsh-last.log 2>/dev/null || true
+    {
+      echo "===== AICHAT_DSH_CRASH exit=${dollar}code ${dollar}(date) ====="
+      echo "--- mem ---"
+      free -m 2>/dev/null || true
+      echo "--- dmesg tail (OOM? segfault?) ---"
+      dmesg 2>/dev/null | tail -50 || true
+      echo "--- dsh log tail ---"
+      tail -100 /tmp/aichat-dsh-last.log 2>/dev/null || true
+    } >> /tmp/aichat-dsh-crash.log 2>&1
+    echo "AICHAT_DSH_EXIT=${dollar}code" >>/tmp/dsh-web.log
+    # 同时往串口打崩溃摘要，VM 终端/App 日志能直接看到退出码、日志尾和 dmesg；
+    # 这样不用再手动 cat crash.log，截图串口就能定位 exit=134 的原因。
+    {
+      echo "===== AICHAT_DSH_CRASH exit=${dollar}code ${dollar}(date) ====="
+      echo "--- dsh log tail ---"
+      tail -25 /tmp/aichat-dsh-last.log 2>/dev/null || true
+      echo "--- runtime hook tail ---"
+      tail -50 /tmp/aichat-dsh-runtime.log 2>/dev/null || true
+      echo "--- dsh own logs ---"
+      DSHLOG=${dollar}(ls -t /root/.dsh/logs/*.log 2>/dev/null | head -1)
+      if [ -n "${dollar}DSHLOG" ]; then tail -60 "${dollar}DSHLOG" 2>/dev/null || true; fi
+      echo "--- node report files ---"
+      ls -lt /root/.dsh/report.*.json 2>/dev/null | head -3 || true
+      echo "--- dmesg tail ---"
+      dmesg 2>/dev/null | tail -12 || true
+      echo "AICHAT_DSH_CRASH_END"
+    } > /dev/ttyAMA0 2>&1 || true
+  fi
+  sleep 2
+done
+DSH_SUP_EOF
+  chmod +x /usr/local/bin/aichat-dsh-supervisor.sh
+  # DSH 运行期钩子：记录每个 native addon 的 dlopen、未捕获异常/警告和退出码。
+  # 这样 exit=134 abort 后能知道最后加载/执行到哪个 native 模块。
+  cat > /tmp/aichat-dsh-hook.js <<'JS_HOOK_EOF'
+const fs = require('fs');
+const log = (s) => {
+  try { fs.appendFileSync('/tmp/aichat-dsh-runtime.log', new Date().toISOString() + ' ' + s + '\n'); } catch (_) {}
+};
+try {
+  const origDlopen = process.dlopen;
+  process.dlopen = function (module, filename, flags) {
+    log('dlopen ' + filename);
+    return origDlopen.apply(this, arguments);
+  };
+  process.on('uncaughtException', (e) => log('uncaughtException ' + (e && e.stack || e)));
+  process.on('unhandledRejection', (e) => log('unhandledRejection ' + (e && e.stack || e)));
+  process.on('warning', (w) => log('warning ' + (w && w.stack || w)));
+  process.on('exit', (c) => log('exit ' + c));
+  log('hook installed');
+} catch (_) {}
+JS_HOOK_EOF
+  rm -f /tmp/aichat-dsh-runtime.log
   # 重启转发器（旧版本在跑的话换掉）
   if [ -f /tmp/dsh-forward.pid ]; then
     kill ${dollar}(cat /tmp/dsh-forward.pid) 2>/dev/null
@@ -465,27 +687,44 @@ JS_EOF
   (nohup node /usr/local/bin/dsh-forward.js >/tmp/dsh-forward.log 2>&1 & echo ${dollar}! > /tmp/dsh-forward.pid)
   sleep 2
   $workspaceBlock
-  $seedBlock  # 脚本可能被重跑（App 超时重试/手动再执行）：用"进程是否还活着"判断，活着就复用，
+  # OOM 保护：磁盘模式创建 256MB swap（Live/tmpfs 不创建，避免吃内存）。
+  # 很多 DSH 崩溃其实是 guest 内存不足被内核 OOM kill；crash log 里会留下 dmesg 证据。
+  if [ ! -f /root/.aichat-swap ] && (df -T / 2>/dev/null | grep -q ext4 || mount 2>/dev/null | grep ' / ' | grep -q ext4); then
+    dd if=/dev/zero of=/root/.aichat-swap bs=1M count=256 2>/dev/null || true
+    chmod 600 /root/.aichat-swap 2>/dev/null || true
+    mkswap /root/.aichat-swap >/dev/null 2>&1 && swapon /root/.aichat-swap 2>/dev/null || true
+    echo 10 > /proc/sys/vm/swappiness 2>/dev/null || true
+  fi
+  echo "AICHAT_SWAP=${dollar}(free -m 2>/dev/null | grep -i swap || echo none)"
+  # guest 直连 api.deepseek.com 需要 DNS；QEMU 的 dns=192.168.1.1 在部分移动网络下不可达，
+  # 这里强制写公共 DNS，避免 DSH 模型请求瞬间 transport failed。
+  mkdir -p /etc
+  printf -- 'nameserver 223.5.5.5\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+  echo "AICHAT_DNS=${dollar}(cat /etc/resolv.conf 2>/dev/null | tr '\n' ' ')"
+  $seedBlock  # 脚本可能被重跑（App 超时重试/手动再执行）：supervisor 活着就复用，
   # 不重启也不覆盖日志（覆盖会把 token 弄丢，界面就误报 AICHAT_DSH_FAIL）
-  if pgrep -f 'dsh --profile web' >/dev/null 2>&1; then
+  # 先把 key 放进当前 setup shell，后面的自检 AICHAT_SEED_KEYLEN 才能反映真实注入长度；
+  # 之前只给 supervisor 进程 env，echo 永远看到空值，App 就误报未配置。
+  export AICHAT_API_KEY='$seedKey'
+  rm -f /tmp/aichat-dsh-stop
+  if pgrep -f aichat-dsh-supervisor.sh >/dev/null 2>&1; then
     echo AICHAT_DSH_REUSE
   else
     rm -f /tmp/dsh-web.log
-    (nohup env AICHAT_API_KEY='$seedKey' /opt/dsh/bin/dsh --profile web --patch /root/.dsh/aichat.patch.yml --no-open --port 3080 --host 127.0.0.1 \
-        --trusted-host 127.0.0.1:18000 >/tmp/dsh-web.log 2>&1 &)
+    (nohup env AICHAT_API_KEY='$seedKey' /usr/local/bin/aichat-dsh-supervisor.sh >/tmp/aichat-dsh-supervisor.log 2>&1 &)
     sleep 3
   fi
-  # 兜底：3 秒后进程还不在，就换一种写法再试（export 注入环境变量 + 直接 nohup 执行）
-  if [ ${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | wc -l) -eq 0 ]; then
+  # 兜底：3 秒后 supervisor 还不在，就换一种写法再试（export 注入环境变量 + 直接 nohup 执行）
+  if [ ${dollar}(pgrep -f aichat-dsh-supervisor.sh 2>/dev/null | wc -l) -eq 0 ]; then
     echo AICHAT_DSH_RETRY_SIMPLE
     export AICHAT_API_KEY='$seedKey'
     cd /root
-    (nohup /opt/dsh/bin/dsh --profile web --patch /root/.dsh/aichat.patch.yml --no-open --port 3080 --host 127.0.0.1 \
-        --trusted-host 127.0.0.1:18000 >>/tmp/dsh-web.log 2>&1 &)
+    (nohup /usr/local/bin/aichat-dsh-supervisor.sh >>/tmp/aichat-dsh-supervisor.log 2>&1 &)
     sleep 4
   fi
   # 启动后立刻自检：进程数 / 日志大小 / 日志尾  出问题一眼能看出来
   echo "AICHAT_DSH_PS=${dollar}(pgrep -f 'dsh --profile web' 2>/dev/null | wc -l)"
+  echo "AICHAT_DSH_SUP_PS=${dollar}(pgrep -f aichat-dsh-supervisor.sh 2>/dev/null | wc -l)"
   echo "AICHAT_DSH_LOG_BYTES=${dollar}(wc -c < /tmp/dsh-web.log 2>/dev/null || echo 0)"
   echo "AICHAT_SEED_KEYLEN=${dollar}{#AICHAT_API_KEY}"
   echo "AICHAT_SEED_BASE=$seedBase"

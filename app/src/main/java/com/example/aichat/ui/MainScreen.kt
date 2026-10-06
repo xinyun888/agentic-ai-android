@@ -41,9 +41,6 @@ fun MainScreen(
                     IconButton(onClick = { viewModel.showLinux = true }) {
                         Icon(Icons.Filled.Terminal, contentDescription = "Linux 环境")
                     }
-                    IconButton(onClick = { viewModel.showHarness = true }) {
-                        Icon(Icons.Filled.SmartToy, contentDescription = "DS Harness")
-                    }
                     IconButton(onClick = { viewModel.showProfileManager = true }) {
                         Icon(Icons.Outlined.Tune, contentDescription = "API 配置")
                     }

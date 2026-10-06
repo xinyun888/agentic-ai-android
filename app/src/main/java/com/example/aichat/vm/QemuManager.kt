@@ -1,7 +1,9 @@
 package com.example.aichat.vm
 
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import com.example.aichat.linux.LinuxRuntimeManager
@@ -43,10 +45,13 @@ class QemuManager private constructor(private val context: Context, val linux: L
             "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_VERSION/releases/aarch64/netboot"
         const val QEMU_GUEST_PATH = "/usr/bin/qemu-system-aarch64"
 
-        /** guest 启动看门狗：超过该时间还没进 shell 就自动用快速模式重试 */
-        private const val BOOT_WATCHDOG_MS = 240_000L
-        /** 磁盘启动要走完整 OpenRC（首次还有 ext4 journal 回放），给更宽的预算 */
-        private const val BOOT_WATCHDOG_DISK_MS = 900_000L
+        /** guest 启动看门狗：总预算内没进 shell 才降级；慢机磁盘挂载可能几分钟没输出，给足时间 */
+        private const val BOOT_WATCHDOG_MS = 1_200_000L
+        /** 磁盘启动要走完整 OpenRC（首次还有 ext4 journal 回放），慢机可到几十分钟 */
+        private const val BOOT_WATCHDOG_DISK_MS = 3_600_000L
+        /** 串口多久没有新增输出才算卡住；有进度就继续等，不再单纯按总时间回退 */
+        private const val BOOT_STALL_MS = 240_000L
+        private const val BOOT_STALL_DISK_MS = 420_000L
         /** 发完安装命令后，等 guest 回显 AICHAT_SETUP_BEGIN 的时间 */
         private const val SETUP_RETRY_MS = 60_000L
         /** 安装命令最多重发次数（串口写入/网络偶发失败时自救） */
@@ -57,6 +62,16 @@ class QemuManager private constructor(private val context: Context, val linux: L
     }
 
     val vmDir: File = linux.vmDir
+
+    init {
+        // 外部浏览器模式：不换 cookie，直接把带 token 的地址交给系统浏览器（Chrome）。
+        // QemuKeepAliveService 会让 QEMU 在 App 退到后台后继续运行，浏览器才能持续访问 127.0.0.1:18000。
+        // App 内 Harness 入口已移除，DSH 默认就走外部系统浏览器；强制写 true，
+        // 避免旧版本残留的 external_browser=false 让用户还要手动切模式。
+        DshState.externalBrowser = true
+        context.getSharedPreferences("dsh_mode", Context.MODE_PRIVATE)
+            .edit().putBoolean("external_browser", true).apply()
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -395,7 +410,8 @@ class QemuManager private constructor(private val context: Context, val linux: L
         safeMode: Boolean = false,
         fastBootOverride: Boolean? = null
     ): List<String> {
-        // Android + PRoot 下 TCG 多线程 + OpenRC 并行服务会卡死；统一用单线程 TCG 和 cortex-a53
+        // Android + PRoot 下 MTTCG 多线程 + OpenRC 实测会卡死在启动阶段（模拟器复现），
+        // 所以继续用单线程 TCG；DSH 慢的问题改由预热完成后再打开浏览器来规避。
         val accel = "tcg,thread=single"
         val cpu = "cortex-a53"
         val mem = if (safeMode) minOf(memoryMb, 512) else memoryMb
@@ -593,6 +609,135 @@ class QemuManager private constructor(private val context: Context, val linux: L
     fun currentSession(): QemuSession? = activeSession
 
     /** 用户改了 API key/模型后调用：重跑 guest setup，重新写 DSH 模型配置并重启 dsh web。 */
+    /**
+     * 在 App 侧先用一次性 token 换 cookie，把 DSH 首页 HTML 里的 /plugins combo 和 /assets 全部
+     * 预取一遍。DSH 服务端会把生成的 combo 响应缓存在内存（源码里的 responses Map），
+     * 所以浏览器随后加载同样 URL 时就命中服务端缓存，不需要在 QEMU 里重复做几十秒的编译/拼接。
+     * token 在进程生命周期内可重复使用，预热不会把浏览器挡在门外。
+     */
+    private suspend fun warmupDshAssets(tokenUrl: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = tokenUrl.substringBefore("?token=")
+        val noRedirect = OkHttpClient.Builder()
+            .connectTimeout(4, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+        var cookie: String? = null
+        try {
+            noRedirect.newCall(Request.Builder().url(tokenUrl).get().build()).execute().use { resp ->
+                cookie = resp.headers("Set-Cookie")
+                    .firstOrNull { it.startsWith("dsh-auth-") }
+                    ?.substringBefore(";")
+            }
+        } catch (_: Exception) {
+            return@withContext false
+        }
+        if (cookie.isNullOrBlank()) return@withContext false
+
+        val client = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(180, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+        val html = try {
+            client.newCall(
+                Request.Builder().url(clean).header("Cookie", cookie!!).get().build()
+            ).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                resp.body?.string().orEmpty()
+            }
+        } catch (_: Exception) {
+            return@withContext false
+        }
+        if (html.isBlank()) return@withContext false
+
+        val base = try { java.net.URI(clean) } catch (_: Exception) { null }
+        val assets = Regex("""(?:src|href)=["']([^"']+)["']""")
+            .findAll(html)
+            .map { it.groupValues[1].replace("&amp;", "&") }
+            // 只预载主前端 /assets（index/vendor/css），不再把全部 /plugins combo 也抓一遍：
+            // 后者会把 DSH 的 combo responses 缓存撑大，慢机上容易触发 V8/native abort（exit=134）。
+            .filter { it.contains("/assets/") }
+            .mapNotNull { raw ->
+                try {
+                    base?.resolve(raw)?.toString() ?: raw
+                } catch (_: Exception) { null }
+            }
+            .distinct()
+            .toList()
+        if (assets.isEmpty()) return@withContext false
+
+        // 顺序预取，避免在单核 guest 上并发把 Node 打满；每个响应读干净让服务端完成缓存。
+        for (asset in assets) {
+            try {
+                client.newCall(
+                    Request.Builder().url(asset).header("Cookie", cookie!!).get().build()
+                ).execute().use { resp ->
+                    resp.body?.source()?.use { src ->
+                        val sink = okio.Buffer()
+                        while (src.read(sink, 16 * 1024L) != -1L) { /* discard */ }
+                    }
+                }
+            } catch (_: Exception) {
+                // 单个资源失败不阻断其它资源预热
+            }
+        }
+        true
+    }
+
+    /**
+     * DSH 打印 URL 只代表 host 进程起来了，client 插件组合资源/接口在慢机上仍可能几十秒。
+     * 这期间打开浏览器会看到重新连接中 / Failed to fetch。这里用无 cookie 的 GET / 探测：
+     * 连续 3 次 1.5 秒内返回 401 才认为服务真正空闲/预热完成。
+     */
+    private suspend fun waitDshResponsive(timeoutMs: Long = 15 * 60_000L): Boolean = withContext(Dispatchers.IO) {
+        val probeClient = OkHttpClient.Builder()
+            .connectTimeout(2, TimeUnit.SECONDS)
+            .readTimeout(4, TimeUnit.SECONDS)
+            .build()
+        val probeReq = Request.Builder().url("http://127.0.0.1:18000/").get().build()
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var fastStreak = 0
+        while (System.currentTimeMillis() < deadline) {
+            val started = System.currentTimeMillis()
+            try {
+                probeClient.newCall(probeReq).execute().use { }
+                val elapsed = System.currentTimeMillis() - started
+                if (elapsed <= 1_500L) fastStreak++ else fastStreak = 0
+            } catch (_: Exception) {
+                fastStreak = 0
+            }
+            if (fastStreak >= 3) return@withContext true
+            delay(5_000)
+        }
+        false
+    }
+
+    /** 直接拉起系统浏览器打开当前 DSH 地址；返回 false 表示 DSH 还没就绪或没有可用地址。 */
+    fun openDshInBrowser(): Boolean {
+        val raw = DshState.browserUrl ?: return false
+        val target = if (DshState.browserTokenConsumed) raw.substringBefore("?token=") else raw
+        return try {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(target)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            if (!DshState.browserTokenConsumed) DshState.browserTokenConsumed = true
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "打开系统浏览器失败: " + (e.message ?: "unknown"))
+            false
+        }
+    }
+
+    /** 切换「系统浏览器渲染 / 内置 WebView 渲染」，并重配一次 DSH 取新的 token。 */
+    fun setExternalBrowser(enabled: Boolean) {
+        DshState.externalBrowser = enabled
+        context.getSharedPreferences("dsh_mode", Context.MODE_PRIVATE)
+            .edit().putBoolean("external_browser", enabled).apply()
+        restartGuestHarness()
+    }
+
     @Synchronized
     fun restartGuestHarness() {
         val session = activeSession ?: return
@@ -601,7 +746,8 @@ class QemuManager private constructor(private val context: Context, val linux: L
         setupScope.launch {
             try {
                 session.appendSynthetic("[App] 正在重配 DSH（使用当前 API 配置，重新加载插件可能较慢）...")
-                session.write("pkill -f 'dsh --profile web' 2>/dev/null")
+                // 先停 supervisor，否则它会在 pkill 后立刻把旧 DSH 拉起来，导致重配逻辑混乱
+                session.write("touch /tmp/aichat-dsh-stop; pkill -f aichat-dsh-supervisor.sh 2>/dev/null; pkill -f 'dsh --profile web' 2>/dev/null")
                 delay(1500)
             } catch (_: Exception) {}
             // 只看重配后的新串口输出，避免旧 AICHAT_SETUP_DONE 让新 setup 循环提前结束
@@ -611,8 +757,11 @@ class QemuManager private constructor(private val context: Context, val linux: L
 
     fun phoneBridgeSetupCommand(): String = PhoneBridgeHttpServer.guestSetupCommand()
 
-    fun startSession(memoryMb: Int = 2048, smp: Int = 1): QemuSession? =
-        startSessionInternal(memoryMb, smp, safeMode = false)
+    fun startSession(memoryMb: Int = 2048, smp: Int = 1): QemuSession? {
+        diskFallbackAttempted = false
+        diskAutoInstallTriggered = false
+        return startSessionInternal(memoryMb, smp, safeMode = false)
+    }
 
     /** 安全模式：小内存 + 快速启动（init=/bin/sh），用于 guest 卡在 OpenRC/登录前时自救。 */
     fun startSafeSession(): QemuSession? =
@@ -646,6 +795,35 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 PhoneBridgeHttpServer.start(context)
                 // 自动登录 guest 并安装 phone 桥 / 内置 harness
                 startGuestSetup(it)
+                // 常驻监控 DSH supervisor 写出的崩溃标记；setup 循环结束后 DSH 再崩溃也能在 VM 日志看到。
+                setupScope.launch {
+                    var lastCrash = ""
+                    while (activeSession === it) {
+                        delay(3_000)
+                        val out = it.output.value
+                        // 只认带 exit= 的开始标记；不能匹配 AICHAT_DSH_CRASH_END，否则会把结束行当崩溃行。
+                        val marker = "AICHAT_DSH_CRASH exit="
+                        val start = out.lastIndexOf(marker)
+                        if (start >= 0) {
+                            val end = out.indexOf("AICHAT_DSH_CRASH_END", start)
+                            val block = if (end > start) {
+                                out.substring(start, end + "AICHAT_DSH_CRASH_END".length)
+                            } else {
+                                out.substring(start).take(2500)
+                            }.trim()
+                            if (block.isNotBlank() && block != lastCrash) {
+                                lastCrash = block
+                                DshState.crashReport = block.takeLast(6000)
+                                DshState.crashReportAt = System.currentTimeMillis()
+                                DshState.crashReportStale = false
+                                it.appendSynthetic(
+                                    "[App] DSH 崩溃摘要已抓取；可点 VM 页「复制崩溃日志」发给开发者。\n" +
+                                        block.take(3000)
+                                )
+                            }
+                        }
+                    }
+                }
                 // 首次启动失败时自动降级到安全模式
                 startBootWatchdog(it, safeMode)
                 // 20 秒无任何串口输出时，在终端里显示诊断，便于真机定位
@@ -669,54 +847,74 @@ class QemuManager private constructor(private val context: Context, val linux: L
 
     private fun startBootWatchdog(session: QemuSession, safeMode: Boolean) {
         bootWatchdogJob?.cancel()
-        val budgetMs = if (bootFromDisk) BOOT_WATCHDOG_DISK_MS else BOOT_WATCHDOG_MS
+        val maxBudgetMs = if (bootFromDisk) BOOT_WATCHDOG_DISK_MS else BOOT_WATCHDOG_MS
+        val stallMs = if (bootFromDisk) BOOT_STALL_DISK_MS else BOOT_STALL_MS
         bootWatchdogJob = setupScope.launch {
-            delay(budgetMs)
-            if (activeSession !== session) return@launch
-            val out = session.output.value
-            val booted = out.contains("login:") || out.contains("~ #") || out.contains("localhost:~#")
-            if (booted) return@launch
-            val seconds = budgetMs / 1000
-            if (session.running.value) {
-                if (bootFromDisk) {
-                    // 磁盘启动在少数环境（PRoot 下磁盘 I/O 极慢）会卡在 "Mounting root"：
-                    // 自动切回已验证的 Live 模式重试（预装镜像仍留在 /vm，不影响下次）
-                    setDiskBootEnabled(false)
-                    session.appendSynthetic(
-                        "[App] 磁盘启动 $seconds 秒仍未进 shell（PRoot 下磁盘 I/O 慢时可能发生）；" +
-                            "自动切回 Live 模式重试，稍后可用当前:磁盘切回。"
-                    )
-                    Log.w(TAG, "磁盘启动 ${seconds}s 未进 shell，回退 Live 模式")
-                    setupScope.launch { startSessionInternal(2048, 1, safeMode = false) }
-                    return@launch
+            val startedAt = System.currentTimeMillis()
+            var lastLength = session.output.value.length
+            var lastProgressAt = startedAt
+            while (isActive && activeSession === session) {
+                delay(10_000)
+                val out = session.output.value
+                if (out.contains("login:") || out.contains("~ #") || out.contains("localhost:~#")) return@launch
+                if (out.length > lastLength) {
+                    lastLength = out.length
+                    lastProgressAt = System.currentTimeMillis()
                 }
-                // 进程还活着说明不是 QEMU 崩了，而是 guest 卡在 OpenRC/挂载阶段（部分机型会卡死在
-                // firstboot 之前）。此时不能直接再起第二个 QEMU 抢 qcow2 锁，必须先把旧的停掉。
-                if (!safeMode && !fastBoot && !fastFallbackAttempted) {
-                    fastFallbackAttempted = true
-                    session.appendSynthetic(
-                        "[App] QEMU 已运行 $seconds 秒仍未进入 shell，判定 guest 卡在 OpenRC；" +
-                            "自动改用快速模式（init=/bin/sh）重启，绕过 OpenRC 与 login。"
-                    )
-                    Log.w(TAG, "guest ${seconds}s 未进入 shell，自动切换快速模式重启")
-                    setupScope.launch { startSessionInternal(1024, 1, safeMode = false, forceFastBoot = true) }
-                } else {
-                    session.appendSynthetic(
-                        "[App] QEMU 已运行 $seconds 秒仍未检测到 shell；可点停止，再点安全模式" +
-                            "（安全模式会用 init=/bin/sh 快速启动）。"
-                    )
+                val now = System.currentTimeMillis()
+                val stalled = now - lastProgressAt >= stallMs
+                val overBudget = now - startedAt >= maxBudgetMs
+                if (!stalled && !overBudget) continue
+
+                val seconds = ((now - startedAt) / 1000).toInt()
+                val reason = if (stalled) "串口 ${stallMs / 1000} 秒无新输出" else "启动总时间超过 ${maxBudgetMs / 1000} 秒"
+                if (session.running.value) {
+                    if (bootFromDisk) {
+                        // 磁盘启动在少数环境（PRoot 下磁盘 I/O 极慢）会卡在 "Mounting root"：
+                        // 自动切回已验证的 Live 模式重试（预装镜像仍留在 /vm，不影响下次）。
+                        // 记录 diskFallbackAttempted，避免 DSH 就绪后又自动切回磁盘，在慢机上无限重启。
+                        diskFallbackAttempted = true
+                        setDiskBootEnabled(false)
+                        session.appendSynthetic(
+                            "[App] 磁盘启动 $reason（已运行 ${seconds}s）仍未进 shell；" +
+                                "自动切回 Live 模式重试，稍后可用当前:磁盘切回。"
+                        )
+                        Log.w(TAG, "磁盘启动 $reason，回退 Live 模式")
+                        setupScope.launch { startSessionInternal(2048, 1, safeMode = false) }
+                        return@launch
+                    }
+                    // 进程还活着说明不是 QEMU 崩了，而是 guest 卡在 OpenRC/挂载阶段。
+                    // 必须先把旧的停掉，不能直接再起第二个 QEMU 抢 qcow2 锁。
+                    if (!safeMode && !fastBoot && !fastFallbackAttempted) {
+                        fastFallbackAttempted = true
+                        session.appendSynthetic(
+                            "[App] QEMU 已运行 ${seconds}s（$reason）仍未进入 shell，判定 guest 卡在 OpenRC；" +
+                                "自动改用快速模式（init=/bin/sh）重启，绕过 OpenRC 与 login。"
+                        )
+                        Log.w(TAG, "guest $reason，自动切换快速模式重启")
+                        setupScope.launch { startSessionInternal(2048, 1, safeMode = false, forceFastBoot = true) }
+                    } else {
+                        session.appendSynthetic(
+                            "[App] QEMU 已运行 ${seconds}s（$reason）仍未检测到 shell；" +
+                                "可点停止，再点安全模式（安全模式会用 init=/bin/sh 快速启动）。"
+                        )
+                    }
+                } else if (!safeMode && !safeModeAttempted) {
+                    safeModeAttempted = true
+                    Log.w(TAG, "guest $reason 且进程已退出，尝试安全模式重启")
+                    bootWatchdogJob = null
+                    setupScope.launch { startSessionInternal(512, 1, safeMode = true, forceFastBoot = true) }
                 }
-            } else if (!safeMode && !safeModeAttempted) {
-                safeModeAttempted = true
-                Log.w(TAG, "guest ${seconds}s 未进入 shell 且进程已退出，尝试安全模式重启")
-                bootWatchdogJob = null
-                setupScope.launch { startSessionInternal(512, 1, safeMode = true, forceFastBoot = true) }
+                return@launch
             }
         }
     }
 
     /** 已经完成 token->cookie 交换的 URL（一次性 token，绝不重复交换） */
     private var dshUrlExchangedFor: String? = null
+
+    /** 磁盘启动已回退过 Live 模式：避免 DSH 就绪后又自动切回磁盘，在慢机上无限循环重启 */
+    private var diskFallbackAttempted = false
 
     private fun startGuestSetup(session: QemuSession, ignoreBefore: Int = 0) {
         setupJob?.cancel()
@@ -741,8 +939,9 @@ class QemuManager private constructor(private val context: Context, val linux: L
                 // 捕获 Guest 里 dsh web 的启动 URL / 就绪状态，供 DS Harness 页直接内嵌
                 if (tail.contains("AICHAT_DSH_OK")) {
                     DshState.ready = true
+                    if (!DshState.crashReport.isNullOrBlank()) DshState.crashReportStale = true
                     // 首次运行（Live ISO）：自动把系统装到磁盘并切到磁盘启动，让 node/DSH/会话持久化
-                    if (!bootFromDisk && !diskAutoInstallTriggered) {
+                    if (!bootFromDisk && !diskAutoInstallTriggered && !diskFallbackAttempted) {
                         diskAutoInstallTriggered = true
                         session.appendSynthetic(
                             "[App] 首次运行：正在把 Alpine 安装到磁盘以便持久化（约 2-5 分钟，请勿关闭）..."
@@ -767,7 +966,12 @@ class QemuManager private constructor(private val context: Context, val linux: L
                         }
                     }
                 }
-                if (tail.contains("AICHAT_DSH_FAIL")) { DshState.ready = false; DshState.webUrl = null }
+                if (tail.contains("AICHAT_DSH_FAIL")) { DshState.ready = false; DshState.webUrl = null; DshState.browserUrl = null }
+                // 记录 API key 是否真的注入到 guest；0 表示 App 当前 profile 没填 key，
+                // DSH UI 仍允许输入消息，但模型请求会一直等待/失败，VM 页需要明确提示。
+                Regex("AICHAT_SEED_KEYLEN=(\\d+)").findAll(tail).lastOrNull()?.let {
+                    DshState.seedKeyLen = it.groupValues[1].toIntOrNull() ?: -1
+                }
                 // 取最后一条 AICHAT_DSH_URL=（脚本会重复打印，最后一条最完整）；
                 // 并且必须校验 token 长度：管道被截断时会出现 token 为空的 URL，
                 // 用它去加载 DSH 只会得到 "dsh web authentication required"。
@@ -778,11 +982,34 @@ class QemuManager private constructor(private val context: Context, val linux: L
                     val tokenOk = Regex("token=[A-Za-z0-9_-]{20,}").containsMatchIn(url)
                     if (url.startsWith("http") && tokenOk && dshUrlExchangedFor != url) {
                         dshUrlExchangedFor = url
-                        val clean = exchangeDshToken(url)
-                        // 成功：把"干净地址"交给 WebView（靠 cookie 会话，可安全重载）
-                        // 失败：退回带 token 的地址（WebView 可能仍能自己换成功）
-                        DshState.webUrl = clean ?: url
-                        DshState.ready = true
+                        if (DshState.externalBrowser) {
+                            // 外部浏览器模式：绝不能先换 cookie，否则 token 被 App 用掉，Chrome 打开会 401。
+                            DshState.webUrl = null
+                            DshState.browserUrl = url
+                            DshState.browserTokenConsumed = false
+                            DshState.browserLaunchNonce++
+                            DshState.ready = true
+                            // 外部模式：等 DSH 的 client 插件资源/接口真正空闲后再拉起浏览器，
+                            // 否则慢机上浏览器会一直重新连接中/Failed to fetch。
+                            DshState.browserWarmup = true
+                            session.appendSynthetic(
+                                "[App] DSH 已就绪，正在预载前端插件资源（慢机可能几分钟）；" +
+                                    "预载完成后会自动打开系统浏览器，请先不要离开 VM 页。"
+                            )
+                            setupScope.launch(Dispatchers.IO) {
+                                val preloaded = warmupDshAssets(url)
+                                if (!preloaded) waitDshResponsive()
+                                DshState.browserWarmup = false
+                                withContext(Dispatchers.Main) { openDshInBrowser() }
+                            }
+                        } else {
+                            DshState.browserUrl = null
+                            val clean = exchangeDshToken(url)
+                            // 成功：把"干净地址"交给 WebView（靠 cookie 会话，可安全重载）
+                            // 失败：退回带 token 的地址（WebView 可能仍能自己换成功）
+                            DshState.webUrl = clean ?: url
+                            DshState.ready = true
+                        }
                     }
                 }
                 // 个别机型串口会把 /bin/sh 的提示符切成半行（只能看到 "/"），提示符识别会失效。

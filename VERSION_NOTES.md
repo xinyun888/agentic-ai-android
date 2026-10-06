@@ -1,3 +1,229 @@
+## v2.61.58（sandbox 补丁更稳 + 崩溃摘要区分新旧）
+
+### 问题
+- 用户看到的 exit=134 摘要是旧报告（同一个 token/时间），不是新崩溃；
+  但 App 之前只保留 crashReport，DSH 恢复后仍显示已抓取，容易误判。
+- sandbox 补丁之前依赖精确的函数文本，个别文件换行/缩进不同会 patch 失败。
+
+### 修复
+- sandbox 补丁改为按索引插入：找到 `async confine(...)` 后，在第一个
+  `signal?.throwIfAborted();` 后直接插入 return，不再依赖换行/缩进。
+- guest setup 串口会明确输出：
+  `AICHAT_DSH_SANDBOX_PATCH=patched` 或 `failed + 失败原因`。
+- 崩溃摘要开始行加入时间：
+  `AICHAT_DSH_CRASH exit=134 Tue Oct ...`，便于区分新旧。
+- DSH 重新就绪后，App 按钮显示复制历史崩溃日志（DSH 已恢复），
+  不再和当前状态混淆。
+
+- versionCode 334 / versionName 2.61.58
+
+## v2.61.57（真机 ADB 定位 exit=134：禁掉 landlock sandbox probe）
+
+### 真机崩溃根因
+- 通过 ADB 连真机（OnePlus / Android14 / arm64）抓到 DSH crash：
+  `terminate called after throwing an instance of 'std::system_error' what(): No error information`  Aborted（exit=134）
+- 对应 DSH 的 `@deepseek-ai/dsh-sandbox-local`：
+  Linux 下先探测 bwrap，失败后探测 landlock，native probe 在部分真机/QEMU 组合里直接 abort。
+- 真机上 DSH 每次启动都在这里崩溃，supervisor 不断重启，表现为一直崩溃/重连。
+
+### 修复
+- guest setup 给 `dsh-sandbox-local` 打补丁：`confine()` 直接返回原始 argv，
+  不再走 bwrap/landlock probe。
+- QEMU guest 本身就是隔离环境，DSH 工具在 guest 内运行即可；禁用额外 sandbox 不影响
+  Linux 环境隔离，只是不再做 guest 内部的二次文件沙箱。
+- 真机 ADB 验证：DSH 启动后保持稳定，App 崩溃摘要为空，浏览器 UI 可用。
+
+- versionCode 333 / versionName 2.61.57
+
+## v2.61.56（exit=134 崩溃摘要自动抓取 + 一键复制）
+
+### 修复
+- 之前的崩溃监控用 `lastIndexOf("AICHAT_DSH_CRASH")`，会误匹配到 `AICHAT_DSH_CRASH_END`，
+  所以 App 日志里只剩结束标记。现在只认 `AICHAT_DSH_CRASH exit=` 开始，
+  并截取到 `AICHAT_DSH_CRASH_END`，把完整崩溃摘要存进 DshState.crashReport。
+- VM 页新增「复制崩溃日志（已抓取）」按钮：崩溃后点一下，整个摘要进剪贴板。
+- 摘要内容：退出码、DSH 日志尾 25 行、dmesg 尾 12 行。
+- 保留 v2.61.55 的限制预载与 NODE_OPTIONS heap cap。
+
+- versionCode 332 / versionName 2.61.56
+
+## v2.61.55（exit=134 崩溃应对：限制预载 + Node heap cap + 串口崩溃摘要）
+
+### 现象
+- DSH 反复 `exit=134`（SIGABRT），不是 137 OOM kill。常见于 V8/native fatal abort。
+- v2.61.54 的全量 combo 预载可能把 DSH 服务端 responses 缓存/Node heap 撑大，诱发 abort。
+
+### 修复与诊断
+- 预载只保留 `/assets/*`（首页 vendor/index/css），不再预取全部 `/plugins/??` combo，
+  避免服务端 combo 缓存和 Node heap 在慢机上暴涨。
+- supervisor 给 DSH 加 `NODE_OPTIONS="--max-old-space-size=1400 --max-semi-space-size=64"`，
+  避免默认堆上限过高触发 native abort。
+- DSH 崩溃时 supervisor 现在把摘要直接写到串口：
+  - `===== AICHAT_DSH_CRASH exit=134 =====`
+  - 最后 25 行 DSH 日志
+  - dmesg 最后 12 行
+  - `AICHAT_DSH_CRASH_END`
+  这样 VM 终端就能看到 134 的真实原因，不用手动 cat。
+
+- versionCode 331 / versionName 2.61.55
+
+## v2.61.54（App 侧预载 DSH 前端资源，提升首次打开速度）
+
+### 原理（基于模拟器实测 + DSH 源码）
+- DSH 的 client combo 响应在服务端有内存缓存（dsh-client-modules 的 responses Map），
+  同一个 URL 第二次请求不会再重新拼接/生成。
+- 但慢机首次打开浏览器时，浏览器自己触发这些 combo 请求，会在 QEMU 单核里等几十秒到几分钟，
+  期间表现为重新连接中 / Failed to fetch / 插件空。
+- v2.61.54 在 App 侧先把这部分工作做掉：
+  1. 用 DSH token 换 cookie（token 在进程生命周期内可重复使用，不影响浏览器再打开）；
+  2. 拉取首页 HTML；
+  3. 解析其中所有 /plugins/??... combo 和 /assets/... 资源；
+  4. 带 cookie 顺序预取一遍，让服务端生成并缓存，同时预热系统文件缓存；
+  5. 预载完成后再自动打开系统浏览器。
+- 预热期间 VM 页显示正在预载前端插件资源（慢机可能几分钟）。
+
+### 保留
+- 单线程 TCG（实测 MTTCG 多核会在 guest 内核启动阶段卡死）。
+- 写入保护、supervisor、崩溃抓取、外部浏览器默认模式、页面兼容层。
+
+- versionCode 330 / versionName 2.61.54
+
+## v2.61.53（模拟器实测：不是崩溃，是 QEMU 单核太慢；加预热闸门）
+
+### 模拟器实测结论
+- 用 Windows Edge 通过 adb forward 直连 guest DSH，CDP 观察到：
+  - DSH 进程一直活着，前端最终能渲染出探索未至之境 / 选择工作区；
+  - 但 guest 里 `/assets/*.js`、插件 combo 请求耗时 **66～170 秒**；
+  - 工作区目录选择器一直加载中，session/create 会 Failed to fetch，WebSocket 反复重新连接中。
+- 所以不是 OOM、不是权限、不是进程崩溃；是 DSH 服务在 QEMU 单线程 TCG 下响应太慢，
+  浏览器/客户端超时后表现成崩溃/空插件/连不上。
+- 实测 `-accel tcg,thread=multi -smp 2` 会在 guest 内核启动阶段直接卡死（串口 240 秒无输出），
+  所以 MTTCG 不能作为方案，继续单线程。
+
+### 修复
+- 增加预热闸门：DSH 打印 URL 后不立刻打开浏览器，先由 App 轮询 127.0.0.1:18000，
+  连续 3 次 1.5 秒内响应才拉起浏览器；预热期间 VM 页显示DSH 正在预热插件。
+  这样避免浏览器在 DSH 还在初始化时打开，然后一直 Failed to fetch/重新连接。
+- 外部浏览器模式保持默认/强制；写保护、supervisor、崩溃抓取等都保留。
+
+- versionCode 329 / versionName 2.61.53
+
+## v2.61.52（DSH 崩溃抓因 + OOM 保护）
+
+### 崩溃原因排查
+- DSH supervisor 现在会在进程退出后自动记录：
+  - 退出码（137=SIGKILL/OOM，139=segfault，1=JS 错误）
+  - `free -m` 内存快照
+  - `dmesg | tail -50`（是否有 `Out of memory: Killed process ... node`）
+  - 崩溃前 100 行 DSH 日志
+- 详细内容写入 guest 的 `/tmp/aichat-dsh-crash.log`，同时在串口打印：
+  `AICHAT_DSH_CRASH exit=...; see /tmp/aichat-dsh-crash.log`
+- App 的 VM 日志会自动提示这次崩溃。
+
+### 降低 OOM 概率
+- 磁盘模式下自动创建 256MB swap（Live/tmpfs 不创建），并调低 swappiness。
+- v2.61.49 起回退内存已从 1024MB 提升到 2048MB；超时和回退逻辑也不会再反复重启。
+
+- versionCode 328 / versionName 2.61.52
+
+## v2.61.51（DSH 进程守护 + 强制外部浏览器）
+
+### 针对重新连接中 / 新建会话 Failed to fetch / 插件刷新失败
+- 这些现象是 guest 里的 `dsh web` 进程已经死了，但 QEMU 还在：
+  - 页面是浏览器缓存/最后一次渲染；HTTP `/api/session/create`、插件刷新请求自然全部 fetch 失败。
+  - WebSocket `/api/remote.mux` 也一直重连不上。
+- guest setup 现在安装一个 `aichat-dsh-supervisor.sh`：
+  - 每 2 秒检查 `dsh --profile web` 是否存活；
+  - 崩溃/被 OOM 杀掉后自动重新拉起；
+  - DSH 的浏览器 cookie 签名密钥持久化在 `/root/.dsh`（30 天），所以重启后旧 cookie 仍有效，
+    浏览器可以直接自动重连，不需要重新发 token。
+- 「重配」时会先停 supervisor，再重启 DSH，避免旧进程被自动拉起。
+- App 内 Harness 入口已移除，外部浏览器模式现在默认且强制开启：
+  - 不再需要手动切浏览器模式；
+  - DSH 就绪自动拉起系统浏览器。
+
+- versionCode 327 / versionName 2.61.51
+
+## v2.61.50（模型 Key 状态提示）
+
+### 针对进浏览器没让填 key 却能直接发消息
+- DSH 本身没有登录/填 key 弹窗；它会静默使用 App「API 配置」里当前 profile 的 key，
+  由 guest setup 写入 `AICHAT_API_KEY` 后交给 DSH。
+- 如果 App 没配 key：DSH 界面仍然允许输入/发送消息，但模型请求会一直等待或失败，
+  这就是能发消息但 4 分钟没结果的原因之一。
+- VM 页外部模式现在直接显示：
+  - 模型 Key：已从 App API 配置注入（N 字符），DSH 不会再次询问。
+  - 模型 Key：未配置请到 App API 配置填好 key 后点重配。
+- QemuManager 会从串口 `AICHAT_SEED_KEYLEN=` 读取真实注入长度。
+
+- versionCode 326 / versionName 2.61.50
+
+## v2.61.49（慢机启动看门狗 + DSH 保活，修重新连接中/插件空）
+
+### 针对你截图里的问题
+- 外置浏览器已能进 DSH，但插件空、一直重新连接中、测试 4 分钟没结果：
+  本质是 guest 里的 DSH 服务被 App 的启动看门狗反复重启，浏览器旧会话 cookie 随之失效。
+- 截图 VM 串口里的 QEMU 参数是 `-m 1024 / 快速模式`，说明旧版在磁盘启动 900 秒没进 shell 时
+  自动回退 Live 模式；DSH 就绪后又自动切回磁盘，慢机上会无限循环重启。
+
+### 修复
+- 启动看门狗改为有串口进度就继续等：
+  - 磁盘启动：7 分钟无新输出、或总时长 60 分钟才回退；
+  - Live 启动：4 分钟无新输出、或总时长 20 分钟才回退；
+  不再一到 15 分钟就回退，慢机可以慢慢挂载/进 OpenRC。
+- 磁盘回退 Live 后记录 diskFallbackAttempted，DSH 就绪不会再自动切回磁盘，避免循环重启。
+- 快速模式回退内存从 1024MB 提到 2048MB，DSH/Node 更不容易卡死。
+- VM 页申请忽略电池优化，降低切到浏览器后 App/QEMU 被 OEM 后台清理的概率。
+- 保留 v2.61.48 的 guest 写入保护与 v2.61.46/47 的兼容层、外部浏览器模式。
+
+- versionCode 325 / versionName 2.61.49
+
+## v2.61.48（guest 工作区写入保护）
+
+### 针对创建不了工作区 / 没有写入权限
+- DSH 的工作区创建发生在 guest Linux 内，DSH 进程以 root 运行，不经 Android 存储权限；
+  真正可能的写失败是 guest 根分区被挂成 ro，或 /root 下目录权限/文件冲突。
+- guest setup 现在启动 DSH 前会：
+  - `mount -o remount,rw /` 尝试恢复根分区可写；
+  - 预创建默认工作区 `/root/deepseek-harness/default-workspace`；
+  - 对 /root 和默认工作区 chmod 755；
+  - 做一次真实写测试，串口打印 `AICHAT_DSH_WRITE_OK` 或 `AICHAT_DSH_WRITE_FAIL`。
+- 如果串口显示 `AICHAT_DSH_WRITE_FAIL`，说明 guest 文件系统确实不可写，需要重建/修复磁盘；
+  如果显示 OK，则创建失败更可能是目录已存在（选 Open 或换个名字），不是权限问题。
+
+- versionCode 324 / versionName 2.61.48
+
+## v2.61.47（去掉 App 内 Harness 入口，VM 页直接跳浏览器）
+
+### 按你的要求
+- 主界面移除「DS Harness」图标，App 内不再进入内嵌 Harness 页，避免又踩白屏。
+- Linux VM 页新增两个按钮：
+  - 「切换到浏览器渲染 / 打开 DSH 浏览器」：一键切外部模式并拉起系统浏览器；
+  - 「复制 DSH 地址」：把当前 token/干净地址复制到剪贴板，可粘贴到任意浏览器打开。
+- 外部模式下 DSH 一就绪会自动 `ACTION_VIEW` 打开系统浏览器；App 在后台被系统拦截时，
+  回到 VM 页点按钮或复制地址手动打开。
+- 模式与 token 状态显示在 VM 页；QEMU 由前台服务保持运行，切到浏览器不会中断。
+- 保留 v2.61.46 的 DSH 服务端 HTML 兼容层：Chrome 直接打开也能补 Promise.withResolvers / AbortSignal.any。
+
+- versionCode 323 / versionName 2.61.47
+
+## v2.61.46（外部浏览器渲染模式 + DSH 服务端兼容层）
+
+### 外部浏览器模式
+- 顶栏新增「浏览器」按钮：切换为系统浏览器渲染 DSH，不再在 App WebView 里跑。
+- 开启后 App 会重配一次 DSH 取新的 token，自动 `ACTION_VIEW` 拉起 Chrome/默认浏览器；
+  QEMU 由 QemuKeepAliveService 前台服务保持运行，切到浏览器不会中断。
+- 外部模式面板提供：重新打开浏览器 / 重配并重新打开 / 切回内置 WebView。
+- Token 由浏览器消费一次，之后重开自动走干净地址；换浏览器或清 cookie 后可重配取新 token。
+- 模式持久化在 SharedPreferences，App 重启后仍生效。
+
+### DSH 服务端兼容层
+- guest setup 现在会给 DSH 的 `dsh-host-webserver` 打补丁：在页面 HTML 的
+  `READY_MARKUP` 之前插入 Promise.withResolvers / AbortSignal.any / AbortSignal.timeout 兼容层。
+- 这样 **内嵌 WebView 和系统浏览器** 都在 DSH 页面最开始就拿到兼容层，不依赖 App 侧注入时机。
+
+- versionCode 322 / versionName 2.61.46
+
 ## v2.61.45（加载遮罩）
 
 ### 体验
